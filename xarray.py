@@ -15,15 +15,25 @@ import fortran_scan as fscan
 import xunset
 
 DO_RE = re.compile(
-    r"^\s*do\s+([a-z][a-z0-9_]*)\s*=\s*([^,]+?)\s*,\s*([^,]+?)\s*$",
+    r"^\s*do\s+([a-z][a-z0-9_]*)\s*=\s*([^,]+?)\s*,\s*([^,]+?)(?:\s*,\s*([^,]+?))?\s*$",
     re.IGNORECASE,
 )
 END_DO_RE = re.compile(r"^\s*end\s*do\b", re.IGNORECASE)
+IF_THEN_RE = re.compile(r"^\s*if\s*\((.+)\)\s*then\s*$", re.IGNORECASE)
+END_IF_RE = re.compile(r"^\s*end\s*if\b", re.IGNORECASE)
 ASSIGN_RE = re.compile(r"^\s*(.+?)\s*=\s*(.+)$", re.IGNORECASE)
 SIMPLE_NAME_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*$", re.IGNORECASE)
 INDEXED_NAME_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*$", re.IGNORECASE)
 ADD_ACC_RE = re.compile(
     r"^\s*([a-z][a-z0-9_]*)\s*\+\s*(.+)$",
+    re.IGNORECASE,
+)
+MUL_ACC_RE = re.compile(
+    r"^\s*([a-z][a-z0-9_]*)\s*\*\s*(.+)$",
+    re.IGNORECASE,
+)
+ADD_ONE_RE = re.compile(
+    r"^\s*([a-z][a-z0-9_]*)\s*\+\s*1(?:\.0+)?(?:_[a-z0-9]+)?\s*$",
     re.IGNORECASE,
 )
 
@@ -78,7 +88,27 @@ def replace_index_with_slice(expr: str, idx_var: str, lb: str, ub: str) -> str:
     return pat.sub(lambda m: f"{m.group(1)}({lb}:{ub})", expr)
 
 
-def maybe_elementwise(loop_var: str, lb: str, ub: str, body_stmt: str) -> Optional[str]:
+def build_range(lb: str, ub: str, step: Optional[str]) -> str:
+    """Build Fortran slice-range text from loop bounds and optional step."""
+    lb_s = lb.strip()
+    ub_s = ub.strip()
+    if step is None:
+        return f"{lb_s}:{ub_s}"
+    st = step.strip()
+    return f"{lb_s}:{ub_s}:{st}"
+
+
+def has_loop_var(expr: str, loop_var: str) -> bool:
+    """Check whether expression still contains loop index variable."""
+    return re.search(rf"\b{re.escape(loop_var)}\b", expr, re.IGNORECASE) is not None
+
+
+def split_range(rng: str) -> Tuple[str, str]:
+    """Split range text into (lb, ub_or_ub_step)."""
+    return rng.split(":", 1)[0], rng.split(":", 1)[1]
+
+
+def maybe_elementwise(loop_var: str, rng: str, body_stmt: str) -> Optional[str]:
     """Detect elementwise assignment loop and build replacement."""
     m = ASSIGN_RE.match(body_stmt.strip())
     if not m:
@@ -92,16 +122,19 @@ def maybe_elementwise(loop_var: str, lb: str, ub: str, body_stmt: str) -> Option
     lhs_idx = m_lhs.group(2).lower()
     if lhs_idx != loop_var.lower():
         return None
-    rhs_sliced = replace_index_with_slice(rhs, loop_var, lb.strip(), ub.strip())
+    lb, ubtxt = split_range(rng)
+    rhs_sliced = replace_index_with_slice(rhs, loop_var, lb, ubtxt)
+    # The helper above expects (lb, ub-text). rng may include step in ub-text.
+    if has_loop_var(rhs_sliced, loop_var):
+        return None
     if rhs_sliced == rhs:
         return None
-    return f"{lhs_name}({lb.strip()}:{ub.strip()}) = {rhs_sliced}"
+    return f"{lhs_name}({rng}) = {rhs_sliced}"
 
 
 def maybe_reduction_sum(
     loop_var: str,
-    lb: str,
-    ub: str,
+    rng: str,
     body_stmt: str,
     prev_stmt: Optional[str],
 ) -> Optional[str]:
@@ -127,10 +160,126 @@ def maybe_reduction_sum(
     if acc_in_rhs != acc_name_lhs:
         return None
     expr = madd.group(2).strip()
-    expr_sliced = replace_index_with_slice(expr, loop_var, lb.strip(), ub.strip())
+    lb, ubtxt = rng.split(":", 1)
+    expr_sliced = replace_index_with_slice(expr, loop_var, lb, ubtxt)
+    if has_loop_var(expr_sliced, loop_var):
+        return None
     if expr_sliced == expr:
         return None
     return f"{acc_name_lhs} = sum({expr_sliced})"
+
+
+def maybe_reduction_product(
+    loop_var: str,
+    rng: str,
+    body_stmt: str,
+    prev_stmt: Optional[str],
+) -> Optional[str]:
+    """Detect product-reduction loop and build replacement."""
+    if prev_stmt is None:
+        return None
+    mp = ASSIGN_RE.match(prev_stmt.strip())
+    ml = ASSIGN_RE.match(body_stmt.strip())
+    if not mp or not ml:
+        return None
+    acc_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+    acc_lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
+    if not acc_prev or not acc_lhs:
+        return None
+    acc_name_prev = acc_prev.group(1).lower()
+    acc_name_lhs = acc_lhs.group(1).lower()
+    if acc_name_prev != acc_name_lhs:
+        return None
+    mmul = MUL_ACC_RE.match(ml.group(2).strip())
+    if not mmul:
+        return None
+    acc_in_rhs = mmul.group(1).lower()
+    if acc_in_rhs != acc_name_lhs:
+        return None
+    expr = mmul.group(2).strip()
+    lb, ubtxt = rng.split(":", 1)
+    expr_sliced = replace_index_with_slice(expr, loop_var, lb, ubtxt)
+    if has_loop_var(expr_sliced, loop_var):
+        return None
+    if expr_sliced == expr:
+        return None
+    return f"{acc_name_lhs} = product({expr_sliced})"
+
+
+def maybe_masked_sum(
+    loop_var: str,
+    rng: str,
+    prev_stmt: Optional[str],
+    if_stmt: str,
+    body_stmt: str,
+) -> Optional[str]:
+    """Detect masked sum inside IF block within loop."""
+    if prev_stmt is None:
+        return None
+    mp = ASSIGN_RE.match(prev_stmt.strip())
+    if not mp:
+        return None
+    acc_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+    if not acc_prev:
+        return None
+    acc = acc_prev.group(1).lower()
+    mif = IF_THEN_RE.match(if_stmt.strip())
+    ml = ASSIGN_RE.match(body_stmt.strip())
+    if not mif or not ml:
+        return None
+    lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
+    if not lhs or lhs.group(1).lower() != acc:
+        return None
+    madd = ADD_ACC_RE.match(ml.group(2).strip())
+    if not madd or madd.group(1).lower() != acc:
+        return None
+    cond = mif.group(1).strip()
+    expr = madd.group(2).strip()
+    lb, ubtxt = rng.split(":", 1)
+    cond_s = replace_index_with_slice(cond, loop_var, lb, ubtxt)
+    expr_s = replace_index_with_slice(expr, loop_var, lb, ubtxt)
+    if has_loop_var(cond_s, loop_var) or has_loop_var(expr_s, loop_var):
+        return None
+    if cond_s == cond or expr_s == expr:
+        return None
+    return f"{acc} = sum({expr_s}, mask = {cond_s})"
+
+
+def maybe_count(
+    loop_var: str,
+    rng: str,
+    prev_stmt: Optional[str],
+    if_stmt: str,
+    body_stmt: str,
+) -> Optional[str]:
+    """Detect count-in-if pattern and build COUNT replacement."""
+    if prev_stmt is None:
+        return None
+    mp = ASSIGN_RE.match(prev_stmt.strip())
+    if not mp:
+        return None
+    k_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+    if not k_prev:
+        return None
+    kname = k_prev.group(1).lower()
+    mif = IF_THEN_RE.match(if_stmt.strip())
+    ml = ASSIGN_RE.match(body_stmt.strip())
+    if not mif or not ml:
+        return None
+    lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
+    if not lhs or lhs.group(1).lower() != kname:
+        return None
+    madd1 = ADD_ONE_RE.match(ml.group(2).strip())
+    if not madd1 or madd1.group(1).lower() != kname:
+        return None
+    cond = mif.group(1).strip()
+    lb, ubtxt = rng.split(":", 1)
+    cond_s = replace_index_with_slice(cond, loop_var, lb, ubtxt)
+    if has_loop_var(cond_s, loop_var):
+        return None
+    if cond_s == cond:
+        return None
+    return f"{kname} = count({cond_s})"
 
 
 def analyze_unit(unit: xunset.Unit) -> List[Finding]:
@@ -147,51 +296,106 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
         loop_var = mdo.group(1)
         lb = mdo.group(2)
         ub = mdo.group(3)
-        # Only handle loops with exactly one statement body.
-        if i + 2 >= len(body):
-            i += 1
-            continue
-        ln_body, stmt_body = body[i + 1]
-        ln_end, stmt_end = body[i + 2]
-        if not END_DO_RE.match(stmt_end.strip()):
-            i += 1
-            continue
+        step = mdo.group(4)
+        rng = build_range(lb, ub, step)
 
-        # Elementwise pattern.
-        sugg_elem = maybe_elementwise(loop_var, lb, ub, stmt_body)
-        if sugg_elem is not None:
-            findings.append(
-                Finding(
-                    path=unit.path,
-                    rule="elementwise",
-                    unit_kind=unit.kind,
-                    unit_name=unit.name,
-                    start_line=ln,
-                    end_line=ln_end,
-                    suggestion=sugg_elem,
-                )
-            )
-            i += 3
-            continue
+        # Form A: one-statement loop body.
+        if i + 2 < len(body):
+            ln_body, stmt_body = body[i + 1]
+            ln_end, stmt_end = body[i + 2]
+            if END_DO_RE.match(stmt_end.strip()):
+                sugg_elem = maybe_elementwise(loop_var, rng, stmt_body)
+                if sugg_elem is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="elementwise",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_elem,
+                        )
+                    )
+                    i += 3
+                    continue
+                prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
+                start_line = body[i - 1][0] if i - 1 >= 0 else ln
+                sugg_sum = maybe_reduction_sum(loop_var, rng, stmt_body, prev_stmt)
+                if sugg_sum is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_sum",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line,
+                            end_line=ln_end,
+                            suggestion=sugg_sum,
+                        )
+                    )
+                    i += 3
+                    continue
+                sugg_prod = maybe_reduction_product(loop_var, rng, stmt_body, prev_stmt)
+                if sugg_prod is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_product",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line,
+                            end_line=ln_end,
+                            suggestion=sugg_prod,
+                        )
+                    )
+                    i += 3
+                    continue
 
-        # Reduction pattern uses the previous statement as init.
-        prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
-        sugg_red = maybe_reduction_sum(loop_var, lb, ub, stmt_body, prev_stmt)
-        if sugg_red is not None:
-            start_line = body[i - 1][0] if i - 1 >= 0 else ln
-            findings.append(
-                Finding(
-                    path=unit.path,
-                    rule="reduction_sum",
-                    unit_kind=unit.kind,
-                    unit_name=unit.name,
-                    start_line=start_line,
-                    end_line=ln_end,
-                    suggestion=sugg_red,
-                )
-            )
-            i += 3
-            continue
+        # Form B: IF-block inside loop body:
+        # do ...
+        #    if (cond) then
+        #       stmt
+        #    end if
+        # end do
+        if i + 4 < len(body):
+            _ln_if, stmt_if = body[i + 1]
+            _ln_inside, stmt_inside = body[i + 2]
+            _ln_eif, stmt_eif = body[i + 3]
+            ln_end, stmt_end = body[i + 4]
+            if IF_THEN_RE.match(stmt_if.strip()) and END_IF_RE.match(stmt_eif.strip()) and END_DO_RE.match(stmt_end.strip()):
+                prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
+                start_line = body[i - 1][0] if i - 1 >= 0 else ln
+                sugg_msum = maybe_masked_sum(loop_var, rng, prev_stmt, stmt_if, stmt_inside)
+                if sugg_msum is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_masked_sum",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line,
+                            end_line=ln_end,
+                            suggestion=sugg_msum,
+                        )
+                    )
+                    i += 5
+                    continue
+                sugg_cnt = maybe_count(loop_var, rng, prev_stmt, stmt_if, stmt_inside)
+                if sugg_cnt is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_count",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line,
+                            end_line=ln_end,
+                            suggestion=sugg_cnt,
+                        )
+                    )
+                    i += 5
+                    continue
         i += 1
     return findings
 
