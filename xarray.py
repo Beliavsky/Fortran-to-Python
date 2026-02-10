@@ -22,6 +22,7 @@ END_DO_RE = re.compile(r"^\s*end\s*do\b", re.IGNORECASE)
 IF_THEN_RE = re.compile(r"^\s*if\s*\((.+)\)\s*then\s*$", re.IGNORECASE)
 END_IF_RE = re.compile(r"^\s*end\s*if\b", re.IGNORECASE)
 ASSIGN_RE = re.compile(r"^\s*(.+?)\s*=\s*(.+)$", re.IGNORECASE)
+ALLOCATE_RE = re.compile(r"^\s*allocate\s*\((.*)\)\s*$", re.IGNORECASE)
 SIMPLE_NAME_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*$", re.IGNORECASE)
 INDEXED_NAME_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*$", re.IGNORECASE)
 ADD_ACC_RE = re.compile(
@@ -79,6 +80,52 @@ def make_backup_path(path: Path) -> Path:
         idx += 1
 
 
+def split_top_level_commas(text: str) -> List[str]:
+    """Split text on top-level commas only."""
+    out: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'" and not in_double:
+            if in_single and i + 1 < len(text) and text[i + 1] == "'":
+                cur.append("''")
+                i += 2
+                continue
+            in_single = not in_single
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            if in_double and i + 1 < len(text) and text[i + 1] == '"':
+                cur.append('""')
+                i += 2
+                continue
+            in_double = not in_double
+            cur.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                out.append("".join(cur).strip())
+                cur = []
+                i += 1
+                continue
+        cur.append(ch)
+        i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
 def replace_index_with_slice(expr: str, idx_var: str, lb: str, ub: str) -> str:
     """Rewrite occurrences of name(idx_var) to name(lb:ub) in expression."""
     pat = re.compile(
@@ -108,7 +155,127 @@ def split_range(rng: str) -> Tuple[str, str]:
     return rng.split(":", 1)[0], rng.split(":", 1)[1]
 
 
-def maybe_elementwise(loop_var: str, rng: str, body_stmt: str) -> Optional[str]:
+def normalize_expr(text: str) -> str:
+    """Normalize expression text for conservative equality checks."""
+    return "".join(text.lower().split())
+
+
+def parse_rank1_decl_bounds(unit: xunset.Unit) -> Dict[str, str]:
+    """Collect rank-1 declaration bounds text as 'lb:ub'."""
+    out: Dict[str, str] = {}
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low or "::" not in low:
+            continue
+        if not re.match(r"^\s*(integer|real|logical|character|complex|type\b|class\b)", low, re.IGNORECASE):
+            continue
+        rhs = low.split("::", 1)[1]
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            # Strip init.
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            if not rest.startswith("("):
+                continue
+            depth = 0
+            end_pos = -1
+            for j, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = j
+                        break
+            if end_pos < 0:
+                continue
+            dims = rest[1:end_pos].strip()
+            if not dims:
+                continue
+            if "," in dims:
+                continue
+            if ":" in dims:
+                lb, ub = dims.split(":", 1)
+                lb = lb.strip() or "1"
+                ub = ub.strip()
+                if not ub:
+                    continue
+                out.setdefault(name, f"{lb}:{ub}")
+            else:
+                d = dims.strip()
+                if not d:
+                    continue
+                out.setdefault(name, f"1:{d}")
+    return out
+
+
+def simplify_section_expr(expr: str, decl_bounds: Dict[str, str]) -> str:
+    """Simplify full-range rank-1 sections to whole arrays when clearly safe."""
+    s = expr
+    # Rule 1: a(1:size(a)) -> a
+    s = re.sub(
+        r"\b([a-z][a-z0-9_]*)\s*\(\s*1\s*:\s*size\s*\(\s*\1\s*\)\s*\)",
+        r"\1",
+        s,
+        flags=re.IGNORECASE,
+    )
+    # Rule 2: a(lb:ub) -> a when section matches declaration bounds.
+    for name, bnd in decl_bounds.items():
+        pat = re.compile(rf"\b{re.escape(name)}\s*\(\s*([^)]*)\)", re.IGNORECASE)
+        def repl(m: re.Match[str]) -> str:
+            rng = m.group(1).strip()
+            if ":" not in rng:
+                return m.group(0)
+            if normalize_expr(rng) == normalize_expr(bnd):
+                return name
+            return m.group(0)
+        s = pat.sub(repl, s)
+    return s
+
+
+def parse_alloc_shape_spec(stmt: str) -> Dict[str, str]:
+    """Parse simple allocate(var(size(expr))) patterns as var -> expr."""
+    out: Dict[str, str] = {}
+    m = ALLOCATE_RE.match(stmt.strip())
+    if not m:
+        return out
+    for chunk in split_top_level_commas(m.group(1)):
+        txt = chunk.strip()
+        mm = re.match(
+            r"^([a-z][a-z0-9_]*)\s*\(\s*size\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*\)\s*$",
+            txt,
+            re.IGNORECASE,
+        )
+        if not mm:
+            continue
+        out[mm.group(1).lower()] = mm.group(2).lower()
+    return out
+
+
+def can_collapse_lhs_alloc(name: str, rng: str, alloc_map: Dict[str, str]) -> bool:
+    """True if lhs range matches known allocate(name(size(src))) pattern."""
+    src = alloc_map.get(name.lower())
+    if src is None:
+        return False
+    if normalize_expr(rng) == normalize_expr(f"1:size({src})"):
+        return True
+    return False
+
+
+def maybe_elementwise(
+    loop_var: str,
+    rng: str,
+    body_stmt: str,
+    decl_bounds: Dict[str, str],
+    alloc_map: Dict[str, str],
+) -> Optional[str]:
     """Detect elementwise assignment loop and build replacement."""
     m = ASSIGN_RE.match(body_stmt.strip())
     if not m:
@@ -129,7 +296,14 @@ def maybe_elementwise(loop_var: str, rng: str, body_stmt: str) -> Optional[str]:
         return None
     if rhs_sliced == rhs:
         return None
-    return f"{lhs_name}({rng}) = {rhs_sliced}"
+    lhs_expr = f"{lhs_name}({rng})"
+    bnd = decl_bounds.get(lhs_name.lower())
+    if bnd is not None and normalize_expr(rng) == normalize_expr(bnd):
+        lhs_expr = lhs_name
+    elif can_collapse_lhs_alloc(lhs_name, rng, alloc_map):
+        lhs_expr = lhs_name
+    rhs_sliced = simplify_section_expr(rhs_sliced, decl_bounds)
+    return f"{lhs_expr} = {rhs_sliced}"
 
 
 def maybe_reduction_sum(
@@ -166,6 +340,7 @@ def maybe_reduction_sum(
         return None
     if expr_sliced == expr:
         return None
+    expr_sliced = simplify_section_expr(expr_sliced, decl_bounds={})
     return f"{acc_name_lhs} = sum({expr_sliced})"
 
 
@@ -203,6 +378,7 @@ def maybe_reduction_product(
         return None
     if expr_sliced == expr:
         return None
+    expr_sliced = simplify_section_expr(expr_sliced, decl_bounds={})
     return f"{acc_name_lhs} = product({expr_sliced})"
 
 
@@ -242,6 +418,8 @@ def maybe_masked_sum(
         return None
     if cond_s == cond or expr_s == expr:
         return None
+    expr_s = simplify_section_expr(expr_s, decl_bounds={})
+    cond_s = simplify_section_expr(cond_s, decl_bounds={})
     return f"{acc} = sum({expr_s}, mask = {cond_s})"
 
 
@@ -279,6 +457,7 @@ def maybe_count(
         return None
     if cond_s == cond:
         return None
+    cond_s = simplify_section_expr(cond_s, decl_bounds={})
     return f"{kname} = count({cond_s})"
 
 
@@ -286,9 +465,12 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     """Analyze one unit for simple loop-to-array opportunities."""
     findings: List[Finding] = []
     body = unit.body
+    decl_bounds = parse_rank1_decl_bounds(unit)
+    alloc_map: Dict[str, str] = {}
     i = 0
     while i < len(body):
         ln, stmt = body[i]
+        alloc_map.update(parse_alloc_shape_spec(stmt))
         mdo = DO_RE.match(stmt.strip())
         if not mdo:
             i += 1
@@ -304,7 +486,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             ln_body, stmt_body = body[i + 1]
             ln_end, stmt_end = body[i + 2]
             if END_DO_RE.match(stmt_end.strip()):
-                sugg_elem = maybe_elementwise(loop_var, rng, stmt_body)
+                sugg_elem = maybe_elementwise(loop_var, rng, stmt_body, decl_bounds, alloc_map)
                 if sugg_elem is not None:
                     findings.append(
                         Finding(
