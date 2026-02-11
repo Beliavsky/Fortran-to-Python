@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 import shutil
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ DO_RE = re.compile(
 END_DO_RE = re.compile(r"^\s*end\s*do\b", re.IGNORECASE)
 IF_THEN_RE = re.compile(r"^\s*if\s*\((.+)\)\s*then\s*$", re.IGNORECASE)
 END_IF_RE = re.compile(r"^\s*end\s*if\b", re.IGNORECASE)
+ONE_LINE_IF_RE = re.compile(r"^\s*if\s*\((.+)\)\s*(.+)$", re.IGNORECASE)
 ASSIGN_RE = re.compile(r"^\s*(.+?)\s*=\s*(.+)$", re.IGNORECASE)
 ALLOCATE_RE = re.compile(r"^\s*allocate\s*\((.*)\)\s*$", re.IGNORECASE)
 SIMPLE_NAME_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*$", re.IGNORECASE)
@@ -40,6 +42,7 @@ ADD_ONE_RE = re.compile(
 
 BEGIN_TAG = "!! beginning of code that xarray.py suggests replacing"
 END_TAG = "!! end of code that xarray.py suggests replacing"
+CHANGED_TAG = "!! changed by xarray.py"
 
 
 @dataclass
@@ -461,6 +464,52 @@ def maybe_count(
     return f"{kname} = count({cond_s})"
 
 
+def maybe_count_inline(
+    loop_var: str,
+    rng: str,
+    prev_stmt: Optional[str],
+    inline_if_stmt: str,
+) -> Optional[str]:
+    """Detect one-line IF count pattern and build COUNT replacement."""
+    if prev_stmt is None:
+        return None
+    mp = ASSIGN_RE.match(prev_stmt.strip())
+    if not mp:
+        return None
+    k_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+    if not k_prev:
+        return None
+    kname = k_prev.group(1).lower()
+
+    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
+    if not mif:
+        return None
+    cond = mif.group(1).strip()
+    body_stmt = mif.group(2).strip()
+    # Exclude block IF form handled elsewhere.
+    if body_stmt.lower().startswith("then"):
+        return None
+
+    ml = ASSIGN_RE.match(body_stmt)
+    if not ml:
+        return None
+    lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
+    if not lhs or lhs.group(1).lower() != kname:
+        return None
+    madd1 = ADD_ONE_RE.match(ml.group(2).strip())
+    if not madd1 or madd1.group(1).lower() != kname:
+        return None
+
+    lb, ubtxt = rng.split(":", 1)
+    cond_s = replace_index_with_slice(cond, loop_var, lb, ubtxt)
+    if has_loop_var(cond_s, loop_var):
+        return None
+    if cond_s == cond:
+        return None
+    cond_s = simplify_section_expr(cond_s, decl_bounds={})
+    return f"{kname} = count({cond_s})"
+
+
 def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     """Analyze one unit for simple loop-to-array opportunities."""
     findings: List[Finding] = []
@@ -529,6 +578,21 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                             start_line=start_line,
                             end_line=ln_end,
                             suggestion=sugg_prod,
+                        )
+                    )
+                    i += 3
+                    continue
+                sugg_cnt_inline = maybe_count_inline(loop_var, rng, prev_stmt, stmt_body)
+                if sugg_cnt_inline is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_count",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line,
+                            end_line=ln_end,
+                            suggestion=sugg_cnt_inline,
                         )
                     )
                     i += 3
@@ -632,6 +696,32 @@ def annotate_file(path: Path, findings: List[Finding]) -> Tuple[int, Optional[Pa
     return inserted, backup
 
 
+def apply_fix_file(path: Path, findings: List[Finding], *, annotate: bool = False) -> Tuple[int, Optional[Path]]:
+    """Replace suggested blocks with array-operation statements."""
+    if not findings:
+        return 0, None
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    changed = 0
+    for f in sorted(findings, key=lambda x: (x.start_line, x.end_line), reverse=True):
+        sidx = f.start_line - 1
+        eidx = f.end_line - 1
+        if sidx < 0 or eidx < 0 or sidx >= len(lines) or eidx >= len(lines) or sidx > eidx:
+            continue
+        raw_s = lines[sidx]
+        eol = "\r\n" if raw_s.endswith("\r\n") else ("\n" if raw_s.endswith("\n") else "\n")
+        indent = re.match(r"^\s*", raw_s).group(0) if raw_s else ""
+        comment = f"  {CHANGED_TAG}" if annotate else ""
+        repl = f"{indent}{f.suggestion}{comment}{eol}"
+        lines[sidx : eidx + 1] = [repl]
+        changed += 1
+    if changed == 0:
+        return 0, None
+    backup = make_backup_path(path)
+    shutil.copy2(path, backup)
+    path.write_text("".join(lines), encoding="utf-8")
+    return changed, backup
+
+
 def main() -> int:
     """Run xarray advisory and optional annotation mode."""
     parser = argparse.ArgumentParser(
@@ -640,8 +730,13 @@ def main() -> int:
     parser.add_argument("fortran_files", type=Path, nargs="*")
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print full replacement suggestions")
+    parser.add_argument("--fix", action="store_true", help="Apply suggested replacements in-place")
     parser.add_argument("--annotate", action="store_true", help="Insert annotated suggestion blocks")
+    parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
     args = parser.parse_args()
+    if args.diff and not args.fix:
+        print("--diff requires --fix.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
@@ -666,7 +761,35 @@ def main() -> int:
         if args.verbose:
             print(f"  suggest: {f.suggestion}")
 
-    if args.annotate:
+    if args.fix:
+        by_file: Dict[Path, List[Finding]] = {}
+        for f in findings:
+            by_file.setdefault(f.path, []).append(f)
+        touched = 0
+        total = 0
+        for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
+            before = p.read_text(encoding="utf-8")
+            n, backup = apply_fix_file(p, by_file[p], annotate=args.annotate)
+            total += n
+            if n > 0:
+                touched += 1
+                print(f"\nFixed {p.name}: replaced {n} block(s), backup {backup.name if backup else '(none)'}")
+                if args.diff:
+                    after = p.read_text(encoding="utf-8")
+                    diff_lines = difflib.unified_diff(
+                        before.splitlines(),
+                        after.splitlines(),
+                        fromfile=f"a/{p.name}",
+                        tofile=f"b/{p.name}",
+                        lineterm="",
+                    )
+                    print("")
+                    for line in diff_lines:
+                        print(line)
+            elif args.verbose:
+                print(f"\nNo fixes applied in {p.name}")
+        print(f"\n--fix summary: files changed {touched}, replaced {total}")
+    elif args.annotate:
         by_file: Dict[Path, List[Finding]] = {}
         for f in findings:
             by_file.setdefault(f.path, []).append(f)
