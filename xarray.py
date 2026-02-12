@@ -80,6 +80,10 @@ EQ_RE = re.compile(r"^\s*(.+?)\s*(==|\.eq\.)\s*(.+?)\s*$", re.IGNORECASE)
 IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 CALL_LIKE_RE = re.compile(r"\b([a-z][a-z0-9_]*)\s*\(", re.IGNORECASE)
 INDEXED_CONST_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*\(\s*(\d+)\s*\)\s*$", re.IGNORECASE)
+PRINT_PREFIX_RE = re.compile(r"^\s*print\s*\*\s*,\s*(.+)\s*$", re.IGNORECASE)
+READ_PREFIX_RE = re.compile(r"^\s*read\s*\*\s*,\s*(.+)\s*$", re.IGNORECASE)
+PRINT_STMT_RE = re.compile(r"^\s*print\s+(.+)$", re.IGNORECASE)
+LOOP_ASSIGN_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
 
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
@@ -2026,6 +2030,210 @@ def maybe_if_any_all(stmt: str, decl_bounds: Dict[str, str]) -> Optional[str]:
     return f"if ({fn}({sec})) {action}"
 
 
+def parse_implied_do_inner(inner: str) -> Optional[Tuple[str, str, str, str, Optional[str]]]:
+    """Parse one implied-DO body: expr, i=lb,ub[,step]."""
+    parts = split_top_level_commas(inner)
+    if len(parts) < 3 or len(parts) > 4:
+        return None
+    expr = parts[0].strip()
+    m_asn = LOOP_ASSIGN_RE.match(parts[1].strip())
+    if not m_asn:
+        return None
+    loop_var = m_asn.group(1).strip()
+    lb = m_asn.group(2).strip()
+    ub = parts[2].strip()
+    step = parts[3].strip() if len(parts) == 4 else None
+    return expr, loop_var, lb, ub, step
+
+
+def simplify_section_expr_rank2(expr: str, rank2_bounds: Dict[str, Tuple[str, str]]) -> str:
+    """Simplify full-range rank-2 sections a(lb1:ub1,lb2:ub2) -> a when safe."""
+    s = expr
+    for name, (b1, b2) in rank2_bounds.items():
+        pat = re.compile(rf"\b{re.escape(name)}\s*\(\s*([^,]+)\s*,\s*([^)]+)\)", re.IGNORECASE)
+
+        def repl(m: re.Match[str]) -> str:
+            r1 = m.group(1).strip()
+            r2 = m.group(2).strip()
+            if normalize_expr(r1) == normalize_expr(f"1:{b1}") and normalize_expr(r2) == normalize_expr(f"1:{b2}"):
+                return name
+            return m.group(0)
+
+        s = pat.sub(repl, s)
+    return s
+
+
+def maybe_print_implied_do(
+    stmt: str,
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[str]:
+    """Detect PRINT implied-DO items and simplify to array expressions."""
+    m = PRINT_PREFIX_RE.match(stmt.strip())
+    if not m:
+        return None
+    tail = m.group(1).strip()
+    items = split_top_level_commas(tail)
+    if not items:
+        return None
+
+    changed = False
+    out_items: List[str] = []
+    for item in items:
+        txt = item.strip()
+        if not (txt.startswith("(") and txt.endswith(")")):
+            out_items.append(txt)
+            continue
+
+        outer = parse_implied_do_inner(txt[1:-1].strip())
+        if outer is None:
+            out_items.append(txt)
+            continue
+        expr, loop_var, lb, ub, step = outer
+        ubtxt = ub if step is None else f"{ub}:{step}"
+
+        expr_s = expr
+        # Handle nested implied-DO, e.g. ((y(i,j), i=1,n1), j=1,n2).
+        if expr.startswith("(") and expr.endswith(")"):
+            inner = parse_implied_do_inner(expr[1:-1].strip())
+            if inner is not None:
+                in_expr, in_var, in_lb, in_ub, in_step = inner
+                in_ubtxt = in_ub if in_step is None else f"{in_ub}:{in_step}"
+                need_transpose = False
+                arr_name: Optional[str] = None
+                in_idx = parse_indexed_name(in_expr)
+                if in_idx is not None and len(in_idx[1]) == 2:
+                    arr_name = in_idx[0].lower()
+                    a1 = in_idx[1][0].strip().lower()
+                    a2 = in_idx[1][1].strip().lower()
+                    if a1 == loop_var.lower() and a2 == in_var.lower():
+                        need_transpose = True
+                nested = replace_affine_index_anydim(in_expr, in_var, in_lb, in_ubtxt)
+                nested = replace_affine_index_anydim(nested, loop_var, lb, ubtxt)
+                if not has_loop_var(nested, in_var) and not has_loop_var(nested, loop_var):
+                    expr_s = nested
+                    if need_transpose and arr_name is not None:
+                        sec_match = re.match(
+                            rf"^\s*{re.escape(arr_name)}\s*\(\s*([^,]+)\s*,\s*([^)]+)\)\s*$",
+                            expr_s,
+                            re.IGNORECASE,
+                        )
+                        rb = rank2_bounds.get(arr_name)
+                        if sec_match and rb is not None:
+                            r1 = sec_match.group(1).strip()
+                            r2 = sec_match.group(2).strip()
+                            if (
+                                normalize_expr(r1) == normalize_expr(f"1:{rb[0]}")
+                                and normalize_expr(r2) == normalize_expr(f"1:{rb[1]}")
+                            ):
+                                expr_s = f"transpose({arr_name})"
+                else:
+                    out_items.append(txt)
+                    continue
+            else:
+                out_items.append(txt)
+                continue
+        else:
+            expr_s = replace_affine_index_anydim(expr_s, loop_var, lb, ubtxt)
+            if has_loop_var(expr_s, loop_var) or expr_s == expr:
+                out_items.append(txt)
+                continue
+
+        expr_s = simplify_section_expr(expr_s, decl_bounds)
+        expr_s = simplify_section_expr_rank2(expr_s, rank2_bounds)
+        out_items.append(expr_s)
+        changed = True
+
+    if not changed:
+        return None
+    return f"print*, {', '.join(out_items)}"
+
+
+def maybe_read_implied_do(
+    stmt: str,
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[str]:
+    """Detect simple READ nested implied-DO and suggest full-array READ."""
+    m = READ_PREFIX_RE.match(stmt.strip())
+    if not m:
+        return None
+    tail = m.group(1).strip()
+    items = split_top_level_commas(tail)
+    if len(items) != 1:
+        return None
+    txt = items[0].strip()
+    if not (txt.startswith("(") and txt.endswith(")")):
+        return None
+
+    outer = parse_implied_do_inner(txt[1:-1].strip())
+    if outer is None:
+        return None
+    expr, loop_var, lb, ub, step = outer
+    if lb.strip() != "1" or (step is not None and step.strip() != "1"):
+        return None
+    if not (expr.startswith("(") and expr.endswith(")")):
+        return None
+
+    inner = parse_implied_do_inner(expr[1:-1].strip())
+    if inner is None:
+        return None
+    in_expr, in_var, in_lb, in_ub, in_step = inner
+    if in_lb.strip() != "1" or (in_step is not None and in_step.strip() != "1"):
+        return None
+
+    in_idx = parse_indexed_name(in_expr)
+    if in_idx is None:
+        return None
+    arr_name, args = in_idx
+    if len(args) != 2:
+        return None
+    if args[0].strip().lower() != in_var.lower():
+        return None
+    if args[1].strip().lower() != loop_var.lower():
+        return None
+
+    rb = rank2_bounds.get(arr_name.lower())
+    if rb is None:
+        return None
+    if normalize_expr(in_ub) != normalize_expr(rb[0]):
+        return None
+    if normalize_expr(ub) != normalize_expr(rb[1]):
+        return None
+    return f"read*, {arr_name}"
+
+
+def maybe_print_loop(
+    loop_var: str,
+    lb: str,
+    ub: str,
+    step: Optional[str],
+    stmt: str,
+    decl_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect DO-loop scalar PRINT over i and suggest array PRINT."""
+    m = PRINT_STMT_RE.match(stmt.strip())
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    parts = split_top_level_commas(rest)
+    if len(parts) != 2:
+        return None
+    fmt = parts[0].strip()
+    item = parts[1].strip()
+    if not fmt:
+        return None
+    # Keep this rule for formatted PRINT only; list-directed is handled elsewhere.
+    if fmt == "*":
+        return None
+
+    ubtxt = ub if step is None else f"{ub}:{step}"
+    item_s = replace_affine_index_anydim(item, loop_var, lb, ubtxt)
+    if item_s == item or has_loop_var(item_s, loop_var):
+        return None
+    item_s = simplify_section_expr(item_s, decl_bounds)
+    return f"print {fmt}, {item_s}"
+
+
 def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     """Analyze one unit for simple loop-to-array opportunities."""
     findings: List[Finding] = []
@@ -2037,6 +2245,32 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     while i < len(body):
         ln, stmt = body[i]
         alloc_map.update(parse_alloc_shape_spec(stmt))
+        sugg_read = maybe_read_implied_do(stmt, rank2_bounds)
+        if sugg_read is not None:
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="implied_do_read",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln,
+                    suggestion=sugg_read,
+                )
+            )
+        sugg_print = maybe_print_implied_do(stmt, decl_bounds, rank2_bounds)
+        if sugg_print is not None:
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="implied_do_print",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln,
+                    suggestion=sugg_print,
+                )
+            )
         sugg_ifaa = maybe_if_any_all(stmt, decl_bounds)
         if sugg_ifaa is not None:
             findings.append(
@@ -2174,6 +2408,21 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             ln_body, stmt_body = body[i + 1]
             ln_end, stmt_end = body[i + 2]
             if END_DO_RE.match(stmt_end.strip()):
+                sugg_ploop = maybe_print_loop(loop_var, lb, ub, step, stmt_body, decl_bounds)
+                if sugg_ploop is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="print_loop",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_ploop,
+                        )
+                    )
+                    i += 3
+                    continue
                 sugg_elem = maybe_elementwise(loop_var, rng, stmt_body, decl_bounds, alloc_map)
                 if sugg_elem is not None:
                     findings.append(
