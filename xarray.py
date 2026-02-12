@@ -76,6 +76,7 @@ class Finding:
 
 
 CMP_RE = re.compile(r"^\s*(.+?)\s*(<=|>=|<|>)\s*(.+?)\s*$", re.IGNORECASE)
+EQ_RE = re.compile(r"^\s*(.+?)\s*(==|\.eq\.)\s*(.+?)\s*$", re.IGNORECASE)
 IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 CALL_LIKE_RE = re.compile(r"\b([a-z][a-z0-9_]*)\s*\(", re.IGNORECASE)
 INDEXED_CONST_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*\(\s*(\d+)\s*\)\s*$", re.IGNORECASE)
@@ -1495,6 +1496,131 @@ def maybe_count_inline(
     return f"{kname} = count({cond_s})"
 
 
+def parse_find_condition(cond: str, loop_var: str) -> Optional[Tuple[str, str]]:
+    """Parse equality condition arr(i) == value into (arr_name, value_expr)."""
+    m = EQ_RE.match(cond.strip())
+    if not m:
+        return None
+    lhs = m.group(1).strip()
+    rhs = m.group(3).strip()
+    li = INDEXED_NAME_RE.match(lhs)
+    ri = INDEXED_NAME_RE.match(rhs)
+    if li and li.group(2).lower() == loop_var.lower() and not ri:
+        if has_loop_var(rhs, loop_var):
+            return None
+        return li.group(1), rhs
+    if ri and ri.group(2).lower() == loop_var.lower() and not li:
+        if has_loop_var(lhs, loop_var):
+            return None
+        return ri.group(1), lhs
+    return None
+
+
+def build_findloc_index_expr(sec: str, val: str, lb: str, step: Optional[str]) -> str:
+    """Build index expression with FINDLOC and loop-range offset adjustment."""
+    loc_expr = f"findloc({sec}, {val}, dim=1, back=.true.)"
+    lb_s = lb.strip()
+    if step is None:
+        if normalize_expr(lb_s) != "1":
+            return f"({lb_s}) - 1 + {loc_expr}"
+        return loc_expr
+    st = step.strip()
+    return f"({lb_s}) + ({st})*({loc_expr} - 1)"
+
+
+def maybe_findloc_inline(
+    loop_var: str,
+    rng: str,
+    step: Optional[str],
+    prev_stmt: Optional[str],
+    inline_if_stmt: str,
+    decl_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect one-line IF find-index pattern and build FINDLOC replacement."""
+    if prev_stmt is None:
+        return None
+    mp = ASSIGN_RE.match(prev_stmt.strip())
+    if not mp:
+        return None
+    idx_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+    if not idx_prev:
+        return None
+    idx_name = idx_prev.group(1).lower()
+    if not ZERO_LITERAL_RE.match(mp.group(2).strip()):
+        return None
+
+    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
+    if not mif:
+        return None
+    cond = mif.group(1).strip()
+    body_stmt = mif.group(2).strip()
+    if body_stmt.lower().startswith("then"):
+        return None
+    mset = ASSIGN_RE.match(body_stmt)
+    if not mset:
+        return None
+    lhs = SIMPLE_NAME_RE.match(mset.group(1).strip())
+    rhs = SIMPLE_NAME_RE.match(mset.group(2).strip())
+    if not lhs or not rhs:
+        return None
+    if lhs.group(1).lower() != idx_name or rhs.group(1).lower() != loop_var.lower():
+        return None
+
+    parsed = parse_find_condition(cond, loop_var)
+    if parsed is None:
+        return None
+    arr, val = parsed
+    lb, _ub = split_range(rng)
+    sec = simplify_section_expr(f"{arr}({rng})", decl_bounds)
+    idx_expr = build_findloc_index_expr(sec, val, lb, step)
+    return f"{idx_name} = {idx_expr}"
+
+
+def maybe_findloc_block(
+    loop_var: str,
+    rng: str,
+    step: Optional[str],
+    prev_stmt: Optional[str],
+    if_stmt: str,
+    body_stmt: str,
+    decl_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect IF-block find-index pattern and build FINDLOC replacement."""
+    if prev_stmt is None:
+        return None
+    mp = ASSIGN_RE.match(prev_stmt.strip())
+    if not mp:
+        return None
+    idx_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+    if not idx_prev:
+        return None
+    idx_name = idx_prev.group(1).lower()
+    if not ZERO_LITERAL_RE.match(mp.group(2).strip()):
+        return None
+
+    mif = IF_THEN_RE.match(if_stmt.strip())
+    if not mif:
+        return None
+    mset = ASSIGN_RE.match(body_stmt.strip())
+    if not mset:
+        return None
+    lhs = SIMPLE_NAME_RE.match(mset.group(1).strip())
+    rhs = SIMPLE_NAME_RE.match(mset.group(2).strip())
+    if not lhs or not rhs:
+        return None
+    if lhs.group(1).lower() != idx_name or rhs.group(1).lower() != loop_var.lower():
+        return None
+
+    parsed = parse_find_condition(mif.group(1).strip(), loop_var)
+    if parsed is None:
+        return None
+    arr, val = parsed
+    lb, _ub = split_range(rng)
+    sec = simplify_section_expr(f"{arr}({rng})", decl_bounds)
+    idx_expr = build_findloc_index_expr(sec, val, lb, step)
+    return f"{idx_name} = {idx_expr}"
+
+
 def maybe_masked_product_inline(
     loop_var: str,
     rng: str,
@@ -2110,6 +2236,21 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
+                sugg_find_inline = maybe_findloc_inline(loop_var, rng, step, prev_stmt, stmt_body, decl_bounds)
+                if sugg_find_inline is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_findloc",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line,
+                            end_line=ln_end,
+                            suggestion=sugg_find_inline,
+                        )
+                    )
+                    i += 3
+                    continue
                 sugg_msum_inline = maybe_masked_sum_inline(loop_var, rng, prev_stmt, stmt_body, decl_bounds)
                 if sugg_msum_inline is not None:
                     findings.append(
@@ -2271,6 +2412,21 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                             start_line=start_line,
                             end_line=ln_end,
                             suggestion=sugg_msum,
+                        )
+                    )
+                    i += 5
+                    continue
+                sugg_find = maybe_findloc_block(loop_var, rng, step, prev_stmt, stmt_if, stmt_inside, decl_bounds)
+                if sugg_find is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_findloc",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line,
+                            end_line=ln_end,
+                            suggestion=sugg_find,
                         )
                     )
                     i += 5
