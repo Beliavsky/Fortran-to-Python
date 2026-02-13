@@ -87,6 +87,41 @@ PRINT_STMT_RE = re.compile(r"^\s*print\s+(.+)$", re.IGNORECASE)
 LOOP_ASSIGN_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
 RANDOM_CALL_RE = re.compile(r"^\s*call\s+random_number\s*\(\s*(.+)\s*\)\s*$", re.IGNORECASE)
 
+# Conservative set of elemental intrinsics that are safe in array expressions.
+ELEMENTAL_INTRINSICS = {
+    "abs",
+    "acos",
+    "asin",
+    "atan",
+    "aint",
+    "anint",
+    "ceiling",
+    "cmplx",
+    "conjg",
+    "cos",
+    "cosh",
+    "dble",
+    "dim",
+    "dprod",
+    "exp",
+    "floor",
+    "int",
+    "log",
+    "log10",
+    "max",
+    "min",
+    "mod",
+    "modulo",
+    "nint",
+    "real",
+    "sign",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+}
+
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve source files from args or current-directory defaults."""
@@ -592,6 +627,18 @@ def split_range(rng: str) -> Tuple[str, str]:
     return rng.split(":", 1)[0], rng.split(":", 1)[1]
 
 
+def range_upper_if_one_based(rng: str) -> Optional[str]:
+    """Return upper bound text for 1-based ranges like 1:n or 1:n:s, else None."""
+    parts = rng.split(":", 2)
+    if len(parts) < 2:
+        return None
+    lb = parts[0].strip()
+    ub = parts[1].strip()
+    if normalize_expr(lb) != normalize_expr("1") or not ub:
+        return None
+    return ub
+
+
 def range_to_do_triplet(rng: str) -> str:
     """Convert lb:ub[:step] range text to implied-do triplet lb,ub[,step]."""
     parts = rng.split(":", 2)
@@ -923,11 +970,29 @@ def maybe_elementwise(
                 sec = lhs_args_sliced[0].strip()
                 pat = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(sec)}\s*\)", re.IGNORECASE)
                 rhs_sliced = pat.sub(lambda m: f"spread({m.group(1)}({sec}), dim=2, ncopies={ncopy})", rhs_sliced)
+                rng_txt = lhs_args_sliced[1].strip()
+                ncopy2 = range_upper_if_one_based(sec)
+                if ncopy2 is not None:
+                    pat2 = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(rng_txt)}\s*\)", re.IGNORECASE)
+                    rhs_sliced = pat2.sub(
+                        lambda m: f"spread({m.group(1)}({rng_txt}), dim=1, ncopies={ncopy2})",
+                        rhs_sliced,
+                    )
             elif lhs_pos == 0:
                 sec = lhs_args_sliced[1].strip()
                 pat = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(sec)}\s*\)", re.IGNORECASE)
                 rhs_sliced = pat.sub(lambda m: f"spread({m.group(1)}({sec}), dim=1, ncopies={ncopy})", rhs_sliced)
+                rng_txt = lhs_args_sliced[0].strip()
+                ncopy2 = range_upper_if_one_based(sec)
+                if ncopy2 is not None:
+                    pat2 = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(rng_txt)}\s*\)", re.IGNORECASE)
+                    rhs_sliced = pat2.sub(
+                        lambda m: f"spread({m.group(1)}({rng_txt}), dim=2, ncopies={ncopy2})",
+                        rhs_sliced,
+                    )
     rhs_sliced = simplify_section_expr(rhs_sliced, decl_bounds)
+    if has_disallowed_function_calls(rhs_sliced, array_names):
+        return None
     return f"{lhs_expr} = {rhs_sliced}"
 
 
@@ -938,6 +1003,7 @@ def maybe_temp_then_elementwise(
     stmt_body: str,
     decl_bounds: Dict[str, str],
     alloc_map: Dict[str, str],
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect temp-scalar then elementwise assignment and inline temp expression."""
     m1 = ASSIGN_RE.match(stmt_temp.strip())
@@ -993,6 +1059,8 @@ def maybe_temp_then_elementwise(
         lhs_expr = lhs_name
 
     rhs2_inlined = simplify_section_expr(rhs2_inlined, decl_bounds)
+    if has_disallowed_function_calls(rhs2_inlined, array_names):
+        return None
     return f"{lhs_expr} = {rhs2_inlined}"
 
 
@@ -1002,6 +1070,7 @@ def maybe_reduction_sum(
     body_stmt: str,
     prev_stmt: Optional[str],
     decl_bounds: Dict[str, str],
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect sum-reduction loop with preceding initialization and build replacement."""
     if prev_stmt is None:
@@ -1032,6 +1101,8 @@ def maybe_reduction_sum(
     if expr_sliced == expr:
         return None
     expr_sliced = simplify_section_expr(expr_sliced, decl_bounds)
+    if has_disallowed_function_calls(expr_sliced, array_names):
+        return None
     return f"{acc_name_lhs} = sum({expr_sliced})"
 
 
@@ -1109,6 +1180,7 @@ def maybe_reduction_product(
     body_stmt: str,
     prev_stmt: Optional[str],
     decl_bounds: Dict[str, str],
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect product-reduction loop and build replacement."""
     if prev_stmt is None:
@@ -1139,6 +1211,8 @@ def maybe_reduction_product(
     if expr_sliced == expr:
         return None
     expr_sliced = simplify_section_expr(expr_sliced, decl_bounds)
+    if has_disallowed_function_calls(expr_sliced, array_names):
+        return None
     return f"{acc_name_lhs} = product({expr_sliced})"
 
 
@@ -1462,6 +1536,19 @@ def has_nonarray_call(expr: str, array_names: Set[str]) -> bool:
     return False
 
 
+def has_disallowed_function_calls(expr: str, array_names: Set[str]) -> bool:
+    """True if expression calls non-array names outside a conservative elemental allowlist."""
+    s = strip_quoted_text(expr.lower())
+    for m in CALL_LIKE_RE.finditer(s):
+        name = m.group(1).lower()
+        if name in array_names:
+            continue
+        if name in ELEMENTAL_INTRINSICS:
+            continue
+        return True
+    return False
+
+
 def maybe_loop_to_concurrent_or_forall(
     loop_var: str,
     rng: str,
@@ -1506,6 +1593,7 @@ def maybe_masked_sum(
     if_stmt: str,
     body_stmt: str,
     decl_bounds: Dict[str, str],
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect masked sum inside IF block within loop."""
     if prev_stmt is None:
@@ -1538,6 +1626,8 @@ def maybe_masked_sum(
         return None
     expr_s = simplify_section_expr(expr_s, decl_bounds)
     cond_s = simplify_section_expr(cond_s, decl_bounds)
+    if has_disallowed_function_calls(expr_s, array_names) or has_disallowed_function_calls(cond_s, array_names):
+        return None
     return f"{acc} = sum({expr_s}, mask = {cond_s})"
 
 
@@ -1548,6 +1638,7 @@ def maybe_masked_product(
     if_stmt: str,
     body_stmt: str,
     decl_bounds: Dict[str, str],
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect masked product inside IF block within loop."""
     if prev_stmt is None:
@@ -1580,6 +1671,8 @@ def maybe_masked_product(
         return None
     expr_s = simplify_section_expr(expr_s, decl_bounds)
     cond_s = simplify_section_expr(cond_s, decl_bounds)
+    if has_disallowed_function_calls(expr_s, array_names) or has_disallowed_function_calls(cond_s, array_names):
+        return None
     return f"{acc} = product({expr_s}, mask = {cond_s})"
 
 
@@ -1806,6 +1899,7 @@ def maybe_masked_product_inline(
     prev_stmt: Optional[str],
     inline_if_stmt: str,
     decl_bounds: Dict[str, str],
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect one-line IF masked product reduction and build PRODUCT replacement."""
     if prev_stmt is None:
@@ -1846,6 +1940,8 @@ def maybe_masked_product_inline(
         return None
     expr_s = simplify_section_expr(expr_s, decl_bounds)
     cond_s = simplify_section_expr(cond_s, decl_bounds)
+    if has_disallowed_function_calls(expr_s, array_names) or has_disallowed_function_calls(cond_s, array_names):
+        return None
     return f"{acc} = product({expr_s}, mask = {cond_s})"
 
 
@@ -1855,6 +1951,7 @@ def maybe_masked_sum_inline(
     prev_stmt: Optional[str],
     inline_if_stmt: str,
     decl_bounds: Dict[str, str],
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect one-line IF masked sum reduction and build SUM replacement."""
     if prev_stmt is None:
@@ -1895,6 +1992,8 @@ def maybe_masked_sum_inline(
         return None
     expr_s = simplify_section_expr(expr_s, decl_bounds)
     cond_s = simplify_section_expr(cond_s, decl_bounds)
+    if has_disallowed_function_calls(expr_s, array_names) or has_disallowed_function_calls(cond_s, array_names):
+        return None
     return f"{acc} = sum({expr_s}, mask = {cond_s})"
 
 
@@ -2102,6 +2201,7 @@ def maybe_conditional_set(
     true_stmt: str,
     false_stmt: str,
     decl_bounds: Dict[str, str],
+    array_names: Set[str],
 ) -> Optional[Tuple[str, str]]:
     """Detect elementwise IF/ELSE assignment and suggest MERGE or WHERE/ELSEWHERE."""
     mif = IF_THEN_RE.match(if_stmt.strip())
@@ -2143,6 +2243,12 @@ def maybe_conditional_set(
     cond_s = simplify_section_expr(cond_s, decl_bounds)
     rhs_t_s = simplify_section_expr(rhs_t_s, decl_bounds)
     rhs_f_s = simplify_section_expr(rhs_f_s, decl_bounds)
+    if (
+        has_disallowed_function_calls(cond_s, array_names)
+        or has_disallowed_function_calls(rhs_t_s, array_names)
+        or has_disallowed_function_calls(rhs_f_s, array_names)
+    ):
+        return None
 
     if is_simple_merge_source(rhs_t_s) and is_simple_merge_source(rhs_f_s):
         return f"{lhs_expr} = merge({rhs_t_s}, {rhs_f_s}, {cond_s})", "elementwise_conditional_merge"
@@ -2626,12 +2732,13 @@ def maybe_spread_nested_2d(
 
     rhs = m_asn.group(2).strip()
     rhs_s = rhs
-    # Replace rank-2 element references that use loop vars with full sections.
-    pat2 = re.compile(
-        rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(dim1_var)}\s*,\s*{re.escape(dim2_var)}\s*\)",
-        re.IGNORECASE,
-    )
-    rhs_s = pat2.sub(lambda m: f"{m.group(1)}(1:{n1}, 1:{n2})", rhs_s)
+    # Replace rank-2 *array* element refs that use loop vars with full sections.
+    for r2name in rank2_bounds.keys():
+        pat2 = re.compile(
+            rf"\b{re.escape(r2name)}\s*\(\s*{re.escape(dim1_var)}\s*,\s*{re.escape(dim2_var)}\s*\)",
+            re.IGNORECASE,
+        )
+        rhs_s = pat2.sub(lambda _m: f"{r2name}(1:{n1}, 1:{n2})", rhs_s)
     # Convert rank-1 refs by loop variable to SPREAD broadcasts.
     pat_dim1 = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(dim1_var)}\s*\)", re.IGNORECASE)
     rhs_s = pat_dim1.sub(lambda m: f"spread({m.group(1)}, dim=2, ncopies={n2})", rhs_s)
@@ -2650,6 +2757,9 @@ def maybe_spread_nested_2d(
 
     rhs_s = simplify_section_expr(rhs_s, decl_bounds1)
     rhs_s = simplify_section_expr_rank2(rhs_s, rank2_bounds)
+    array_names = set(decl_bounds1.keys()) | set(rank2_bounds.keys())
+    if has_disallowed_function_calls(rhs_s, array_names):
+        return None
     if "spread(" not in rhs_s.lower():
         return None
     return f"{lhs_expr} = {rhs_s}"
@@ -3076,7 +3186,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     continue
                 prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
                 start_line = body[i - 1][0] if i - 1 >= 0 else ln
-                sugg_sum = maybe_reduction_sum(loop_var, rng, stmt_body, prev_stmt, decl_bounds)
+                sugg_sum = maybe_reduction_sum(loop_var, rng, stmt_body, prev_stmt, decl_bounds, array_names)
                 if sugg_sum is not None:
                     findings.append(
                         Finding(
@@ -3108,7 +3218,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
-                sugg_prod = maybe_reduction_product(loop_var, rng, stmt_body, prev_stmt, decl_bounds)
+                sugg_prod = maybe_reduction_product(loop_var, rng, stmt_body, prev_stmt, decl_bounds, array_names)
                 if sugg_prod is not None:
                     findings.append(
                         Finding(
@@ -3153,7 +3263,9 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
-                sugg_msum_inline = maybe_masked_sum_inline(loop_var, rng, prev_stmt, stmt_body, decl_bounds)
+                sugg_msum_inline = maybe_masked_sum_inline(
+                    loop_var, rng, prev_stmt, stmt_body, decl_bounds, array_names
+                )
                 if sugg_msum_inline is not None:
                     findings.append(
                         Finding(
@@ -3168,7 +3280,9 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
-                sugg_mprod_inline = maybe_masked_product_inline(loop_var, rng, prev_stmt, stmt_body, decl_bounds)
+                sugg_mprod_inline = maybe_masked_product_inline(
+                    loop_var, rng, prev_stmt, stmt_body, decl_bounds, array_names
+                )
                 if sugg_mprod_inline is not None:
                     findings.append(
                         Finding(
@@ -3205,7 +3319,9 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             _ln_s2, stmt_s2 = body[i + 2]
             ln_end, stmt_end = body[i + 3]
             if END_DO_RE.match(stmt_end.strip()):
-                sugg_temp_elem = maybe_temp_then_elementwise(loop_var, rng, stmt_s1, stmt_s2, decl_bounds, alloc_map)
+                sugg_temp_elem = maybe_temp_then_elementwise(
+                    loop_var, rng, stmt_s1, stmt_s2, decl_bounds, alloc_map, array_names
+                )
                 if sugg_temp_elem is not None:
                     findings.append(
                         Finding(
@@ -3272,7 +3388,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                 and END_IF_RE.match(stmt_eif.strip())
                 and END_DO_RE.match(stmt_end.strip())
             ):
-                sugg_cond = maybe_conditional_set(loop_var, rng, stmt_if, stmt_t, stmt_f, decl_bounds)
+                sugg_cond = maybe_conditional_set(loop_var, rng, stmt_if, stmt_t, stmt_f, decl_bounds, array_names)
                 if sugg_cond is not None:
                     suggestion, rule = sugg_cond
                     findings.append(
@@ -3303,7 +3419,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             if IF_THEN_RE.match(stmt_if.strip()) and END_IF_RE.match(stmt_eif.strip()) and END_DO_RE.match(stmt_end.strip()):
                 prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
                 start_line = body[i - 1][0] if i - 1 >= 0 else ln
-                sugg_msum = maybe_masked_sum(loop_var, rng, prev_stmt, stmt_if, stmt_inside, decl_bounds)
+                sugg_msum = maybe_masked_sum(loop_var, rng, prev_stmt, stmt_if, stmt_inside, decl_bounds, array_names)
                 if sugg_msum is not None:
                     findings.append(
                         Finding(
@@ -3333,7 +3449,9 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 5
                     continue
-                sugg_mprod = maybe_masked_product(loop_var, rng, prev_stmt, stmt_if, stmt_inside, decl_bounds)
+                sugg_mprod = maybe_masked_product(
+                    loop_var, rng, prev_stmt, stmt_if, stmt_inside, decl_bounds, array_names
+                )
                 if sugg_mprod is not None:
                     findings.append(
                         Finding(
