@@ -659,11 +659,23 @@ def parse_rank1_decl_bounds(unit: xunset.Unit) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for _ln, stmt in unit.body:
         low = stmt.strip().lower()
-        if not low or "::" not in low:
+        if not low:
             continue
         if not re.match(r"^\s*(integer|real|logical|character|complex|type\b|class\b)", low, re.IGNORECASE):
             continue
-        rhs = low.split("::", 1)[1]
+        rhs = ""
+        if "::" in low:
+            rhs = low.split("::", 1)[1]
+        else:
+            m_no = re.match(
+                r"^\s*(integer|real|logical|character|complex)"
+                r"(?:\s*(?:\([^)]*\)|\*\s*\d+))?\s+(.+)$",
+                low,
+                re.IGNORECASE,
+            )
+            if not m_no:
+                continue
+            rhs = m_no.group(2)
         for chunk in split_top_level_commas(rhs):
             txt = chunk.strip()
             if not txt:
@@ -826,11 +838,23 @@ def collect_rank1_array_names(unit: xunset.Unit) -> Set[str]:
     out: Set[str] = set()
     for _ln, stmt in unit.body:
         low = stmt.strip().lower()
-        if not low or "::" not in low:
+        if not low:
             continue
         if not re.match(r"^\s*(integer|real|logical|character|complex|type\b|class\b)", low, re.IGNORECASE):
             continue
-        rhs = low.split("::", 1)[1]
+        rhs = ""
+        if "::" in low:
+            rhs = low.split("::", 1)[1]
+        else:
+            m_no = re.match(
+                r"^\s*(integer|real|logical|character|complex)"
+                r"(?:\s*(?:\([^)]*\)|\*\s*\d+))?\s+(.+)$",
+                low,
+                re.IGNORECASE,
+            )
+            if not m_no:
+                continue
+            rhs = m_no.group(2)
         for chunk in split_top_level_commas(rhs):
             txt = chunk.strip()
             if not txt:
@@ -1341,6 +1365,188 @@ def parse_indexed_name(text: str) -> Optional[Tuple[str, List[str]]]:
     return name, args
 
 
+def parse_rank1_const_lhs_target(lhs: str) -> Optional[Tuple[str, int, int]]:
+    """Parse lhs as rank-1 name(k) or name(k1:k2) with integer bounds."""
+    m = re.match(r"^\s*([a-z][a-z0-9_]*)\s*\(\s*(.+)\s*\)\s*$", lhs, re.IGNORECASE)
+    if not m:
+        return None
+    name = m.group(1)
+    inner = m.group(2).strip()
+    if "," in inner:
+        return None
+    if ":" in inner:
+        parts = inner.split(":", 1)
+        lo_txt = parts[0].strip()
+        hi_txt = parts[1].strip()
+        if not lo_txt or not hi_txt:
+            return None
+        if not re.fullmatch(r"[+-]?\d+", lo_txt) or not re.fullmatch(r"[+-]?\d+", hi_txt):
+            return None
+        lo = int(lo_txt)
+        hi = int(hi_txt)
+        if hi < lo:
+            return None
+        return name, lo, hi
+    if not re.fullmatch(r"[+-]?\d+", inner):
+        return None
+    k = int(inner)
+    return name, k, k
+
+
+def parse_array_constructor_values(rhs: str) -> Optional[List[str]]:
+    """Parse bracket or slash-delimited constructor into value items."""
+    txt = rhs.strip()
+    if txt.startswith("[") and txt.endswith("]"):
+        inside = txt[1:-1].strip()
+    elif txt.startswith("(/") and txt.endswith("/)"):
+        inside = txt[2:-2].strip()
+    else:
+        return None
+    if not inside:
+        return []
+    vals = [v.strip() for v in split_top_level_commas(inside)]
+    if any(not v for v in vals):
+        return None
+    return vals
+
+
+def rhs_constructor_items(rhs: str) -> List[str]:
+    """Return constructor items from rhs or scalar rhs as one item."""
+    ctor = parse_array_constructor_values(rhs)
+    if ctor is not None:
+        return ctor
+    return [rhs.strip()]
+
+
+def maybe_constructor_pack(
+    body: List[Tuple[int, str]],
+    start_idx: int,
+    decl_bounds: Dict[str, str],
+) -> Optional[Tuple[int, str]]:
+    """Detect consecutive rank-1 const-index assignments packable into one constructor."""
+    if start_idx >= len(body):
+        return None
+    ln0, stmt0 = body[start_idx]
+    m0 = ASSIGN_RE.match(stmt0.strip())
+    if not m0:
+        return None
+    lhs0 = parse_rank1_const_lhs_target(m0.group(1).strip())
+    if lhs0 is None:
+        return None
+    name, lo0, hi0 = lhs0
+    rhs0 = m0.group(2).strip()
+    items0 = rhs_constructor_items(rhs0)
+    if (hi0 - lo0 + 1) != len(items0):
+        return None
+    # Avoid self-reference: constructor assignment evaluates rhs before lhs update.
+    if re.search(rf"\b{re.escape(name)}\b", strip_quoted_text(rhs0), re.IGNORECASE):
+        return None
+
+    parts: List[str] = list(items0)
+    last_hi = hi0
+    end_idx = start_idx
+    j = start_idx + 1
+    while j < len(body):
+        _ln, stmt = body[j]
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            break
+        lhs = parse_rank1_const_lhs_target(m.group(1).strip())
+        if lhs is None or lhs[0].lower() != name.lower():
+            break
+        lo, hi = lhs[1], lhs[2]
+        if lo != last_hi + 1:
+            break
+        rhs = m.group(2).strip()
+        if re.search(rf"\b{re.escape(name)}\b", strip_quoted_text(rhs), re.IGNORECASE):
+            break
+        items = rhs_constructor_items(rhs)
+        if (hi - lo + 1) != len(items):
+            break
+        parts.extend(items)
+        last_hi = hi
+        end_idx = j
+        j += 1
+
+    if end_idx == start_idx:
+        return None
+    lhs_expr = f"{name}({lo0}:{last_hi})"
+    bnd = decl_bounds.get(name.lower())
+    if bnd is not None and ":" in bnd:
+        b_lo, b_hi = bnd.split(":", 1)
+        if (
+            normalize_expr(str(lo0)) == normalize_expr("1")
+            and normalize_expr(b_lo or "1") == normalize_expr("1")
+            and normalize_expr(str(last_hi)) == normalize_expr(b_hi)
+        ):
+            lhs_expr = name
+    suggestion = f"{lhs_expr} = [{', '.join(parts)}]"
+    return end_idx, suggestion
+
+
+def maybe_constructor_pack_sparse(
+    body: List[Tuple[int, str]],
+    start_idx: int,
+) -> Optional[Tuple[int, str]]:
+    """Detect consecutive scalar-index assignments to same rank-1 array with sparse indices."""
+    if start_idx >= len(body):
+        return None
+    m0 = ASSIGN_RE.match(body[start_idx][1].strip())
+    if not m0:
+        return None
+    lhs0 = parse_rank1_const_lhs_target(m0.group(1).strip())
+    if lhs0 is None:
+        return None
+    name0, lo0, hi0 = lhs0
+    if lo0 != hi0:
+        return None
+    rhs0 = m0.group(2).strip()
+    if re.search(rf"\b{re.escape(name0)}\b", strip_quoted_text(rhs0), re.IGNORECASE):
+        return None
+
+    idxs: List[int] = [lo0]
+    vals: List[str] = [rhs0]
+    seen: Set[int] = {lo0}
+    end_idx = start_idx
+    j = start_idx + 1
+    while j < len(body):
+        m = ASSIGN_RE.match(body[j][1].strip())
+        if not m:
+            break
+        lhs = parse_rank1_const_lhs_target(m.group(1).strip())
+        if lhs is None or lhs[0].lower() != name0.lower():
+            break
+        lo, hi = lhs[1], lhs[2]
+        if lo != hi:
+            break
+        if lo in seen:
+            return None
+        rhs = m.group(2).strip()
+        if re.search(rf"\b{re.escape(name0)}\b", strip_quoted_text(rhs), re.IGNORECASE):
+            break
+        idxs.append(lo)
+        vals.append(rhs)
+        seen.add(lo)
+        end_idx = j
+        j += 1
+
+    if end_idx == start_idx:
+        return None
+    # If contiguous, let constructor_pack handle it.
+    is_contig = True
+    for k in range(1, len(idxs)):
+        if idxs[k] != idxs[k - 1] + 1:
+            is_contig = False
+            break
+    if is_contig:
+        return None
+
+    idx_vec = ", ".join(str(k) for k in idxs)
+    val_vec = ", ".join(vals)
+    suggestion = f"{name0}([{idx_vec}]) = [{val_vec}]"
+    return end_idx, suggestion
+
+
 def maybe_matmul_mv_nested(
     outer_loop_var: str,
     outer_rng: str,
@@ -1694,6 +1900,9 @@ def maybe_count(
     if not k_prev:
         return None
     kname = k_prev.group(1).lower()
+    if kname == "count":
+        # Avoid invalid/ambiguous rewrites like "count = count(...)".
+        return None
     mif = IF_THEN_RE.match(if_stmt.strip())
     ml = ASSIGN_RE.match(body_stmt.strip())
     if not mif or not ml:
@@ -1735,6 +1944,9 @@ def maybe_count_inline(
     if not k_prev:
         return None
     kname = k_prev.group(1).lower()
+    if kname == "count":
+        # Avoid invalid/ambiguous rewrites like "count = count(...)".
+        return None
 
     mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
     if not mif:
@@ -2905,6 +3117,38 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     suggestion=sugg_ifaa,
                 )
             )
+        pack = maybe_constructor_pack(body, i, decl_bounds)
+        if pack is not None:
+            end_idx, sugg_pack = pack
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="constructor_pack",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=body[end_idx][0],
+                    suggestion=sugg_pack,
+                )
+            )
+            i = end_idx + 1
+            continue
+        pack_sparse = maybe_constructor_pack_sparse(body, i)
+        if pack_sparse is not None:
+            end_idx, sugg_pack = pack_sparse
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="constructor_pack_sparse",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=body[end_idx][0],
+                    suggestion=sugg_pack,
+                )
+            )
+            i = end_idx + 1
+            continue
         mdo = DO_RE.match(stmt.strip())
         if not mdo:
             i += 1
@@ -3865,7 +4109,6 @@ def main() -> int:
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print full replacement suggestions")
     parser.add_argument(
-        "-summary",
         "--summary",
         action="store_true",
         help="Print per-file summary: file candidates before_lines after_lines delta",
@@ -3910,9 +4153,10 @@ def main() -> int:
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
         return 2
-    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    baseline_compile_paths = files
+    after_compile_paths = [args.out] if (args.fix and args.out is not None) else files
     if args.fix and args.compiler:
-        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+        if not fbuild.run_compiler_command(args.compiler, baseline_compile_paths, "baseline", fscan.display_path):
             return 5
 
     findings: List[Finding] = []
@@ -4026,7 +4270,7 @@ def main() -> int:
             cand_n = len(by_file_candidates.get(p, []))
             print(f"{fscan.display_path(p)} {cand_n} {before_n} {before_n} 0")
     if args.fix and args.compiler:
-        if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+        if not fbuild.run_compiler_command(args.compiler, after_compile_paths, "after-fix", fscan.display_path):
             return 5
     return 0
 
