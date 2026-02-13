@@ -887,6 +887,118 @@ def collect_rank1_array_names(unit: xunset.Unit) -> Set[str]:
     return out
 
 
+def collect_rank1_whole_assign_blocked(unit: xunset.Unit) -> Set[str]:
+    """Collect rank-1 names where section->whole rewrite should be avoided."""
+    blocked: Set[str] = set()
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low:
+            continue
+        if not re.match(r"^\s*(integer|real|logical|character|complex|type\b|class\b)", low, re.IGNORECASE):
+            continue
+
+        decl_head = ""
+        rhs = ""
+        if "::" in low:
+            left, right = low.split("::", 1)
+            decl_head = left.strip()
+            rhs = right
+        else:
+            m_no = re.match(
+                r"^\s*(integer|real|logical|character|complex)"
+                r"(?:\s*(?:\([^)]*\)|\*\s*\d+))?\s+(.+)$",
+                low,
+                re.IGNORECASE,
+            )
+            if not m_no:
+                continue
+            decl_head = m_no.group(1).strip()
+            rhs = m_no.group(2)
+
+        attrs_block = (
+            re.search(r"\ballocatable\b", decl_head, re.IGNORECASE) is not None
+            or re.search(r"\bpointer\b", decl_head, re.IGNORECASE) is not None
+            or re.match(r"^\s*class\b", decl_head, re.IGNORECASE) is not None
+        )
+
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            if not rest.startswith("("):
+                continue
+            depth = 0
+            end_pos = -1
+            for j, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = j
+                        break
+            if end_pos < 0:
+                continue
+            dims = rest[1:end_pos].strip()
+            if not dims or "," in dims:
+                continue
+            # Deferred/assumed-shape or assumed-size rank-1 should not be rewritten.
+            if ":" in dims:
+                blocked.add(name)
+                continue
+            if attrs_block:
+                blocked.add(name)
+    return blocked
+
+
+def collect_rank1_class_names(unit: xunset.Unit) -> Set[str]:
+    """Collect rank-1 CLASS(...) declaration names (always blocked for whole-array rewrite)."""
+    out: Set[str] = set()
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low or "::" not in low:
+            continue
+        if not re.match(r"^\s*class\b", low, re.IGNORECASE):
+            continue
+        rhs = low.split("::", 1)[1]
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            if not rest.startswith("("):
+                continue
+            depth = 0
+            end_pos = -1
+            for j, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = j
+                        break
+            if end_pos < 0:
+                continue
+            dims = rest[1:end_pos].strip()
+            if dims and "," not in dims:
+                out.add(name)
+    return out
+
+
 def simplify_section_expr(expr: str, decl_bounds: Dict[str, str]) -> str:
     """Simplify full-range rank-1 sections to whole arrays when clearly safe."""
     s = expr
@@ -918,6 +1030,141 @@ def simplify_section_expr(expr: str, decl_bounds: Dict[str, str]) -> str:
             return m.group(0)
         s = pat.sub(repl, s)
     return s
+
+
+def maybe_whole_array_assign(
+    stmt: str,
+    decl_bounds: Dict[str, str],
+    blocked_names: Set[str],
+    class_names: Set[str],
+    alloc_rank1_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect full-rank1 section assignment and suggest whole-array assignment."""
+    m = ASSIGN_RE.match(stmt.strip())
+    if not m:
+        return None
+    lhs = m.group(1).strip()
+    rhs = m.group(2).strip()
+    parsed = parse_indexed_name(lhs)
+    if parsed is None:
+        return None
+    name, args = parsed
+    if len(args) != 1:
+        return None
+    lname = name.lower()
+    if lname in class_names:
+        return None
+    rng = args[0].strip()
+    full = False
+    bnd = decl_bounds.get(lname)
+    if bnd is not None:
+        if rng == ":":
+            full = True
+        elif ":" in rng and normalize_expr(rng) == normalize_expr(bnd):
+            full = True
+    if not full and lname in alloc_rank1_bounds:
+        abnd = alloc_rank1_bounds[lname]
+        if ":" in rng and normalize_expr(rng) == normalize_expr(abnd):
+            full = True
+    if lname in blocked_names:
+        # Allow deferred/alloc/pointer only for scalar literal rhs when
+        # full allocation bounds are known from prior ALLOCATE(name(...)).
+        scalar_lit = bool(
+            NUM_LITERAL_RE.match(rhs) or LOGICAL_LITERAL_RE.match(rhs) or CHAR_LITERAL_RE.match(rhs)
+        )
+        if not (scalar_lit and lname in alloc_rank1_bounds and full):
+            return None
+    if not full:
+        return None
+    return f"{name} = {rhs}"
+
+
+def parse_alloc_rank1_bounds(stmt: str) -> Dict[str, str]:
+    """Parse simple ALLOCATE(name(ub)) or ALLOCATE(name(lb:ub)) into rank-1 bounds."""
+    out: Dict[str, str] = {}
+    m = ALLOCATE_RE.match(stmt.strip())
+    if not m:
+        return out
+    for chunk in split_top_level_commas(m.group(1)):
+        txt = chunk.strip()
+        if not txt:
+            continue
+        if "=" in txt and "=>" not in txt:
+            continue
+        mm = re.match(r"^([a-z][a-z0-9_]*)\s*\((.*)\)\s*$", txt, re.IGNORECASE)
+        if not mm:
+            continue
+        name = mm.group(1).lower()
+        dims = mm.group(2).strip()
+        if not dims or "," in dims:
+            continue
+        if ":" in dims:
+            lb, ub = dims.split(":", 1)
+            lb = lb.strip() or "1"
+            ub = ub.strip()
+            if not ub:
+                continue
+            out[name] = f"{lb}:{ub}"
+        else:
+            ub = dims.strip()
+            if not ub:
+                continue
+            out[name] = f"1:{ub}"
+    return out
+
+
+def parse_allocate_for_source(stmt: str) -> Optional[Tuple[str, str, List[str]]]:
+    """Parse allocate(...) as (base_name, alloc_object_text, option_chunks) for source rewrite."""
+    m = ALLOCATE_RE.match(stmt.strip())
+    if not m:
+        return None
+    inside = m.group(1).strip()
+    if not inside:
+        return None
+    chunks = split_top_level_commas(inside)
+    objs: List[str] = []
+    opts: List[str] = []
+    for ch in chunks:
+        txt = ch.strip()
+        if not txt:
+            continue
+        if "=" in txt and "=>" not in txt:
+            key = txt.split("=", 1)[0].strip().lower()
+            if key in {"source", "mold"}:
+                return None
+            opts.append(txt)
+            continue
+        objs.append(txt)
+    if len(objs) != 1:
+        return None
+    obj = objs[0]
+    mobj = re.match(r"^\s*([a-z][a-z0-9_]*)\b", obj, re.IGNORECASE)
+    if not mobj:
+        return None
+    return mobj.group(1), obj, opts
+
+
+def maybe_allocate_source_pair(stmt_alloc: str, stmt_next: str) -> Optional[str]:
+    """Detect allocate(x(...)); x = rhs and suggest allocate(x(...), source=rhs)."""
+    parsed = parse_allocate_for_source(stmt_alloc)
+    if parsed is None:
+        return None
+    base, obj, opts = parsed
+    m_asn = ASSIGN_RE.match(stmt_next.strip())
+    if not m_asn:
+        return None
+    lhs = m_asn.group(1).strip()
+    rhs = m_asn.group(2).strip()
+    m_lhs = SIMPLE_NAME_RE.match(lhs)
+    if not m_lhs or m_lhs.group(1).lower() != base.lower():
+        return None
+    # Conservative: skip self-reference in SOURCE expression.
+    if re.search(rf"\b{re.escape(base)}\b", strip_quoted_text(rhs), re.IGNORECASE):
+        return None
+    inner_parts: List[str] = [obj]
+    inner_parts.extend(opts)
+    inner_parts.append(f"source={rhs}")
+    return f"allocate({', '.join(inner_parts)})"
 
 
 def parse_alloc_shape_spec(stmt: str) -> Dict[str, str]:
@@ -3071,13 +3318,33 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     decl_bounds = parse_rank1_decl_bounds(unit)
     rank2_bounds = parse_rank2_decl_bounds(unit)
     rank3_bounds = parse_rank3_decl_bounds(unit)
+    blocked_whole_names = collect_rank1_whole_assign_blocked(unit)
+    class_rank1_names = collect_rank1_class_names(unit)
     array_names: Set[str] = set(decl_bounds.keys()) | set(rank2_bounds.keys()) | set(rank3_bounds.keys())
     array_names |= collect_rank1_array_names(unit)
     alloc_map: Dict[str, str] = {}
+    alloc_rank1_bounds: Dict[str, str] = {}
     i = 0
     while i < len(body):
         ln, stmt = body[i]
         alloc_map.update(parse_alloc_shape_spec(stmt))
+        alloc_rank1_bounds.update(parse_alloc_rank1_bounds(stmt))
+        if i + 1 < len(body):
+            sugg_alloc_src = maybe_allocate_source_pair(stmt, body[i + 1][1])
+            if sugg_alloc_src is not None:
+                findings.append(
+                    Finding(
+                        path=unit.path,
+                        rule="allocate_source",
+                        unit_kind=unit.kind,
+                        unit_name=unit.name,
+                        start_line=ln,
+                        end_line=body[i + 1][0],
+                        suggestion=sugg_alloc_src,
+                    )
+                )
+                i += 2
+                continue
         sugg_read = maybe_read_implied_do(stmt, rank2_bounds)
         if sugg_read is not None:
             findings.append(
@@ -3115,6 +3382,21 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     start_line=ln,
                     end_line=ln,
                     suggestion=sugg_ifaa,
+                )
+            )
+        sugg_whole = maybe_whole_array_assign(
+            stmt, decl_bounds, blocked_whole_names, class_rank1_names, alloc_rank1_bounds
+        )
+        if sugg_whole is not None:
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="whole_array_assign",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln,
+                    suggestion=sugg_whole,
                 )
             )
         pack = maybe_constructor_pack(body, i, decl_bounds)
