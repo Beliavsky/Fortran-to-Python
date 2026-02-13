@@ -958,6 +958,265 @@ def collect_rank1_whole_assign_blocked(unit: xunset.Unit) -> Set[str]:
     return blocked
 
 
+def collect_rank1_nondefault_real_names(unit: xunset.Unit) -> Set[str]:
+    """Collect rank-1 REAL/DOUBLE PRECISION arrays with nondefault real kind."""
+    out: Set[str] = set()
+    for _ln, stmt in unit.body:
+        raw = stmt.strip()
+        low = raw.lower()
+        if not low:
+            continue
+
+        is_nondefault_real_decl = False
+        if re.match(r"^\s*double\s+precision\b", low):
+            is_nondefault_real_decl = True
+        elif re.match(r"^\s*real\b", low):
+            if re.search(r"^\s*real\s*\*", low):
+                is_nondefault_real_decl = True
+            elif re.search(r"^\s*real\s*\(", low):
+                is_nondefault_real_decl = True
+        if not is_nondefault_real_decl:
+            continue
+
+        rhs = ""
+        if "::" in low:
+            rhs = low.split("::", 1)[1]
+        else:
+            m_no = re.match(
+                r"^\s*(?:double\s+precision|real(?:\s*(?:\([^)]*\)|\*\s*\d+))?)\s+(.+)$",
+                low,
+                re.IGNORECASE,
+            )
+            if not m_no:
+                continue
+            rhs = m_no.group(1)
+
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            if not rest.startswith("("):
+                continue
+            depth = 0
+            end_pos = -1
+            for j, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = j
+                        break
+            if end_pos < 0:
+                continue
+            dims = rest[1:end_pos].strip()
+            if dims and "," not in dims:
+                out.add(name)
+    return out
+
+
+def collect_scalar_nondefault_real_names(unit: xunset.Unit) -> Set[str]:
+    """Collect scalar names declared as nondefault REAL in one unit."""
+    out: Set[str] = set()
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low:
+            continue
+        is_nondefault_real_decl = False
+        if re.match(r"^\s*double\s+precision\b", low):
+            is_nondefault_real_decl = True
+        elif re.match(r"^\s*real\b", low):
+            if re.search(r"^\s*real\s*\*", low):
+                is_nondefault_real_decl = True
+            elif re.search(r"^\s*real\s*\(", low):
+                is_nondefault_real_decl = True
+        if not is_nondefault_real_decl:
+            continue
+
+        rhs = ""
+        if "::" in low:
+            rhs = low.split("::", 1)[1]
+        else:
+            m_no = re.match(
+                r"^\s*(?:double\s+precision|real(?:\s*(?:\([^)]*\)|\*\s*\d+))?)\s+(.+)$",
+                low,
+                re.IGNORECASE,
+            )
+            if not m_no:
+                continue
+            rhs = m_no.group(1)
+
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            # Scalar declaration entity has no (...) declarator.
+            if not rest.startswith("("):
+                out.add(name)
+    return out
+
+
+def collect_rank1_complex_names(unit: xunset.Unit) -> Set[str]:
+    """Collect rank-1 COMPLEX array names in one unit."""
+    out: Set[str] = set()
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low:
+            continue
+        if not re.match(r"^\s*complex\b", low, re.IGNORECASE):
+            continue
+        rhs = ""
+        if "::" in low:
+            rhs = low.split("::", 1)[1]
+        else:
+            m_no = re.match(
+                r"^\s*complex(?:\s*(?:\([^)]*\)|\*\s*\d+))?\s+(.+)$",
+                low,
+                re.IGNORECASE,
+            )
+            if not m_no:
+                continue
+            rhs = m_no.group(1)
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            if not rest.startswith("("):
+                continue
+            depth = 0
+            end_pos = -1
+            for j, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = j
+                        break
+            if end_pos < 0:
+                continue
+            dims = rest[1:end_pos].strip()
+            if dims and "," not in dims:
+                out.add(name)
+    return out
+
+
+def collect_character_scalar_names(unit: xunset.Unit) -> Set[str]:
+    """Collect scalar CHARACTER entity names (substring targets must not be packed)."""
+    out: Set[str] = set()
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low:
+            continue
+        if not re.match(r"^\s*character\b", low, re.IGNORECASE):
+            continue
+        rhs = ""
+        if "::" in low:
+            rhs = low.split("::", 1)[1]
+        else:
+            m_no = re.match(r"^\s*character(?:\s*(?:\([^)]*\)|\*\s*\d+))?\s+(.+)$", low, re.IGNORECASE)
+            if not m_no:
+                continue
+            rhs = m_no.group(1)
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            # Scalar character has no array declarator after entity name.
+            if not rest.startswith("("):
+                out.add(name)
+    return out
+
+
+def parse_char_length_from_spec(spec: str) -> Optional[int]:
+    """Parse fixed CHARACTER length from type-spec text, return None if unknown."""
+    s = spec.strip().lower()
+    m_star = re.search(r"character\s*\*\s*(\d+)", s, re.IGNORECASE)
+    if m_star:
+        return int(m_star.group(1))
+    m_paren = re.search(r"character\s*\((.*)\)", s, re.IGNORECASE)
+    if m_paren:
+        inner = m_paren.group(1)
+        m_len = re.search(r"\blen\s*=\s*(\d+)\b", inner, re.IGNORECASE)
+        if m_len:
+            return int(m_len.group(1))
+        if re.fullmatch(r"\s*\d+\s*", inner):
+            return int(inner.strip())
+    return None
+
+
+def collect_character_scalar_lengths(unit: xunset.Unit) -> Dict[str, int]:
+    """Collect scalar CHARACTER names with fixed length in one unit."""
+    out: Dict[str, int] = {}
+    for _ln, stmt in unit.body:
+        raw = stmt.strip()
+        low = raw.lower()
+        if not low:
+            continue
+        if not re.match(r"^\s*character\b", low, re.IGNORECASE):
+            continue
+
+        decl_head = ""
+        rhs = ""
+        if "::" in low:
+            left, right = low.split("::", 1)
+            decl_head = left.strip()
+            rhs = right
+        else:
+            m_no = re.match(r"^\s*(character(?:\s*(?:\([^)]*\)|\*\s*\d+))?)\s+(.+)$", low, re.IGNORECASE)
+            if not m_no:
+                continue
+            decl_head = m_no.group(1).strip()
+            rhs = m_no.group(2)
+        nlen = parse_char_length_from_spec(decl_head)
+        if nlen is None:
+            continue
+
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            if rest.startswith("("):
+                continue
+            out[name] = nlen
+    return out
+
+
 def collect_rank1_class_names(unit: xunset.Unit) -> Set[str]:
     """Collect rank-1 CLASS(...) declaration names (always blocked for whole-array rewrite)."""
     out: Set[str] = set()
@@ -1665,10 +1924,36 @@ def rhs_constructor_items(rhs: str) -> List[str]:
     return [rhs.strip()]
 
 
+def is_numeric_literal_text(text: str) -> bool:
+    """True for simple numeric literals (integer/real, optional kind/exponent)."""
+    return NUM_LITERAL_RE.match(text.strip()) is not None
+
+
+def allow_constructor_for_nondefault_real_with_scalars(
+    parts: List[str], scalar_nondefault_real_names: Set[str]
+) -> bool:
+    """Conservative gate for nondefault-real constructor rewrites with scalar-name support."""
+    if not parts:
+        return False
+    for p in parts:
+        t = p.strip()
+        if is_numeric_literal_text(t):
+            continue
+        mname = SIMPLE_NAME_RE.match(t)
+        if mname and mname.group(1).lower() in scalar_nondefault_real_names:
+            continue
+        return False
+    return True
+
+
 def maybe_constructor_pack(
     body: List[Tuple[int, str]],
     start_idx: int,
     decl_bounds: Dict[str, str],
+    nondefault_real_names: Set[str],
+    scalar_nondefault_real_names: Set[str],
+    complex_rank1_names: Set[str],
+    character_scalar_names: Set[str],
 ) -> Optional[Tuple[int, str]]:
     """Detect consecutive rank-1 const-index assignments packable into one constructor."""
     if start_idx >= len(body):
@@ -1681,6 +1966,10 @@ def maybe_constructor_pack(
     if lhs0 is None:
         return None
     name, lo0, hi0 = lhs0
+    if name.lower() in complex_rank1_names:
+        return None
+    if name.lower() in character_scalar_names:
+        return None
     rhs0 = m0.group(2).strip()
     items0 = rhs_constructor_items(rhs0)
     if (hi0 - lo0 + 1) != len(items0):
@@ -1717,6 +2006,10 @@ def maybe_constructor_pack(
 
     if end_idx == start_idx:
         return None
+    if name.lower() in nondefault_real_names and not allow_constructor_for_nondefault_real_with_scalars(
+        parts, scalar_nondefault_real_names
+    ):
+        return None
     lhs_expr = f"{name}({lo0}:{last_hi})"
     bnd = decl_bounds.get(name.lower())
     if bnd is not None and ":" in bnd:
@@ -1734,6 +2027,10 @@ def maybe_constructor_pack(
 def maybe_constructor_pack_sparse(
     body: List[Tuple[int, str]],
     start_idx: int,
+    nondefault_real_names: Set[str],
+    scalar_nondefault_real_names: Set[str],
+    complex_rank1_names: Set[str],
+    character_scalar_names: Set[str],
 ) -> Optional[Tuple[int, str]]:
     """Detect consecutive scalar-index assignments to same rank-1 array with sparse indices."""
     if start_idx >= len(body):
@@ -1745,6 +2042,10 @@ def maybe_constructor_pack_sparse(
     if lhs0 is None:
         return None
     name0, lo0, hi0 = lhs0
+    if name0.lower() in complex_rank1_names:
+        return None
+    if name0.lower() in character_scalar_names:
+        return None
     if lo0 != hi0:
         return None
     rhs0 = m0.group(2).strip()
@@ -1787,11 +2088,222 @@ def maybe_constructor_pack_sparse(
             break
     if is_contig:
         return None
+    if name0.lower() in nondefault_real_names and not allow_constructor_for_nondefault_real_with_scalars(
+        vals, scalar_nondefault_real_names
+    ):
+        return None
 
     idx_vec = ", ".join(str(k) for k in idxs)
     val_vec = ", ".join(vals)
     suggestion = f"{name0}([{idx_vec}]) = [{val_vec}]"
     return end_idx, suggestion
+
+
+def split_top_level_concat(text: str) -> List[str]:
+    """Split expression by top-level // operators."""
+    out: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'" and not in_double:
+            if in_single and i + 1 < len(text) and text[i + 1] == "'":
+                cur.append("''")
+                i += 2
+                continue
+            in_single = not in_single
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            if in_double and i + 1 < len(text) and text[i + 1] == '"':
+                cur.append('""')
+                i += 2
+                continue
+            in_double = not in_double
+            cur.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "/" and i + 1 < len(text) and text[i + 1] == "/" and depth == 0:
+                out.append("".join(cur).strip())
+                cur = []
+                i += 2
+                continue
+        cur.append(ch)
+        i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def parse_char_literal_length(expr: str) -> Optional[int]:
+    """Return character literal length if expr is a single char literal, else None."""
+    t = expr.strip()
+    if not t:
+        return None
+    # Optional kind-prefix: k_'abc' or 4_"abc"
+    qpos1 = t.find("'")
+    qpos2 = t.find('"')
+    qpos = -1
+    qch = ""
+    if qpos1 >= 0 and (qpos2 < 0 or qpos1 < qpos2):
+        qpos = qpos1
+        qch = "'"
+    elif qpos2 >= 0:
+        qpos = qpos2
+        qch = '"'
+    if qpos < 0:
+        return None
+    prefix = t[:qpos].strip()
+    if prefix and not prefix.endswith("_"):
+        return None
+    i = qpos + 1
+    n = 0
+    while i < len(t):
+        ch = t[i]
+        if ch == qch:
+            if i + 1 < len(t) and t[i + 1] == qch:
+                n += 1
+                i += 2
+                continue
+            i += 1
+            if t[i:].strip():
+                return None
+            return n
+        n += 1
+        i += 1
+    return None
+
+
+def strip_outer_parens(expr: str) -> str:
+    """Strip one layer of outer parens if they wrap whole expression."""
+    t = expr.strip()
+    if len(t) < 2 or t[0] != "(" or t[-1] != ")":
+        return t
+    depth = 0
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(t):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(t) - 1:
+                    return t
+    if depth == 0:
+        return t[1:-1].strip()
+    return t
+
+
+def char_expr_known_length(expr: str, scalar_char_lengths: Dict[str, int]) -> Optional[int]:
+    """Return fixed length for conservative subset of CHARACTER expressions."""
+    t = strip_outer_parens(expr)
+    lit_len = parse_char_literal_length(t)
+    if lit_len is not None:
+        return lit_len
+    mname = SIMPLE_NAME_RE.match(t)
+    if mname:
+        return scalar_char_lengths.get(mname.group(1).lower())
+    if re.match(r"^\s*(?:achar|char)\s*\(", t, re.IGNORECASE):
+        return 1
+    parts = split_top_level_concat(t)
+    if len(parts) > 1:
+        total = 0
+        for p in parts:
+            lp = char_expr_known_length(p, scalar_char_lengths)
+            if lp is None:
+                return None
+            total += lp
+        return total
+    return None
+
+
+def parse_scalar_char_substring_lhs(lhs: str, scalar_char_lengths: Dict[str, int]) -> Optional[Tuple[str, int, int]]:
+    """Parse scalar CHARACTER substring target S(lo:hi) with integer bounds."""
+    m = re.match(r"^\s*([a-z][a-z0-9_]*)\s*\(\s*([^:(),]+)\s*:\s*([^:(),]+)\s*\)\s*$", lhs, re.IGNORECASE)
+    if not m:
+        return None
+    name = m.group(1)
+    if name.lower() not in scalar_char_lengths:
+        return None
+    lo_t = m.group(2).strip()
+    hi_t = m.group(3).strip()
+    if not re.fullmatch(r"[+-]?\d+", lo_t) or not re.fullmatch(r"[+-]?\d+", hi_t):
+        return None
+    lo = int(lo_t)
+    hi = int(hi_t)
+    if hi < lo:
+        return None
+    return name, lo, hi
+
+
+def maybe_character_concat_pack(
+    body: List[Tuple[int, str]],
+    start_idx: int,
+    scalar_char_lengths: Dict[str, int],
+) -> Optional[Tuple[int, str]]:
+    """Detect contiguous scalar CHARACTER substring assignments and fold to // concat."""
+    if start_idx >= len(body):
+        return None
+    m0 = ASSIGN_RE.match(body[start_idx][1].strip())
+    if not m0:
+        return None
+    p0 = parse_scalar_char_substring_lhs(m0.group(1).strip(), scalar_char_lengths)
+    if p0 is None:
+        return None
+    name, lo0, hi0 = p0
+    rhs0 = m0.group(2).strip()
+    if re.search(rf"\b{re.escape(name)}\b", strip_quoted_text(rhs0), re.IGNORECASE):
+        return None
+    l0 = char_expr_known_length(rhs0, scalar_char_lengths)
+    if l0 is None or l0 != (hi0 - lo0 + 1):
+        return None
+
+    parts: List[str] = [rhs0]
+    last_hi = hi0
+    end_idx = start_idx
+    j = start_idx + 1
+    while j < len(body):
+        m = ASSIGN_RE.match(body[j][1].strip())
+        if not m:
+            break
+        p = parse_scalar_char_substring_lhs(m.group(1).strip(), scalar_char_lengths)
+        if p is None or p[0].lower() != name.lower():
+            break
+        lo, hi = p[1], p[2]
+        if lo != last_hi + 1:
+            break
+        rhs = m.group(2).strip()
+        if re.search(rf"\b{re.escape(name)}\b", strip_quoted_text(rhs), re.IGNORECASE):
+            break
+        ln_rhs = char_expr_known_length(rhs, scalar_char_lengths)
+        if ln_rhs is None or ln_rhs != (hi - lo + 1):
+            break
+        parts.append(rhs)
+        last_hi = hi
+        end_idx = j
+        j += 1
+
+    if end_idx == start_idx:
+        return None
+    total_len = scalar_char_lengths.get(name.lower())
+    if total_len is None or lo0 != 1 or last_hi != total_len:
+        return None
+    return end_idx, f"{name} = {' // '.join(parts)}"
 
 
 def maybe_matmul_mv_nested(
@@ -3320,6 +3832,11 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     rank3_bounds = parse_rank3_decl_bounds(unit)
     blocked_whole_names = collect_rank1_whole_assign_blocked(unit)
     class_rank1_names = collect_rank1_class_names(unit)
+    nondefault_real_rank1_names = collect_rank1_nondefault_real_names(unit)
+    scalar_nondefault_real_names = collect_scalar_nondefault_real_names(unit)
+    complex_rank1_names = collect_rank1_complex_names(unit)
+    character_scalar_names = collect_character_scalar_names(unit)
+    scalar_char_lengths = collect_character_scalar_lengths(unit)
     array_names: Set[str] = set(decl_bounds.keys()) | set(rank2_bounds.keys()) | set(rank3_bounds.keys())
     array_names |= collect_rank1_array_names(unit)
     alloc_map: Dict[str, str] = {}
@@ -3384,6 +3901,22 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     suggestion=sugg_ifaa,
                 )
             )
+        char_pack = maybe_character_concat_pack(body, i, scalar_char_lengths)
+        if char_pack is not None:
+            end_idx, sugg_char = char_pack
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="character_concat_pack",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=body[end_idx][0],
+                    suggestion=sugg_char,
+                )
+            )
+            i = end_idx + 1
+            continue
         sugg_whole = maybe_whole_array_assign(
             stmt, decl_bounds, blocked_whole_names, class_rank1_names, alloc_rank1_bounds
         )
@@ -3399,7 +3932,15 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     suggestion=sugg_whole,
                 )
             )
-        pack = maybe_constructor_pack(body, i, decl_bounds)
+        pack = maybe_constructor_pack(
+            body,
+            i,
+            decl_bounds,
+            nondefault_real_rank1_names,
+            scalar_nondefault_real_names,
+            complex_rank1_names,
+            character_scalar_names,
+        )
         if pack is not None:
             end_idx, sugg_pack = pack
             findings.append(
@@ -3415,7 +3956,14 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             )
             i = end_idx + 1
             continue
-        pack_sparse = maybe_constructor_pack_sparse(body, i)
+        pack_sparse = maybe_constructor_pack_sparse(
+            body,
+            i,
+            nondefault_real_rank1_names,
+            scalar_nondefault_real_names,
+            complex_rank1_names,
+            character_scalar_names,
+        )
         if pack_sparse is not None:
             end_idx, sugg_pack = pack_sparse
             findings.append(
