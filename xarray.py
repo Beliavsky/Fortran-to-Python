@@ -363,7 +363,9 @@ def find_matching_paren(text: str, open_pos: int) -> int:
     return -1
 
 
-def replace_affine_index_anydim(expr: str, loop_var: str, lb: str, ub: str) -> str:
+def replace_affine_index_anydim(
+    expr: str, loop_var: str, lb: str, ub: str, array_names: Optional[Set[str]] = None
+) -> str:
     """Rewrite name(..., i±k, ...) args to shifted slices for any dimension."""
     out: List[str] = []
     i = 0
@@ -379,6 +381,10 @@ def replace_affine_index_anydim(expr: str, loop_var: str, lb: str, ub: str) -> s
         while j < n and expr[j].isspace():
             j += 1
         if j >= n or expr[j] != "(":
+            out.append(expr[i])
+            i += 1
+            continue
+        if array_names is not None and name.lower() not in array_names:
             out.append(expr[i])
             i += 1
             continue
@@ -878,6 +884,7 @@ def maybe_elementwise(
     body_stmt: str,
     decl_bounds: Dict[str, str],
     alloc_map: Dict[str, str],
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect elementwise assignment loop and build replacement."""
     m = ASSIGN_RE.match(body_stmt.strip())
@@ -890,7 +897,7 @@ def maybe_elementwise(
         return None
     lhs_name, lhs_args, lhs_pos = lhs_parsed
     lb, ubtxt = split_range(rng)
-    rhs_sliced = replace_affine_index_anydim(rhs, loop_var, lb, ubtxt)
+    rhs_sliced = replace_affine_index_anydim(rhs, loop_var, lb, ubtxt, array_names=array_names)
     # The helper above expects (lb, ub-text). rng may include step in ub-text.
     if has_loop_var(rhs_sliced, loop_var):
         return None
@@ -907,6 +914,19 @@ def maybe_elementwise(
             lhs_expr = lhs_name
     else:
         lhs_expr = f"{lhs_name}({', '.join(lhs_args_sliced)})"
+        # Conservative rank-2 broadcast support:
+        # a(sec, j_range) = a(sec, j_shifted) * x(sec)
+        # -> a(sec, j_range) = a(sec, j_shifted) * spread(x(sec), dim=2, ncopies=ub)
+        if len(lhs_args_sliced) == 2 and normalize_expr(lb) == normalize_expr("1") and ":" not in ubtxt:
+            ncopy = ubtxt.strip()
+            if lhs_pos == 1:
+                sec = lhs_args_sliced[0].strip()
+                pat = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(sec)}\s*\)", re.IGNORECASE)
+                rhs_sliced = pat.sub(lambda m: f"spread({m.group(1)}({sec}), dim=2, ncopies={ncopy})", rhs_sliced)
+            elif lhs_pos == 0:
+                sec = lhs_args_sliced[1].strip()
+                pat = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(sec)}\s*\)", re.IGNORECASE)
+                rhs_sliced = pat.sub(lambda m: f"spread({m.group(1)}({sec}), dim=1, ncopies={ncopy})", rhs_sliced)
     rhs_sliced = simplify_section_expr(rhs_sliced, decl_bounds)
     return f"{lhs_expr} = {rhs_sliced}"
 
@@ -3039,7 +3059,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
-                sugg_elem = maybe_elementwise(loop_var, rng, stmt_body, decl_bounds, alloc_map)
+                sugg_elem = maybe_elementwise(loop_var, rng, stmt_body, decl_bounds, alloc_map, array_names)
                 if sugg_elem is not None:
                     findings.append(
                         Finding(
@@ -3444,7 +3464,7 @@ def analyze_unit_concurrent_forall(
             continue
         # Also allow converted expression forms from existing elementwise detector
         # before wrapping, if the one-line body itself is not directly eligible.
-        sugg_elem = maybe_elementwise(loop_var, rng, stmt_body, decl_bounds, {})
+        sugg_elem = maybe_elementwise(loop_var, rng, stmt_body, decl_bounds, {}, array_names)
         if sugg_elem is not None:
             sug2 = maybe_loop_to_concurrent_or_forall(
                 loop_var,
