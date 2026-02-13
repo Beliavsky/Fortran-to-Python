@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 import xunset
 
@@ -84,6 +85,7 @@ PRINT_PREFIX_RE = re.compile(r"^\s*print\s*\*\s*,\s*(.+)\s*$", re.IGNORECASE)
 READ_PREFIX_RE = re.compile(r"^\s*read\s*\*\s*,\s*(.+)\s*$", re.IGNORECASE)
 PRINT_STMT_RE = re.compile(r"^\s*print\s+(.+)$", re.IGNORECASE)
 LOOP_ASSIGN_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
+RANDOM_CALL_RE = re.compile(r"^\s*call\s+random_number\s*\(\s*(.+)\s*\)\s*$", re.IGNORECASE)
 
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
@@ -584,6 +586,16 @@ def split_range(rng: str) -> Tuple[str, str]:
     return rng.split(":", 1)[0], rng.split(":", 1)[1]
 
 
+def range_to_do_triplet(rng: str) -> str:
+    """Convert lb:ub[:step] range text to implied-do triplet lb,ub[,step]."""
+    parts = rng.split(":", 2)
+    if len(parts) == 2:
+        return f"{parts[0].strip()},{parts[1].strip()}"
+    if len(parts) == 3:
+        return f"{parts[0].strip()},{parts[1].strip()},{parts[2].strip()}"
+    return rng
+
+
 def normalize_expr(text: str) -> str:
     """Normalize expression text for conservative equality checks."""
     return "".join(text.lower().split())
@@ -700,6 +712,62 @@ def parse_rank2_decl_bounds(unit: xunset.Unit) -> Dict[str, Tuple[str, str]]:
     return out
 
 
+def parse_rank3_decl_bounds(unit: xunset.Unit) -> Dict[str, Tuple[str, str, str]]:
+    """Collect explicit rank-3 declaration upper bounds as (ub1, ub2, ub3)."""
+    out: Dict[str, Tuple[str, str, str]] = {}
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low or "::" not in low:
+            continue
+        if not re.match(r"^\s*(integer|real|logical|character|complex|type\b|class\b)", low, re.IGNORECASE):
+            continue
+        rhs = low.split("::", 1)[1]
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            if not rest.startswith("("):
+                continue
+            depth = 0
+            end_pos = -1
+            for j, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = j
+                        break
+            if end_pos < 0:
+                continue
+            dims = rest[1:end_pos].strip()
+            parts = split_top_level_commas(dims)
+            if len(parts) != 3:
+                continue
+
+            def upper(d: str) -> str:
+                t = d.strip()
+                if ":" in t:
+                    toks = t.split(":", 1)
+                    return toks[1].strip() if toks[1].strip() else ":"
+                return t
+
+            ub1 = upper(parts[0])
+            ub2 = upper(parts[1])
+            ub3 = upper(parts[2])
+            if ub1 == ":" or ub2 == ":" or ub3 == ":":
+                continue
+            out[name] = (ub1, ub2, ub3)
+    return out
+
+
 def collect_rank1_array_names(unit: xunset.Unit) -> Set[str]:
     """Collect rank-1 array names (including assumed/deferred shape) declared in one unit."""
     out: Set[str] = set()
@@ -745,13 +813,19 @@ def collect_rank1_array_names(unit: xunset.Unit) -> Set[str]:
 def simplify_section_expr(expr: str, decl_bounds: Dict[str, str]) -> str:
     """Simplify full-range rank-1 sections to whole arrays when clearly safe."""
     s = expr
-    # Rule 1: a(1:size(a)) -> a
-    s = re.sub(
+    # Rule 1: a(1:size(a)) -> a, unless immediately followed by substring selector:
+    # a(1:size(a))(i:j) must stay as-is.
+    pat_full_size = re.compile(
         r"\b([a-z][a-z0-9_]*)\s*\(\s*1\s*:\s*size\s*\(\s*\1\s*\)\s*\)",
-        r"\1",
-        s,
-        flags=re.IGNORECASE,
+        re.IGNORECASE,
     )
+    def repl_full_size(m: re.Match[str]) -> str:
+        name = m.group(1)
+        tail = m.string[m.end() :]
+        if tail.lstrip().startswith("("):
+            return f"{name}(:)"
+        return name
+    s = pat_full_size.sub(repl_full_size, s)
     # Rule 2: a(lb:ub) -> a when section matches declaration bounds.
     for name, bnd in decl_bounds.items():
         pat = re.compile(rf"\b{re.escape(name)}\s*\(\s*([^)]*)\)", re.IGNORECASE)
@@ -759,7 +833,10 @@ def simplify_section_expr(expr: str, decl_bounds: Dict[str, str]) -> str:
             rng = m.group(1).strip()
             if ":" not in rng:
                 return m.group(0)
+            tail = m.string[m.end() :]
             if normalize_expr(rng) == normalize_expr(bnd):
+                if tail.lstrip().startswith("("):
+                    return f"{name}(:)"
                 return name
             return m.group(0)
         s = pat.sub(repl, s)
@@ -904,6 +981,7 @@ def maybe_reduction_sum(
     rng: str,
     body_stmt: str,
     prev_stmt: Optional[str],
+    decl_bounds: Dict[str, str],
 ) -> Optional[str]:
     """Detect sum-reduction loop with preceding initialization and build replacement."""
     if prev_stmt is None:
@@ -933,8 +1011,76 @@ def maybe_reduction_sum(
         return None
     if expr_sliced == expr:
         return None
-    expr_sliced = simplify_section_expr(expr_sliced, decl_bounds={})
+    expr_sliced = simplify_section_expr(expr_sliced, decl_bounds)
     return f"{acc_name_lhs} = sum({expr_sliced})"
+
+
+def maybe_reduction_sum_vector_2d(
+    loop_var: str,
+    rng: str,
+    body_stmt: str,
+    prev_stmt: Optional[str],
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[str]:
+    """Detect vector accumulation from 2D slices and suggest SPREAD+SUM(dim=1)."""
+    if prev_stmt is None:
+        return None
+    mp = ASSIGN_RE.match(prev_stmt.strip())
+    ml = ASSIGN_RE.match(body_stmt.strip())
+    if not mp or not ml:
+        return None
+    acc_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+    acc_lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
+    if not acc_prev or not acc_lhs:
+        return None
+    acc_name = acc_lhs.group(1)
+    if acc_prev.group(1).lower() != acc_name.lower():
+        return None
+    acc_bnd = decl_bounds.get(acc_name.lower())
+    if acc_bnd is None:
+        return None
+    madd = ADD_ACC_RE.match(ml.group(2).strip())
+    if not madd:
+        return None
+    if madd.group(1).lower() != acc_name.lower():
+        return None
+    expr = madd.group(2).strip()
+    lb, ubtxt = split_range(rng)
+    # Keep this rewrite conservative: unit-step full-range row loops only.
+    if normalize_expr(lb) != normalize_expr("1"):
+        return None
+    if ":" in ubtxt:
+        return None
+
+    # Require at least one rank-2 row-slice term involving loop index.
+    touched_rank2 = False
+    expr_mat = expr
+    for r2name, rb in rank2_bounds.items():
+        pat_row = re.compile(
+            rf"\b{re.escape(r2name)}\s*\(\s*{re.escape(loop_var)}\s*,\s*:\s*\)",
+            re.IGNORECASE,
+        )
+        if pat_row.search(expr_mat):
+            touched_rank2 = True
+            expr_mat = pat_row.sub(lambda m: f"{r2name}({lb}:{ubtxt}, 1:{rb[1]})", expr_mat)
+    if not touched_rank2:
+        return None
+
+    # Broadcast bare rank-1 vectors across rows.
+    for vname in decl_bounds.keys():
+        pat_vec = re.compile(rf"\b{re.escape(vname)}\b(?!\s*\()", re.IGNORECASE)
+        expr_mat = pat_vec.sub(
+            lambda m: f"spread({vname}, dim=1, ncopies={ubtxt})",
+            expr_mat,
+        )
+
+    if has_loop_var(expr_mat, loop_var):
+        return None
+
+    expr_mat = simplify_section_expr(expr_mat, decl_bounds)
+    expr_mat = simplify_section_expr_rank2(expr_mat, rank2_bounds)
+    return f"{acc_name} = sum({expr_mat}, dim=1)"
 
 
 def maybe_reduction_product(
@@ -942,6 +1088,7 @@ def maybe_reduction_product(
     rng: str,
     body_stmt: str,
     prev_stmt: Optional[str],
+    decl_bounds: Dict[str, str],
 ) -> Optional[str]:
     """Detect product-reduction loop and build replacement."""
     if prev_stmt is None:
@@ -971,7 +1118,7 @@ def maybe_reduction_product(
         return None
     if expr_sliced == expr:
         return None
-    expr_sliced = simplify_section_expr(expr_sliced, decl_bounds={})
+    expr_sliced = simplify_section_expr(expr_sliced, decl_bounds)
     return f"{acc_name_lhs} = product({expr_sliced})"
 
 
@@ -1422,6 +1569,7 @@ def maybe_count(
     prev_stmt: Optional[str],
     if_stmt: str,
     body_stmt: str,
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect count-in-if pattern and build COUNT replacement."""
     if prev_stmt is None:
@@ -1451,6 +1599,9 @@ def maybe_count(
     if cond_s == cond:
         return None
     cond_s = simplify_section_expr(cond_s, decl_bounds={})
+    if has_nonarray_call(cond_s, array_names):
+        triplet = range_to_do_triplet(rng)
+        return f"{kname} = count([({cond}, {loop_var}={triplet})])"
     return f"{kname} = count({cond_s})"
 
 
@@ -1459,6 +1610,7 @@ def maybe_count_inline(
     rng: str,
     prev_stmt: Optional[str],
     inline_if_stmt: str,
+    array_names: Set[str],
 ) -> Optional[str]:
     """Detect one-line IF count pattern and build COUNT replacement."""
     if prev_stmt is None:
@@ -1497,6 +1649,9 @@ def maybe_count_inline(
     if cond_s == cond:
         return None
     cond_s = simplify_section_expr(cond_s, decl_bounds={})
+    if has_nonarray_call(cond_s, array_names):
+        triplet = range_to_do_triplet(rng)
+        return f"{kname} = count([({cond}, {loop_var}={triplet})])"
     return f"{kname} = count({cond_s})"
 
 
@@ -2234,12 +2389,348 @@ def maybe_print_loop(
     return f"print {fmt}, {item_s}"
 
 
+def maybe_random_number_loop_1d(
+    loop_var: str,
+    rng: str,
+    stmt: str,
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    rank3_bounds: Dict[str, Tuple[str, str, str]],
+) -> Optional[str]:
+    """Detect DO loop filling one array dimension via random_number scalar call."""
+    m = RANDOM_CALL_RE.match(stmt.strip())
+    if not m:
+        return None
+    harvest = parse_indexed_name(m.group(1).strip())
+    if harvest is None:
+        return None
+    arr_name, args = harvest
+    loop_ranges = {loop_var.lower(): rng}
+    new_args: List[str] = []
+    replaced = False
+    for arg in args:
+        a = arg.strip()
+        r = loop_ranges.get(a.lower())
+        if r is not None:
+            new_args.append(r)
+            replaced = True
+        else:
+            new_args.append(a)
+    if not replaced:
+        return None
+    harvest_expr = f"{arr_name}({', '.join(new_args)})"
+    if len(new_args) == 1:
+        bnd = decl_bounds.get(arr_name.lower())
+        if bnd is not None and normalize_expr(new_args[0]) == normalize_expr(bnd):
+            harvest_expr = arr_name
+    elif len(new_args) == 2:
+        bnd2 = rank2_bounds.get(arr_name.lower())
+        if (
+            bnd2 is not None
+            and normalize_expr(new_args[0]) == normalize_expr(f"1:{bnd2[0]}")
+            and normalize_expr(new_args[1]) == normalize_expr(f"1:{bnd2[1]}")
+        ):
+            harvest_expr = arr_name
+    elif len(new_args) == 3:
+        bnd3 = rank3_bounds.get(arr_name.lower())
+        if (
+            bnd3 is not None
+            and normalize_expr(new_args[0]) == normalize_expr(f"1:{bnd3[0]}")
+            and normalize_expr(new_args[1]) == normalize_expr(f"1:{bnd3[1]}")
+            and normalize_expr(new_args[2]) == normalize_expr(f"1:{bnd3[2]}")
+        ):
+            harvest_expr = arr_name
+    return f"call random_number({harvest_expr})"
+
+
+def maybe_random_number_nested_2d(
+    outer_loop_var: str,
+    outer_lb: str,
+    outer_ub: str,
+    outer_step: Optional[str],
+    inner_do_stmt: str,
+    inner_body_stmt: str,
+) -> Optional[str]:
+    """Detect two-level loop random fills and collapse innermost loop only."""
+    m_ido = DO_RE.match(inner_do_stmt.strip())
+    m_call = RANDOM_CALL_RE.match(inner_body_stmt.strip())
+    if not m_ido or not m_call:
+        return None
+    inner_var = m_ido.group(1)
+    inner_lb = m_ido.group(2).strip()
+    inner_ub = m_ido.group(3).strip()
+    inner_step = m_ido.group(4)
+    if inner_lb != "1" or (inner_step is not None and inner_step.strip() != "1"):
+        return None
+    harvest = parse_indexed_name(m_call.group(1).strip())
+    if harvest is None:
+        return None
+    arr_name, args = harvest
+    if len(args) != 2:
+        return None
+    outer_l = outer_loop_var.lower()
+    inner_l = inner_var.lower()
+    new_args: List[str] = []
+    saw_outer = False
+    saw_inner = False
+    for arg in args:
+        a = arg.strip().lower()
+        if a == outer_l:
+            new_args.append(outer_loop_var)
+            saw_outer = True
+        elif a == inner_l:
+            new_args.append(":")
+            saw_inner = True
+        else:
+            return None
+    if not (saw_outer and saw_inner):
+        return None
+
+    do_outer = f"do {outer_loop_var}={outer_lb.strip()},{outer_ub.strip()}"
+    if outer_step is not None:
+        do_outer = f"{do_outer},{outer_step.strip()}"
+    call_line = f"  call random_number({arr_name}({', '.join(new_args)}))"
+    return "\n".join([do_outer, call_line, "end do"])
+
+
+def maybe_random_number_nested_3d(
+    outer_loop_var: str,
+    outer_lb: str,
+    outer_ub: str,
+    outer_step: Optional[str],
+    mid_do_stmt: str,
+    inner_do_stmt: str,
+    inner_body_stmt: str,
+) -> Optional[str]:
+    """Detect three-level loop random fills and collapse innermost loop only."""
+    m_mdo = DO_RE.match(mid_do_stmt.strip())
+    m_ido = DO_RE.match(inner_do_stmt.strip())
+    m_call = RANDOM_CALL_RE.match(inner_body_stmt.strip())
+    if not m_mdo or not m_ido or not m_call:
+        return None
+    mid_var = m_mdo.group(1)
+    mid_lb = m_mdo.group(2).strip()
+    mid_ub = m_mdo.group(3).strip()
+    mid_step = m_mdo.group(4)
+    inner_var = m_ido.group(1)
+    inner_lb = m_ido.group(2).strip()
+    inner_ub = m_ido.group(3).strip()
+    inner_step = m_ido.group(4)
+    if inner_lb != "1" or (inner_step is not None and inner_step.strip() != "1"):
+        return None
+
+    harvest = parse_indexed_name(m_call.group(1).strip())
+    if harvest is None:
+        return None
+    arr_name, args = harvest
+    if len(args) != 3:
+        return None
+    outer_l = outer_loop_var.lower()
+    mid_l = mid_var.lower()
+    inner_l = inner_var.lower()
+    new_args: List[str] = []
+    saw_outer = False
+    saw_mid = False
+    saw_inner = False
+    for arg in args:
+        a = arg.strip().lower()
+        if a == outer_l:
+            new_args.append(outer_loop_var)
+            saw_outer = True
+        elif a == mid_l:
+            new_args.append(mid_var)
+            saw_mid = True
+        elif a == inner_l:
+            new_args.append(":")
+            saw_inner = True
+        else:
+            return None
+    if not (saw_outer and saw_mid and saw_inner):
+        return None
+
+    do_outer = f"do {outer_loop_var}={outer_lb.strip()},{outer_ub.strip()}"
+    if outer_step is not None:
+        do_outer = f"{do_outer},{outer_step.strip()}"
+    do_mid = f"  do {mid_var}={mid_lb},{mid_ub}"
+    if mid_step is not None:
+        do_mid = f"{do_mid},{mid_step.strip()}"
+    call_line = f"    call random_number({arr_name}({', '.join(new_args)}))"
+    return "\n".join([do_outer, do_mid, call_line, "  end do", "end do"])
+
+
+def maybe_spread_nested_2d(
+    outer_loop_var: str,
+    outer_lb: str,
+    outer_ub: str,
+    outer_step: Optional[str],
+    inner_do_stmt: str,
+    inner_body_stmt: str,
+    decl_bounds1: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[str]:
+    """Detect 2D nested loop assignments that map naturally to SPREAD."""
+    m_do = DO_RE.match(inner_do_stmt.strip())
+    m_asn = ASSIGN_RE.match(inner_body_stmt.strip())
+    if not m_do or not m_asn:
+        return None
+    inner_loop_var = m_do.group(1).lower()
+    inner_lb = m_do.group(2).strip()
+    inner_ub = m_do.group(3).strip()
+    inner_step = m_do.group(4)
+    if outer_lb.strip() != "1" or inner_lb != "1":
+        return None
+    if (outer_step is not None and outer_step.strip() != "1") or (inner_step is not None and inner_step.strip() != "1"):
+        return None
+
+    lhs = parse_indexed_name(m_asn.group(1).strip())
+    if lhs is None:
+        return None
+    lhs_name, lhs_args = lhs
+    if len(lhs_args) != 2:
+        return None
+    a1 = lhs_args[0].strip().lower()
+    a2 = lhs_args[1].strip().lower()
+    outer_l = outer_loop_var.lower()
+    if {a1, a2} != {outer_l, inner_loop_var}:
+        return None
+
+    # Map target dimensions to loop vars and copy counts.
+    dim1_var = a1
+    dim2_var = a2
+    ub_by_var = {
+        outer_l: outer_ub.strip(),
+        inner_loop_var: inner_ub,
+    }
+    n1 = ub_by_var[dim1_var]
+    n2 = ub_by_var[dim2_var]
+
+    rhs = m_asn.group(2).strip()
+    rhs_s = rhs
+    # Replace rank-2 element references that use loop vars with full sections.
+    pat2 = re.compile(
+        rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(dim1_var)}\s*,\s*{re.escape(dim2_var)}\s*\)",
+        re.IGNORECASE,
+    )
+    rhs_s = pat2.sub(lambda m: f"{m.group(1)}(1:{n1}, 1:{n2})", rhs_s)
+    # Convert rank-1 refs by loop variable to SPREAD broadcasts.
+    pat_dim1 = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(dim1_var)}\s*\)", re.IGNORECASE)
+    rhs_s = pat_dim1.sub(lambda m: f"spread({m.group(1)}, dim=2, ncopies={n2})", rhs_s)
+    pat_dim2 = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(dim2_var)}\s*\)", re.IGNORECASE)
+    rhs_s = pat_dim2.sub(lambda m: f"spread({m.group(1)}, dim=1, ncopies={n1})", rhs_s)
+
+    if rhs_s == rhs:
+        return None
+    if has_loop_var(rhs_s, dim1_var) or has_loop_var(rhs_s, dim2_var):
+        return None
+
+    lhs_expr = f"{lhs_name}(1:{n1}, 1:{n2})"
+    lbnd = rank2_bounds.get(lhs_name.lower())
+    if lbnd is not None and normalize_expr(lbnd[0]) == normalize_expr(n1) and normalize_expr(lbnd[1]) == normalize_expr(n2):
+        lhs_expr = lhs_name
+
+    rhs_s = simplify_section_expr(rhs_s, decl_bounds1)
+    rhs_s = simplify_section_expr_rank2(rhs_s, rank2_bounds)
+    if "spread(" not in rhs_s.lower():
+        return None
+    return f"{lhs_expr} = {rhs_s}"
+
+
+def maybe_spread_nested_3d(
+    outer_loop_var: str,
+    outer_lb: str,
+    outer_ub: str,
+    outer_step: Optional[str],
+    mid_do_stmt: str,
+    inner_do_stmt: str,
+    inner_body_stmt: str,
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    rank3_bounds: Dict[str, Tuple[str, str, str]],
+) -> Optional[str]:
+    """Detect 3D replication loops t(...,k,...) = c(...,...) and suggest SPREAD."""
+    m_mdo = DO_RE.match(mid_do_stmt.strip())
+    m_ido = DO_RE.match(inner_do_stmt.strip())
+    m_asn = ASSIGN_RE.match(inner_body_stmt.strip())
+    if not m_mdo or not m_ido or not m_asn:
+        return None
+    mid_var = m_mdo.group(1).lower()
+    mid_lb = m_mdo.group(2).strip()
+    mid_ub = m_mdo.group(3).strip()
+    mid_step = m_mdo.group(4)
+    inner_var = m_ido.group(1).lower()
+    inner_lb = m_ido.group(2).strip()
+    inner_ub = m_ido.group(3).strip()
+    inner_step = m_ido.group(4)
+    outer_l = outer_loop_var.lower()
+
+    if outer_lb.strip() != "1" or mid_lb != "1" or inner_lb != "1":
+        return None
+    if (
+        (outer_step is not None and outer_step.strip() != "1")
+        or (mid_step is not None and mid_step.strip() != "1")
+        or (inner_step is not None and inner_step.strip() != "1")
+    ):
+        return None
+
+    lhs = parse_indexed_name(m_asn.group(1).strip())
+    rhs = parse_indexed_name(m_asn.group(2).strip())
+    if lhs is None or rhs is None:
+        return None
+    lhs_name, lhs_args = lhs
+    rhs_name, rhs_args = rhs
+    if len(lhs_args) != 3 or len(rhs_args) != 2:
+        return None
+    vars3 = [a.strip().lower() for a in lhs_args]
+    if set(vars3) != {outer_l, mid_var, inner_var}:
+        return None
+
+    # Find inserted dimension d where removing lhs arg yields rhs args in order.
+    rhs_l = [a.strip().lower() for a in rhs_args]
+    ins_dim: Optional[int] = None
+    for d in range(3):
+        if vars3[:d] + vars3[d + 1 :] == rhs_l:
+            ins_dim = d + 1  # Fortran dim is 1-based.
+            break
+    if ins_dim is None:
+        return None
+
+    ub_by_var = {
+        outer_l: outer_ub.strip(),
+        mid_var: mid_ub.strip(),
+        inner_var: inner_ub.strip(),
+    }
+    n1 = ub_by_var[vars3[0]]
+    n2 = ub_by_var[vars3[1]]
+    n3 = ub_by_var[vars3[2]]
+    ncopies = ub_by_var[vars3[ins_dim - 1]]
+    rhs_b1 = ub_by_var[rhs_l[0]]
+    rhs_b2 = ub_by_var[rhs_l[1]]
+
+    lhs_expr = f"{lhs_name}(1:{n1}, 1:{n2}, 1:{n3})"
+    rb3 = rank3_bounds.get(lhs_name.lower())
+    if (
+        rb3 is not None
+        and normalize_expr(rb3[0]) == normalize_expr(n1)
+        and normalize_expr(rb3[1]) == normalize_expr(n2)
+        and normalize_expr(rb3[2]) == normalize_expr(n3)
+    ):
+        lhs_expr = lhs_name
+
+    rhs_expr = f"{rhs_name}(1:{rhs_b1}, 1:{rhs_b2})"
+    rb2 = rank2_bounds.get(rhs_name.lower())
+    if rb2 is not None and normalize_expr(rb2[0]) == normalize_expr(rhs_b1) and normalize_expr(rb2[1]) == normalize_expr(rhs_b2):
+        rhs_expr = rhs_name
+    return f"{lhs_expr} = spread({rhs_expr}, dim={ins_dim}, ncopies={ncopies})"
+
+
 def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     """Analyze one unit for simple loop-to-array opportunities."""
     findings: List[Finding] = []
     body = unit.body
     decl_bounds = parse_rank1_decl_bounds(unit)
     rank2_bounds = parse_rank2_decl_bounds(unit)
+    rank3_bounds = parse_rank3_decl_bounds(unit)
+    array_names: Set[str] = set(decl_bounds.keys()) | set(rank2_bounds.keys()) | set(rank3_bounds.keys())
+    array_names |= collect_rank1_array_names(unit)
     alloc_map: Dict[str, str] = {}
     i = 0
     while i < len(body):
@@ -2373,6 +2864,114 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     i += 8
                     continue
 
+        # Form S3D: nested 3D replication via spread:
+        # do k=...
+        #    do i=...
+        #       do j=...
+        #          t(i,j,k) = c(i,j)
+        #       end do
+        #    end do
+        # end do
+        if i + 6 < len(body):
+            _ln_mdo, stmt_mdo = body[i + 1]
+            _ln_ido, stmt_ido = body[i + 2]
+            _ln_ibody, stmt_ibody = body[i + 3]
+            ln_iend, stmt_iend = body[i + 4]
+            ln_mend, stmt_mend = body[i + 5]
+            ln_oend, stmt_oend = body[i + 6]
+            if (
+                END_DO_RE.match(stmt_iend.strip())
+                and END_DO_RE.match(stmt_mend.strip())
+                and END_DO_RE.match(stmt_oend.strip())
+            ):
+                sugg_rand3 = maybe_random_number_nested_3d(
+                    loop_var, lb, ub, step, stmt_mdo, stmt_ido, stmt_ibody
+                )
+                if sugg_rand3 is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="random_number_fill",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_oend,
+                            suggestion=sugg_rand3,
+                        )
+                    )
+                    i += 7
+                    continue
+                sugg_s3d = maybe_spread_nested_3d(
+                    loop_var,
+                    lb,
+                    ub,
+                    step,
+                    stmt_mdo,
+                    stmt_ido,
+                    stmt_ibody,
+                    rank2_bounds,
+                    rank3_bounds,
+                )
+                if sugg_s3d is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="nested_spread_3d",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_oend,
+                            suggestion=sugg_s3d,
+                        )
+                    )
+                    i += 7
+                    continue
+
+        # Form S2D: nested 2D broadcasts via spread:
+        # do i=...
+        #    do j=...
+        #       a(i,j) = ...
+        #    end do
+        # end do
+        if i + 4 < len(body):
+            _ln_ido, stmt_ido = body[i + 1]
+            _ln_ibody, stmt_ibody = body[i + 2]
+            ln_iend, stmt_iend = body[i + 3]
+            ln_oend, stmt_oend = body[i + 4]
+            if END_DO_RE.match(stmt_iend.strip()) and END_DO_RE.match(stmt_oend.strip()):
+                sugg_rand2 = maybe_random_number_nested_2d(loop_var, lb, ub, step, stmt_ido, stmt_ibody)
+                if sugg_rand2 is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="random_number_fill",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_oend,
+                            suggestion=sugg_rand2,
+                        )
+                    )
+                    i += 5
+                    continue
+                sugg_s2d = maybe_spread_nested_2d(
+                    loop_var, lb, ub, step, stmt_ido, stmt_ibody, decl_bounds, rank2_bounds
+                )
+                if sugg_s2d is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="nested_spread_2d",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_oend,
+                            suggestion=sugg_s2d,
+                        )
+                    )
+                    i += 5
+                    continue
+
         # Form A0: nested transpose:
         # do i=...
         #    do j=...
@@ -2408,6 +3007,23 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             ln_body, stmt_body = body[i + 1]
             ln_end, stmt_end = body[i + 2]
             if END_DO_RE.match(stmt_end.strip()):
+                sugg_rand1 = maybe_random_number_loop_1d(
+                    loop_var, rng, stmt_body, decl_bounds, rank2_bounds, rank3_bounds
+                )
+                if sugg_rand1 is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="random_number_fill",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_rand1,
+                        )
+                    )
+                    i += 3
+                    continue
                 sugg_ploop = maybe_print_loop(loop_var, lb, ub, step, stmt_body, decl_bounds)
                 if sugg_ploop is not None:
                     findings.append(
@@ -2440,7 +3056,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     continue
                 prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
                 start_line = body[i - 1][0] if i - 1 >= 0 else ln
-                sugg_sum = maybe_reduction_sum(loop_var, rng, stmt_body, prev_stmt)
+                sugg_sum = maybe_reduction_sum(loop_var, rng, stmt_body, prev_stmt, decl_bounds)
                 if sugg_sum is not None:
                     findings.append(
                         Finding(
@@ -2455,7 +3071,24 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
-                sugg_prod = maybe_reduction_product(loop_var, rng, stmt_body, prev_stmt)
+                sugg_sum_vec2 = maybe_reduction_sum_vector_2d(
+                    loop_var, rng, stmt_body, prev_stmt, decl_bounds, rank2_bounds
+                )
+                if sugg_sum_vec2 is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_sum_vector_2d",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line,
+                            end_line=ln_end,
+                            suggestion=sugg_sum_vec2,
+                        )
+                    )
+                    i += 3
+                    continue
+                sugg_prod = maybe_reduction_product(loop_var, rng, stmt_body, prev_stmt, decl_bounds)
                 if sugg_prod is not None:
                     findings.append(
                         Finding(
@@ -2470,7 +3103,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
-                sugg_cnt_inline = maybe_count_inline(loop_var, rng, prev_stmt, stmt_body)
+                sugg_cnt_inline = maybe_count_inline(loop_var, rng, prev_stmt, stmt_body, array_names)
                 if sugg_cnt_inline is not None:
                     findings.append(
                         Finding(
@@ -2695,7 +3328,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 5
                     continue
-                sugg_cnt = maybe_count(loop_var, rng, prev_stmt, stmt_if, stmt_inside)
+                sugg_cnt = maybe_count(loop_var, rng, prev_stmt, stmt_if, stmt_inside, array_names)
                 if sugg_cnt is not None:
                     findings.append(
                         Finding(
@@ -2992,7 +3625,7 @@ def remove_unused_locals_from_lines(lines: List[str], path: Path) -> Tuple[List[
     return new_lines, sorted(set(removed_names))
 
 
-def annotate_file(path: Path, findings: List[Finding]) -> Tuple[int, Optional[Path]]:
+def annotate_file(path: Path, findings: List[Finding], *, backup: bool = True) -> Tuple[int, Optional[Path]]:
     """Insert begin/end markers and replacement comment around suggested blocks."""
     if not findings:
         return 0, None
@@ -3028,14 +3661,21 @@ def annotate_file(path: Path, findings: List[Finding]) -> Tuple[int, Optional[Pa
 
     if inserted == 0:
         return 0, None
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
+    backup_path: Optional[Path] = None
+    if backup:
+        backup_path = make_backup_path(path)
+        shutil.copy2(path, backup_path)
     path.write_text("".join(lines), encoding="utf-8")
-    return inserted, backup
+    return inserted, backup_path
 
 
 def apply_fix_file(
-    path: Path, findings: List[Finding], *, annotate: bool = False
+    path: Path,
+    findings: List[Finding],
+    *,
+    annotate: bool = False,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
 ) -> Tuple[int, Optional[Path], List[str]]:
     """Replace suggested blocks with array-operation statements and prune unused locals."""
     if not findings:
@@ -3060,9 +3700,13 @@ def apply_fix_file(
     if changed == 0:
         return 0, None, []
     lines, removed_locals = remove_unused_locals_from_lines(lines, path)
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
-    path.write_text("".join(lines), encoding="utf-8")
+    backup: Optional[Path] = None
+    target = out_path if out_path is not None else path
+    # With explicit output path, do not create input backups.
+    if out_path is None and create_backup:
+        backup = make_backup_path(path)
+        shutil.copy2(path, backup)
+    target.write_text("".join(lines), encoding="utf-8")
     return changed, backup, removed_locals
 
 
@@ -3075,8 +3719,13 @@ def main() -> int:
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print full replacement suggestions")
     parser.add_argument("--fix", action="store_true", help="Apply suggested replacements in-place")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
     parser.add_argument("--annotate", action="store_true", help="Insert annotated suggestion blocks")
     parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
+    parser.add_argument("--limit", type=int, help="Maximum number of source files to process")
     parser.add_argument(
         "--concurrent",
         action="store_true",
@@ -3088,14 +3737,31 @@ def main() -> int:
         help="Use one-line FORALL rewrite mode for eligible simple loops",
     )
     args = parser.parse_args()
+    if args.limit is not None and args.limit < 1:
+        print("--limit must be >= 1.")
+        return 2
+    if args.out is not None:
+        args.fix = True
     if args.diff and not args.fix:
         print("--diff requires --fix.")
         return 2
+    if args.compiler and not args.fix:
+        print("--compiler requires --fix.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
+    if args.limit is not None:
+        files = files[: args.limit]
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     findings: List[Finding] = []
     for p in files:
@@ -3132,20 +3798,30 @@ def main() -> int:
         total = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             before = p.read_text(encoding="utf-8")
-            n, backup, removed_locals = apply_fix_file(p, by_file[p], annotate=args.annotate)
+            out_path = args.out if args.out is not None else None
+            n, backup, removed_locals = apply_fix_file(
+                p,
+                by_file[p],
+                annotate=args.annotate,
+                out_path=out_path,
+                create_backup=args.backup,
+            )
             total += n
             if n > 0:
                 touched += 1
-                print(f"\nFixed {p.name}: replaced {n} block(s), backup {backup.name if backup else '(none)'}")
+                if out_path is not None:
+                    print(f"\nFixed {p.name}: replaced {n} block(s), wrote {out_path}")
+                else:
+                    print(f"\nFixed {p.name}: replaced {n} block(s), backup {backup.name if backup else '(none)'}")
                 if args.verbose and removed_locals:
                     print(f"  removed unused locals: {', '.join(removed_locals)}")
                 if args.diff:
-                    after = p.read_text(encoding="utf-8")
+                    after = (out_path if out_path is not None else p).read_text(encoding="utf-8")
                     diff_lines = difflib.unified_diff(
                         before.splitlines(),
                         after.splitlines(),
                         fromfile=f"a/{p.name}",
-                        tofile=f"b/{p.name}",
+                        tofile=f"b/{(out_path.name if out_path is not None else p.name)}",
                         lineterm="",
                     )
                     print("")
@@ -3161,7 +3837,7 @@ def main() -> int:
         total = 0
         touched = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
-            n, backup = annotate_file(p, by_file[p])
+            n, backup = annotate_file(p, by_file[p], backup=args.backup)
             total += n
             if n > 0:
                 touched += 1
@@ -3169,6 +3845,9 @@ def main() -> int:
             elif args.verbose:
                 print(f"\nNo annotations inserted in {p.name}")
         print(f"\n--annotate summary: files changed {touched}, inserted {total}")
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+            return 5
     return 0
 
 
