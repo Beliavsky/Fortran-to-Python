@@ -3848,6 +3848,14 @@ def apply_fix_file(
     return changed, backup, removed_locals
 
 
+def count_file_lines(path: Path) -> int:
+    """Return line count for a text file (best effort)."""
+    try:
+        return len(path.read_text(encoding="utf-8").splitlines())
+    except Exception:
+        return 0
+
+
 def main() -> int:
     """Run xarray advisory and optional annotation mode."""
     parser = argparse.ArgumentParser(
@@ -3856,6 +3864,12 @@ def main() -> int:
     parser.add_argument("fortran_files", type=Path, nargs="*")
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print full replacement suggestions")
+    parser.add_argument(
+        "-summary",
+        "--summary",
+        action="store_true",
+        help="Print per-file summary: file candidates before_lines after_lines delta",
+    )
     parser.add_argument("--fix", action="store_true", help="Apply suggested replacements in-place")
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
     parser.add_argument("--annotate", action="store_true", help="Insert annotated suggestion blocks")
@@ -3914,8 +3928,18 @@ def main() -> int:
         else:
             findings.extend(analyze_file(p))
 
+    by_file_candidates: Dict[Path, List[Finding]] = {}
+    for f in findings:
+        by_file_candidates.setdefault(f.path, []).append(f)
+    pre_lines: Dict[Path, int] = {p: count_file_lines(p) for p in files}
+
     if not findings:
-        print("No array-operation replacement candidates found.")
+        if args.summary:
+            for p in files:
+                before = pre_lines.get(p, 0)
+                print(f"{fscan.display_path(p)} 0 {before} {before} 0")
+        else:
+            print("No array-operation replacement candidates found.")
         return 0
 
     findings.sort(key=lambda f: (f.path.name.lower(), f.start_line, f.end_line))
@@ -3929,11 +3953,10 @@ def main() -> int:
             print(f"  suggest: {f.suggestion}")
 
     if args.fix:
-        by_file: Dict[Path, List[Finding]] = {}
-        for f in findings:
-            by_file.setdefault(f.path, []).append(f)
+        by_file = by_file_candidates
         touched = 0
         total = 0
+        post_lines: Dict[Path, int] = {}
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             before = p.read_text(encoding="utf-8")
             out_path = args.out if args.out is not None else None
@@ -3967,13 +3990,20 @@ def main() -> int:
                         print(line)
             elif args.verbose:
                 print(f"\nNo fixes applied in {p.name}")
+            target = out_path if out_path is not None else p
+            post_lines[p] = count_file_lines(target)
         print(f"\n--fix summary: files changed {touched}, replaced {total}")
+        if args.summary:
+            for p in files:
+                before_n = pre_lines.get(p, 0)
+                after_n = post_lines.get(p, before_n)
+                cand_n = len(by_file_candidates.get(p, []))
+                print(f"{fscan.display_path(p)} {cand_n} {before_n} {after_n} {after_n - before_n}")
     elif args.annotate:
-        by_file: Dict[Path, List[Finding]] = {}
-        for f in findings:
-            by_file.setdefault(f.path, []).append(f)
+        by_file = by_file_candidates
         total = 0
         touched = 0
+        post_lines: Dict[Path, int] = {}
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             n, backup = annotate_file(p, by_file[p], backup=args.backup)
             total += n
@@ -3982,7 +4012,19 @@ def main() -> int:
                 print(f"\nAnnotated {p.name}: inserted {n}, backup {backup.name if backup else '(none)'}")
             elif args.verbose:
                 print(f"\nNo annotations inserted in {p.name}")
+            post_lines[p] = count_file_lines(p)
         print(f"\n--annotate summary: files changed {touched}, inserted {total}")
+        if args.summary:
+            for p in files:
+                before_n = pre_lines.get(p, 0)
+                after_n = post_lines.get(p, before_n)
+                cand_n = len(by_file_candidates.get(p, []))
+                print(f"{fscan.display_path(p)} {cand_n} {before_n} {after_n} {after_n - before_n}")
+    elif args.summary:
+        for p in files:
+            before_n = pre_lines.get(p, 0)
+            cand_n = len(by_file_candidates.get(p, []))
+            print(f"{fscan.display_path(p)} {cand_n} {before_n} {before_n} 0")
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
             return 5
