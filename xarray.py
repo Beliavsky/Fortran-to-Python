@@ -24,6 +24,10 @@ END_DO_RE = re.compile(r"^\s*end\s*do\b", re.IGNORECASE)
 IF_THEN_RE = re.compile(r"^\s*if\s*\((.+)\)\s*then\s*$", re.IGNORECASE)
 END_IF_RE = re.compile(r"^\s*end\s*if\b", re.IGNORECASE)
 ELSE_RE = re.compile(r"^\s*else\b", re.IGNORECASE)
+CYCLE_RE = re.compile(r"^\s*cycle\b", re.IGNORECASE)
+EXIT_RE = re.compile(r"^\s*exit\b", re.IGNORECASE)
+RETURN_RE = re.compile(r"^\s*return\b", re.IGNORECASE)
+SELECT_CASE_RE = re.compile(r"^\s*select\s+case\b", re.IGNORECASE)
 ONE_LINE_IF_RE = re.compile(r"^\s*if\s*\((.+)\)\s*(.+)$", re.IGNORECASE)
 ASSIGN_RE = re.compile(r"^\s*(.+?)\s*=\s*(.+)$", re.IGNORECASE)
 ALLOCATE_RE = re.compile(r"^\s*allocate\s*\((.*)\)\s*$", re.IGNORECASE)
@@ -105,6 +109,8 @@ ELEMENTAL_INTRINSICS = {
     "dprod",
     "exp",
     "floor",
+    "iachar",
+    "ichar",
     "int",
     "log",
     "log10",
@@ -219,6 +225,12 @@ def split_code_comment(line: str) -> Tuple[str, str]:
             return line[:i], line[i:]
         i += 1
     return line, ""
+
+
+def is_continuation_only_line(line: str) -> bool:
+    """True when a physical line is a free-form continuation starter (`& ...`)."""
+    code, _comment = split_code_comment(line)
+    return bool(re.match(r"^\s*&", code))
 
 
 def strip_quoted_text(text: str) -> str:
@@ -1592,6 +1604,143 @@ def maybe_temp_then_elementwise(
     if has_disallowed_function_calls(rhs2_inlined, array_names):
         return None
     return f"{lhs_expr} = {rhs2_inlined}"
+
+
+def maybe_multi_elementwise(
+    loop_var: str,
+    rng: str,
+    body_stmts: List[str],
+    decl_bounds: Dict[str, str],
+    alloc_map: Dict[str, str],
+    array_names: Set[str],
+) -> Optional[str]:
+    """Detect multiple independent elementwise assignments in one loop body."""
+    if len(body_stmts) < 2:
+        return None
+    suggestions: List[str] = []
+    lhs_names: List[str] = []
+    for stmt in body_stmts:
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            return None
+        lhs = m.group(1).strip()
+        rhs = m.group(2).strip()
+        lhs_parsed = parse_lhs_indexed_by_loop(lhs, loop_var)
+        if lhs_parsed is None:
+            return None
+        lhs_name, _lhs_args, _lhs_pos = lhs_parsed
+        lhs_low = lhs_name.lower()
+        # Conservative: require distinct assignment targets.
+        if lhs_low in lhs_names:
+            return None
+        lhs_names.append(lhs_low)
+        suggestions.append(maybe_elementwise(loop_var, rng, stmt, decl_bounds, alloc_map, array_names) or "")
+        if not suggestions[-1]:
+            return None
+        # Conservative: reject if RHS references any target written in the same loop.
+        rhs_low = strip_quoted_text(rhs.lower())
+        for w in lhs_names:
+            if re.search(rf"\b{re.escape(w)}\s*\(", rhs_low):
+                return None
+    return "\n".join(suggestions)
+
+
+def maybe_nested_multi_elementwise(
+    outer_var: str,
+    outer_rng: str,
+    inner_do_stmt: str,
+    inner_body_stmts: List[str],
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    alloc_map: Dict[str, str],
+    array_names: Set[str],
+) -> Optional[str]:
+    """Detect nested loops with elementwise assignments, allowing independent remainder statements."""
+    def range_to_do_spec(r: str) -> Optional[str]:
+        parts = [p.strip() for p in r.strip().split(":")]
+        if len(parts) == 2:
+            lb = parts[0].strip()
+            ub = parts[1].strip()
+            if lb and ub:
+                return f"{lb},{ub}"
+            return None
+        if len(parts) == 3:
+            lb = parts[0].strip()
+            ub = parts[1].strip()
+            st = parts[2].strip()
+            if lb and ub and st:
+                return f"{lb},{ub},{st}"
+            return None
+        return None
+
+    m_ido = DO_RE.match(inner_do_stmt.strip())
+    if not m_ido:
+        return None
+    inner_var = m_ido.group(1)
+    inner_rng = build_range(m_ido.group(2), m_ido.group(3), m_ido.group(4))
+    elem_stmts: List[str] = []
+    rem_stmts: List[str] = []
+    lhs_written: Set[str] = set()
+    rhs_array_refs: Set[str] = set()
+    for st in inner_body_stmts:
+        ss = st.strip()
+        m_asn = ASSIGN_RE.match(ss)
+        if m_asn is not None:
+            sug = maybe_elementwise(inner_var, inner_rng, ss, decl_bounds, alloc_map, array_names)
+            if sug is not None:
+                elem_stmts.append(sug)
+                lhs0 = m_asn.group(1).strip()
+                rhs0 = m_asn.group(2).strip()
+                m_lhs = parse_lhs_indexed_by_loop(lhs0, inner_var)
+                if m_lhs is None:
+                    return None
+                lhs_written.add(m_lhs[0].lower())
+                rhs_low = strip_quoted_text(rhs0.lower())
+                for mm in CALL_LIKE_RE.finditer(rhs_low):
+                    nm = mm.group(1).lower()
+                    if nm in array_names:
+                        rhs_array_refs.add(nm)
+                continue
+        rem_stmts.append(ss)
+    if not elem_stmts:
+        return None
+    out_vec_lines: List[str] = []
+    for ln in elem_stmts:
+        s = maybe_elementwise(outer_var, outer_rng, ln.strip(), decl_bounds, alloc_map, array_names)
+        if s is None:
+            return None
+        s = simplify_section_expr_rank2(s, rank2_bounds)
+        out_vec_lines.append(s)
+
+    if not rem_stmts:
+        return "\n".join(out_vec_lines)
+
+    # Conservative: remainder must not touch vectorized targets/sources.
+    for rs in rem_stmts:
+        low = strip_quoted_text(rs.lower())
+        m_asn = ASSIGN_RE.match(rs)
+        if m_asn:
+            lhsr = m_asn.group(1).strip()
+            b = fscan.base_identifier(lhsr)
+            if b and (b in lhs_written or b in rhs_array_refs):
+                return None
+        if any(re.search(rf"\b{re.escape(nm)}\s*\(", low) for nm in lhs_written):
+            return None
+
+    m_odo = DO_RE.match(f"do {outer_var}={outer_rng}")
+    outer_spec = range_to_do_spec(outer_rng)
+    inner_spec = range_to_do_spec(inner_rng)
+    if outer_spec is None or inner_spec is None:
+        return None
+    outer_header = f"do {outer_var}={outer_spec}"
+    inner_header = f"   do {inner_var}={inner_spec}"
+    kept = [outer_header, inner_header]
+    for rs in rem_stmts:
+        kept.append(f"      {rs}")
+    kept.append("   end do")
+    kept.append("end do")
+    kept.extend(out_vec_lines)
+    return "\n".join(kept)
 
 
 def maybe_reduction_sum(
@@ -3315,6 +3464,31 @@ def simplify_section_expr_rank2(expr: str, rank2_bounds: Dict[str, Tuple[str, st
     return s
 
 
+def simplify_section_expr_rank2_partial(expr: str, rank2_bounds: Dict[str, Tuple[str, str]]) -> str:
+    """Simplify full first/second dimension sections to ':' when safe."""
+    s = expr
+    for name, (b1, b2) in rank2_bounds.items():
+        pat = re.compile(rf"\b{re.escape(name)}\s*\(\s*([^,]+)\s*,\s*([^)]+)\)", re.IGNORECASE)
+
+        def repl(m: re.Match[str]) -> str:
+            r1 = m.group(1).strip()
+            r2 = m.group(2).strip()
+            r1n = normalize_expr(r1)
+            r2n = normalize_expr(r2)
+            full1 = normalize_expr(f"1:{b1}")
+            full2 = normalize_expr(f"1:{b2}")
+            if r1n == full1 and r2n == full2:
+                return name
+            if r1n == full1:
+                return f"{name}(:, {r2})"
+            if r2n == full2:
+                return f"{name}({r1}, :)"
+            return m.group(0)
+
+        s = pat.sub(repl, s)
+    return s
+
+
 def maybe_print_implied_do(
     stmt: str,
     decl_bounds: Dict[str, str],
@@ -4205,6 +4379,111 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 5
                     continue
+        # Form A2N: nested 2D loop with optional outer-prefix elementwise statements,
+        # then inner multi-assignment elementwise body.
+        # do i=...
+        #   p(i)=...
+        #   do j=...
+        #      a(i,j)=...
+        #      b(i,j)=...
+        #   end do
+        # end do
+        if i + 5 < len(body):
+            k = i + 1
+            prefix_stmts: List[str] = []
+            blocked_prefix = False
+            while k < len(body):
+                st = body[k][1].strip()
+                if DO_RE.match(st):
+                    break
+                if (
+                    not st
+                    or IF_THEN_RE.match(st)
+                    or ELSE_RE.match(st)
+                    or END_IF_RE.match(st)
+                    or CYCLE_RE.match(st)
+                    or EXIT_RE.match(st)
+                    or RETURN_RE.match(st)
+                    or SELECT_CASE_RE.match(st)
+                    or END_DO_RE.match(st)
+                ):
+                    blocked_prefix = True
+                    break
+                prefix_stmts.append(body[k][1])
+                k += 1
+            if blocked_prefix or k >= len(body):
+                m_ido = None
+            else:
+                _ln_ido, stmt_ido = body[k]
+                m_ido = DO_RE.match(stmt_ido.strip())
+            if m_ido is not None:
+                j = k + 1
+                inner_stmts: List[str] = []
+                inner_end = -1
+                blocked = False
+                while j < len(body):
+                    _ln_j, stmt_j = body[j]
+                    st = stmt_j.strip()
+                    if DO_RE.match(st):
+                        blocked = True
+                        break
+                    if END_DO_RE.match(st):
+                        inner_end = j
+                        break
+                    if (
+                        IF_THEN_RE.match(st)
+                        or ELSE_RE.match(st)
+                        or END_IF_RE.match(st)
+                        or CYCLE_RE.match(st)
+                        or EXIT_RE.match(st)
+                        or RETURN_RE.match(st)
+                        or SELECT_CASE_RE.match(st)
+                    ):
+                        blocked = True
+                        break
+                    if st:
+                        inner_stmts.append(stmt_j)
+                    j += 1
+                if not blocked and inner_end > i + 2 and inner_end + 1 < len(body):
+                    ln_oend, stmt_oend = body[inner_end + 1]
+                    if END_DO_RE.match(stmt_oend.strip()):
+                        prefix_suggs: List[str] = []
+                        ok_prefix = True
+                        for pst in prefix_stmts:
+                            ps = maybe_elementwise(loop_var, rng, pst, decl_bounds, alloc_map, array_names)
+                            if ps is None:
+                                ok_prefix = False
+                                break
+                            ps = simplify_section_expr_rank2_partial(ps, rank2_bounds)
+                            prefix_suggs.append(ps)
+                        if not ok_prefix:
+                            i += 1
+                            continue
+                        sugg_nmulti = maybe_nested_multi_elementwise(
+                            loop_var,
+                            rng,
+                            stmt_ido,
+                            inner_stmts,
+                            decl_bounds,
+                            rank2_bounds,
+                            alloc_map,
+                            array_names,
+                        )
+                        if sugg_nmulti is not None:
+                            sug_all = "\n".join(prefix_suggs + [sugg_nmulti]) if prefix_suggs else sugg_nmulti
+                            findings.append(
+                                Finding(
+                                    path=unit.path,
+                                    rule="elementwise_multi_nested",
+                                    unit_kind=unit.kind,
+                                    unit_name=unit.name,
+                                    start_line=ln,
+                                    end_line=ln_oend,
+                                    suggestion=sug_all,
+                                )
+                            )
+                            i = inner_end + 2
+                            continue
 
         # Form A: one-statement loop body.
         if i + 2 < len(body):
@@ -4599,6 +4878,62 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 6
                     continue
+        # Form AM: multi-statement elementwise loop body:
+        # do ...
+        #    a(i)=...
+        #    b(i)=...
+        # end do
+        # Conservative: no nested control flow; only top-level assignments.
+        depth = 1
+        j = i + 1
+        inner_stmts: List[str] = []
+        has_nested = False
+        end_idx = -1
+        while j < len(body):
+            _ln_j, stmt_j = body[j]
+            st = stmt_j.strip()
+            if DO_RE.match(st):
+                has_nested = True
+                break
+            if END_DO_RE.match(st):
+                depth -= 1
+                if depth == 0:
+                    end_idx = j
+                    break
+            else:
+                if (
+                    IF_THEN_RE.match(st)
+                    or ELSE_RE.match(st)
+                    or END_IF_RE.match(st)
+                    or CYCLE_RE.match(st)
+                    or EXIT_RE.match(st)
+                    or RETURN_RE.match(st)
+                    or SELECT_CASE_RE.match(st)
+                ):
+                    has_nested = True
+                    break
+                if st:
+                    inner_stmts.append(stmt_j)
+            j += 1
+        if not has_nested and end_idx > i + 2:
+            ln_end = body[end_idx][0]
+            sugg_multi = maybe_multi_elementwise(
+                loop_var, rng, inner_stmts, decl_bounds, alloc_map, array_names
+            )
+            if sugg_multi is not None:
+                findings.append(
+                    Finding(
+                        path=unit.path,
+                        rule="elementwise_multi",
+                        unit_kind=unit.kind,
+                        unit_name=unit.name,
+                        start_line=ln,
+                        end_line=ln_end,
+                        suggestion=sugg_multi,
+                    )
+                )
+                i = end_idx + 1
+                continue
         i += 1
     return findings
 
@@ -4819,6 +5154,13 @@ def remove_unused_locals_from_lines(lines: List[str], path: Path) -> Tuple[List[
         low = code.strip().lower()
         if "::" not in low or not TYPE_DECL_RE.match(low):
             continue
+        # Do not edit declaration lines participating in free-form continuations.
+        # Reconstructing trailing '&' safely requires whole-statement rewriting.
+        code_rstripped = code.rstrip()
+        if code_rstripped.endswith("&"):
+            continue
+        if idx + 1 < len(new_lines) and is_continuation_only_line(new_lines[idx + 1]):
+            continue
         left, rhs = code.split("::", 1)
         ents = parse_decl_entities(rhs)
         keep_raw: List[str] = []
@@ -4848,6 +5190,9 @@ def annotate_file(path: Path, findings: List[Finding], *, backup: bool = True) -
         eidx = f.end_line - 1
         if sidx < 0 or eidx < 0 or sidx >= len(lines) or eidx >= len(lines) or sidx > eidx:
             continue
+        # Also include any immediate trailing continuation-only lines.
+        while eidx + 1 < len(lines) and is_continuation_only_line(lines[eidx + 1]):
+            eidx += 1
         raw_s = lines[sidx]
         raw_e = lines[eidx]
         indent_s = re.match(r"^\s*", raw_s).group(0) if raw_s else ""
@@ -4899,6 +5244,9 @@ def apply_fix_file(
         eidx = f.end_line - 1
         if sidx < 0 or eidx < 0 or sidx >= len(lines) or eidx >= len(lines) or sidx > eidx:
             continue
+        # Also include any immediate trailing continuation-only lines.
+        while eidx + 1 < len(lines) and is_continuation_only_line(lines[eidx + 1]):
+            eidx += 1
         raw_s = lines[sidx]
         eol = "\r\n" if raw_s.endswith("\r\n") else ("\n" if raw_s.endswith("\n") else "\n")
         indent = re.match(r"^\s*", raw_s).group(0) if raw_s else ""
