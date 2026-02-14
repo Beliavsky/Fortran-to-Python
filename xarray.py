@@ -90,6 +90,7 @@ READ_PREFIX_RE = re.compile(r"^\s*read\s*\*\s*,\s*(.+)\s*$", re.IGNORECASE)
 PRINT_STMT_RE = re.compile(r"^\s*print\s+(.+)$", re.IGNORECASE)
 LOOP_ASSIGN_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
 RANDOM_CALL_RE = re.compile(r"^\s*call\s+random_number\s*\(\s*(.+)\s*\)\s*$", re.IGNORECASE)
+CALL_STMT_RE = re.compile(r"^\s*call\s+([a-z][a-z0-9_]*)\s*\((.*)\)\s*$", re.IGNORECASE)
 
 # Conservative set of elemental intrinsics that are safe in array expressions.
 ELEMENTAL_INTRINSICS = {
@@ -127,6 +128,10 @@ ELEMENTAL_INTRINSICS = {
     "tan",
     "tanh",
 }
+
+# Per-file user-defined elemental function names (lowercase).
+USER_ELEMENTAL_CALLS: Set[str] = set()
+USER_ELEMENTAL_SUBROUTINES: Set[str] = set()
 
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
@@ -1538,6 +1543,44 @@ def maybe_elementwise(
     return f"{lhs_expr} = {rhs_sliced}"
 
 
+def maybe_elemental_subroutine_call(
+    loop_var: str,
+    rng: str,
+    body_stmt: str,
+    decl_bounds: Dict[str, str],
+    array_names: Set[str],
+) -> Optional[str]:
+    """Detect looped calls to an elemental subroutine and suggest array call."""
+    m = CALL_STMT_RE.match(body_stmt.strip())
+    if not m:
+        return None
+    callee = m.group(1).lower()
+    if callee not in USER_ELEMENTAL_SUBROUTINES:
+        return None
+    args_raw = m.group(2).strip()
+    args = split_top_level_commas(args_raw) if args_raw else []
+    if not args:
+        return None
+    lb, ubtxt = split_range(rng)
+    out_args: List[str] = []
+    changed_any = False
+    for a in args:
+        at = a.strip()
+        # Conservative: skip keyword arguments.
+        if re.search(r"(?<![<>=/])=(?![=])", at):
+            return None
+        as_s = replace_affine_index_anydim(at, loop_var, lb, ubtxt, array_names=array_names)
+        if has_loop_var(as_s, loop_var):
+            return None
+        if as_s != at:
+            changed_any = True
+        as_s = simplify_section_expr(as_s, decl_bounds)
+        out_args.append(as_s)
+    if not changed_any:
+        return None
+    return f"call {callee}({', '.join(out_args)})"
+
+
 def maybe_temp_then_elementwise(
     loop_var: str,
     rng: str,
@@ -2646,6 +2689,8 @@ def has_nonarray_call(expr: str, array_names: Set[str]) -> bool:
         name = m.group(1).lower()
         if name in array_names:
             continue
+        if name in USER_ELEMENTAL_CALLS:
+            continue
         return True
     return False
 
@@ -2656,6 +2701,8 @@ def has_disallowed_function_calls(expr: str, array_names: Set[str]) -> bool:
     for m in CALL_LIKE_RE.finditer(s):
         name = m.group(1).lower()
         if name in array_names:
+            continue
+        if name in USER_ELEMENTAL_CALLS:
             continue
         if name in ELEMENTAL_INTRINSICS:
             continue
@@ -4522,6 +4569,23 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
+                sugg_ecall = maybe_elemental_subroutine_call(
+                    loop_var, rng, stmt_body, decl_bounds, array_names
+                )
+                if sugg_ecall is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="elemental_subroutine_call",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_ecall,
+                        )
+                    )
+                    i += 3
+                    continue
                 sugg_elem = maybe_elementwise(loop_var, rng, stmt_body, decl_bounds, alloc_map, array_names)
                 if sugg_elem is not None:
                     findings.append(
@@ -5026,6 +5090,17 @@ def analyze_file(path: Path) -> List[Finding]:
     if not infos or any_missing:
         return []
     finfo = infos[0]
+    global USER_ELEMENTAL_CALLS, USER_ELEMENTAL_SUBROUTINES
+    USER_ELEMENTAL_CALLS = {
+        p.name.lower()
+        for p in finfo.procedures
+        if p.kind == "function" and "elemental" in p.attrs
+    }
+    USER_ELEMENTAL_SUBROUTINES = {
+        p.name.lower()
+        for p in finfo.procedures
+        if p.kind == "subroutine" and "elemental" in p.attrs
+    }
     out: List[Finding] = []
     for unit in xunset.collect_units(finfo):
         out.extend(analyze_unit(unit))
