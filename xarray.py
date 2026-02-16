@@ -15,6 +15,8 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 import cli_paths as cpaths
 import fortran_build as fbuild
 import fortran_scan as fscan
+import xalloc_assign
+import xno_variable
 import xunset
 
 DO_RE = re.compile(
@@ -3800,6 +3802,56 @@ def maybe_io_loop_implied_do(
     return None
 
 
+def maybe_constructor_fill_loop(
+    loop_var: str,
+    lb: str,
+    ub: str,
+    step: Optional[str],
+    stmt: str,
+    decl_bounds: Dict[str, str],
+    alloc_map: Dict[str, str],
+    alloc_rank1_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect rank-1 fill loop and rewrite as array-constructor implied-DO."""
+    m = ASSIGN_RE.match(stmt.strip())
+    if not m:
+        return None
+    lhs = m.group(1).strip()
+    rhs = m.group(2).strip()
+
+    lhs_idx = INDEXED_NAME_RE.match(lhs)
+    if lhs_idx is None:
+        return None
+    arr = lhs_idx.group(1).strip()
+    idx = lhs_idx.group(2).strip().lower()
+    if idx != loop_var.lower():
+        return None
+    if not has_loop_var(rhs, loop_var):
+        return None
+
+    # Only whole-vector fills: 1:ub with optional unit step.
+    if lb.strip() != "1":
+        return None
+    step_txt = None if step is None else step.strip()
+    if step_txt not in (None, "", "1"):
+        return None
+
+    # Ensure this loop covers whole declared/allocated vector.
+    full_ok = False
+    bnd = decl_bounds.get(arr.lower())
+    if bnd is not None and normalize_expr(f"1:{ub}") == normalize_expr(bnd):
+        full_ok = True
+    if can_collapse_lhs_alloc(arr, f"1:{ub}", alloc_map):
+        full_ok = True
+    abnd = alloc_rank1_bounds.get(arr.lower())
+    if abnd is not None and normalize_expr(f"1:{ub}") == normalize_expr(abnd):
+        full_ok = True
+    if not full_ok:
+        return None
+
+    return f"{arr} = [({rhs}, {loop_var}={lb},{ub})]"
+
+
 def maybe_random_number_loop_1d(
     loop_var: str,
     rng: str,
@@ -3852,6 +3904,29 @@ def maybe_random_number_loop_1d(
         ):
             harvest_expr = arr_name
     return f"call random_number({harvest_expr})"
+
+
+def maybe_random_fill_then_elementwise(
+    loop_var: str,
+    rng: str,
+    stmt_fill: str,
+    stmt_elem: str,
+    decl_bounds: Dict[str, str],
+    alloc_map: Dict[str, str],
+    array_names: Set[str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    rank3_bounds: Dict[str, Tuple[str, str, str]],
+) -> Optional[str]:
+    """Detect two-statement loop: random fill of one element, then elementwise update."""
+    s_fill = maybe_random_number_loop_1d(
+        loop_var, rng, stmt_fill, decl_bounds, rank2_bounds, rank3_bounds
+    )
+    if s_fill is None:
+        return None
+    s_elem = maybe_elementwise(loop_var, rng, stmt_elem, decl_bounds, alloc_map, array_names)
+    if s_elem is None:
+        return None
+    return f"{s_fill}\n{s_elem}"
 
 
 def maybe_random_number_nested_2d(
@@ -4662,6 +4737,23 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
+                sugg_ctor = maybe_constructor_fill_loop(
+                    loop_var, lb, ub, step, stmt_body, decl_bounds, alloc_map, alloc_rank1_bounds
+                )
+                if sugg_ctor is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="constructor_fill_loop",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_ctor,
+                        )
+                    )
+                    i += 3
+                    continue
                 sugg_ploop = maybe_print_loop(loop_var, lb, ub, step, stmt_body, decl_bounds)
                 if sugg_ploop is not None:
                     findings.append(
@@ -4844,6 +4936,31 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             _ln_s2, stmt_s2 = body[i + 2]
             ln_end, stmt_end = body[i + 3]
             if END_DO_RE.match(stmt_end.strip()):
+                sugg_rand_elem = maybe_random_fill_then_elementwise(
+                    loop_var,
+                    rng,
+                    stmt_s1,
+                    stmt_s2,
+                    decl_bounds,
+                    alloc_map,
+                    array_names,
+                    rank2_bounds,
+                    rank3_bounds,
+                )
+                if sugg_rand_elem is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="random_number_fill_elementwise",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_rand_elem,
+                        )
+                    )
+                    i += 4
+                    continue
                 sugg_temp_elem = maybe_temp_then_elementwise(
                     loop_var, rng, stmt_s1, stmt_s2, decl_bounds, alloc_map, array_names
                 )
@@ -5453,6 +5570,49 @@ def apply_fix_file(
     return changed, backup, removed_locals
 
 
+def remove_redundant_allocates_via_xalloc_assign(path: Path) -> int:
+    """Delete redundant ALLOCATE-before-assignment statements in one file."""
+    findings = xalloc_assign.analyze_file(path)
+    if not findings:
+        return 0
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    removed = 0
+    by_alloc_line: Dict[int, xalloc_assign.Finding] = {}
+    for f in findings:
+        by_alloc_line.setdefault(f.alloc_line, f)
+    for alloc_line in sorted(by_alloc_line.keys(), reverse=True):
+        f = by_alloc_line[alloc_line]
+        if not (1 <= alloc_line <= len(lines)):
+            continue
+        if f.replace_assign_rhs is not None and 1 <= f.assign_line <= len(lines):
+            lines[f.assign_line - 1] = xalloc_assign.rewrite_assignment_rhs_line(
+                lines[f.assign_line - 1], f.var, f.replace_assign_rhs
+            )
+        end_line = xalloc_assign.end_line_for_stmt_start(lines, alloc_line)
+        if end_line < alloc_line:
+            continue
+        del lines[alloc_line - 1 : end_line]
+        removed += 1
+    if removed > 0:
+        path.write_text("".join(lines), encoding="utf-8")
+    return removed
+
+
+def inline_temps_via_xno_variable(path: Path) -> Tuple[int, int]:
+    """Inline single-use temporaries using xno_variable logic on one file."""
+    findings = xno_variable.analyze_file(path)
+    if not findings:
+        return 0, 0
+    n_inline, n_decl_removed, _n_ann, _backup = xno_variable.apply_fix_file(
+        path,
+        findings,
+        annotate=False,
+        out_path=None,
+        create_backup=False,
+    )
+    return n_inline, n_decl_removed
+
+
 def count_file_lines(path: Path) -> int:
     """Return line count for a text file (best effort)."""
     try:
@@ -5573,6 +5733,12 @@ def main() -> int:
         action="store_true",
         help="Use one-line FORALL rewrite mode for eligible simple loops",
     )
+    parser.add_argument(
+        "--inline",
+        dest="post_inline_temp",
+        action="store_true",
+        help="After xarray rewrites, run xno_variable-style temporary inlining post-pass",
+    )
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         print("--limit must be >= 1.")
@@ -5583,6 +5749,8 @@ def main() -> int:
         args.run = True
     if args.tee_both:
         args.tee = True
+    if args.tee and args.out is None:
+        args.out = Path("temp.f90")
     if args.run and args.out is None:
         args.out = Path("temp.f90")
     if args.out is not None:
@@ -5602,9 +5770,6 @@ def main() -> int:
         return 2
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
-        return 2
-    if args.tee and args.out is None:
-        print("--tee requires --out.")
         return 2
     if args.run and len(files) != 1:
         print("--run/--run-both require exactly one input source file.")
@@ -5674,6 +5839,9 @@ def main() -> int:
         by_file = by_file_candidates
         touched = 0
         total = 0
+        total_alloc_removed = 0
+        total_post_inlined = 0
+        total_post_decl_removed = 0
         post_lines: Dict[Path, int] = {}
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             out_path = args.out if args.out is not None else None
@@ -5694,6 +5862,15 @@ def main() -> int:
             if n > 0:
                 transformed_changed = True
                 touched += 1
+                target = out_path if out_path is not None else p
+                n_alloc_removed = remove_redundant_allocates_via_xalloc_assign(target)
+                total_alloc_removed += n_alloc_removed
+                n_post_inl = 0
+                n_post_decl = 0
+                if args.post_inline_temp:
+                    n_post_inl, n_post_decl = inline_temps_via_xno_variable(target)
+                    total_post_inlined += n_post_inl
+                    total_post_decl_removed += n_post_decl
                 if out_path is not None:
                     print(f"\nFixed {p.name}: replaced {n} block(s), wrote {out_path}")
                     if args.tee:
@@ -5703,6 +5880,13 @@ def main() -> int:
                     print(f"\nFixed {p.name}: replaced {n} block(s), backup {backup.name if backup else '(none)'}")
                 if args.verbose and removed_locals:
                     print(f"  removed unused locals: {', '.join(removed_locals)}")
+                if n_alloc_removed > 0:
+                    print(f"  removed redundant allocate-before-assignment: {n_alloc_removed}")
+                if n_post_inl > 0:
+                    print(
+                        f"  post-inline-temp: inlined {n_post_inl}, "
+                        f"decl-entities removed {n_post_decl}"
+                    )
                 if args.diff:
                     after = (out_path if out_path is not None else p).read_text(encoding="utf-8")
                     diff_lines = difflib.unified_diff(
@@ -5724,7 +5908,16 @@ def main() -> int:
             target = out_path if out_path is not None else p
             transformed_target = target
             post_lines[p] = count_file_lines(target)
-        print(f"\n--fix summary: files changed {touched}, replaced {total}")
+        summary = (
+            f"\n--fix summary: files changed {touched}, replaced {total}, "
+            f"allocates removed {total_alloc_removed}"
+        )
+        if args.post_inline_temp:
+            summary += (
+                f", post-inlined {total_post_inlined}, "
+                f"post decl-entities removed {total_post_decl_removed}"
+            )
+        print(summary)
         if args.summary:
             for p in files:
                 before_n = pre_lines.get(p, 0)
