@@ -7,6 +7,7 @@ import argparse
 import difflib
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -413,6 +414,25 @@ def find_matching_paren(text: str, open_pos: int) -> int:
                     return i
         i += 1
     return -1
+
+
+def parse_one_line_if(stmt: str) -> Optional[Tuple[str, str]]:
+    """Parse one-line IF into (condition, body_stmt), handling nested parentheses."""
+    s = stmt.strip()
+    m_if = re.match(r"^\s*if\b", s, re.IGNORECASE)
+    if not m_if:
+        return None
+    open_pos = s.find("(", m_if.end())
+    if open_pos < 0:
+        return None
+    close_pos = find_matching_paren(s, open_pos)
+    if close_pos < 0:
+        return None
+    cond = s[open_pos + 1 : close_pos].strip()
+    body = s[close_pos + 1 :].strip()
+    if not cond or not body:
+        return None
+    return cond, body
 
 
 def replace_affine_index_anydim(
@@ -2903,11 +2923,10 @@ def maybe_count_inline(
         # Avoid invalid/ambiguous rewrites like "count = count(...)".
         return None
 
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     # Exclude block IF form handled elsewhere.
     if body_stmt.lower().startswith("then"):
         return None
@@ -2988,11 +3007,10 @@ def maybe_findloc_inline(
     if not ZERO_LITERAL_RE.match(mp.group(2).strip()):
         return None
 
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     if body_stmt.lower().startswith("then"):
         return None
     mset = ASSIGN_RE.match(body_stmt)
@@ -3079,11 +3097,10 @@ def maybe_masked_product_inline(
         return None
     acc = acc_prev.group(1).lower()
 
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     if body_stmt.lower().startswith("then"):
         return None
 
@@ -3131,11 +3148,10 @@ def maybe_masked_sum_inline(
         return None
     acc = acc_prev.group(1).lower()
 
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     if body_stmt.lower().startswith("then"):
         return None
 
@@ -3205,11 +3221,10 @@ def maybe_extreme_value_inline(
     decl_bounds: Dict[str, str],
 ) -> Optional[str]:
     """Detect one-line IF min/max update and build MINVAL/MAXVAL replacement."""
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     if body_stmt.lower().startswith("then"):
         return None
 
@@ -3705,6 +3720,84 @@ def maybe_print_loop(
         return None
     item_s = simplify_section_expr(item_s, decl_bounds)
     return f"print {fmt}, {item_s}"
+
+
+def _has_loop_var_ref(expr: str, loop_var: str) -> bool:
+    return re.search(rf"\b{re.escape(loop_var)}\b", expr, re.IGNORECASE) is not None
+
+
+def _parse_write_stmt(stmt: str) -> Optional[Tuple[str, str]]:
+    s = stmt.strip()
+    if not s.lower().startswith("write"):
+        return None
+    i = s.lower().find("write") + len("write")
+    while i < len(s) and s[i].isspace():
+        i += 1
+    if i >= len(s) or s[i] != "(":
+        return None
+    depth = 0
+    in_s = False
+    in_d = False
+    j = i
+    while j < len(s):
+        ch = s[j]
+        if ch == "'" and not in_d:
+            in_s = not in_s
+        elif ch == '"' and not in_s:
+            in_d = not in_d
+        elif not in_s and not in_d:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    ctrl = s[i + 1:j].strip()
+                    tail = s[j + 1:].strip()
+                    if ctrl and tail:
+                        return ctrl, tail
+                    return None
+        j += 1
+    return None
+
+
+def maybe_io_loop_implied_do(
+    loop_var: str,
+    lb: str,
+    ub: str,
+    step: Optional[str],
+    stmt: str,
+) -> Optional[str]:
+    """Detect one-statement PRINT/WRITE loop bodies and build an implied-DO I/O list."""
+    s = stmt.strip()
+    triplet = f"{loop_var}={lb},{ub}"
+    if step is not None and step.strip() and step.strip() != "1":
+        triplet += f",{step.strip()}"
+
+    m = PRINT_STMT_RE.match(s)
+    if m:
+        rest = m.group(1).strip()
+        parts = split_top_level_commas(rest)
+        if len(parts) < 2:
+            return None
+        fmt = parts[0].strip()
+        items = [p.strip() for p in parts[1:] if p.strip()]
+        if not fmt or not items:
+            return None
+        if not any(_has_loop_var_ref(it, loop_var) for it in items):
+            return None
+        return f"print {fmt}, ({', '.join(items + [triplet])})"
+
+    pw = _parse_write_stmt(s)
+    if pw is not None:
+        ctrl, tail = pw
+        items = [p.strip() for p in split_top_level_commas(tail) if p.strip()]
+        if not items:
+            return None
+        if not any(_has_loop_var_ref(it, loop_var) for it in items):
+            return None
+        return f"write ({ctrl}) ({', '.join(items + [triplet])})"
+
+    return None
 
 
 def maybe_random_number_loop_1d(
@@ -4554,6 +4647,21 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
+                sugg_io = maybe_io_loop_implied_do(loop_var, lb, ub, step, stmt_body)
+                if sugg_io is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="io_loop_implied_do",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_io,
+                        )
+                    )
+                    i += 3
+                    continue
                 sugg_ploop = maybe_print_loop(loop_var, lb, ub, step, stmt_body, decl_bounds)
                 if sugg_ploop is not None:
                     findings.append(
@@ -5353,6 +5461,64 @@ def count_file_lines(path: Path) -> int:
         return 0
 
 
+def compile_and_run_capture(
+    source: Path,
+    *,
+    exe_path: Path,
+    label: str,
+    quiet_run: bool = False,
+    keep_exe: bool = False,
+) -> Tuple[bool, str, str]:
+    compile_cmd = ["gfortran", str(source), "-o", str(exe_path)]
+    print(f"Build ({label}): {' '.join(fbuild.quote_cmd_arg(x) for x in compile_cmd)}")
+    cp = subprocess.run(compile_cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        print(f"Build ({label}): FAIL (exit {cp.returncode})")
+        if cp.stdout:
+            print(cp.stdout.rstrip())
+        if cp.stderr:
+            print(fbuild.format_linker_stderr(cp.stderr).rstrip())
+        return False, "", ""
+    print(f"Build ({label}): PASS")
+    print(f"Run ({label}): {fbuild.quote_cmd_arg(str(exe_path))}")
+    rp = subprocess.run([str(exe_path)], capture_output=True, text=True)
+    try:
+        if rp.returncode != 0:
+            print(f"Run ({label}): FAIL (exit {rp.returncode})")
+            if rp.stdout:
+                print(rp.stdout.rstrip())
+            if rp.stderr:
+                print(rp.stderr.rstrip())
+            return False, rp.stdout or "", rp.stderr or ""
+        print(f"Run ({label}): PASS")
+        if not quiet_run:
+            if rp.stdout:
+                print(rp.stdout.rstrip())
+            if rp.stderr:
+                print(rp.stderr.rstrip())
+        return True, rp.stdout or "", rp.stderr or ""
+    finally:
+        if not keep_exe:
+            try:
+                exe_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def compile_and_run_fortran(
+    source: Path,
+    *,
+    exe_path: Path,
+    label: str,
+    quiet_run: bool = False,
+    keep_exe: bool = False,
+) -> bool:
+    ok, _out, _err = compile_and_run_capture(
+        source, exe_path=exe_path, label=label, quiet_run=quiet_run, keep_exe=keep_exe
+    )
+    return ok
+
+
 def main() -> int:
     """Run xarray advisory and optional annotation mode."""
     parser = argparse.ArgumentParser(
@@ -5368,6 +5534,29 @@ def main() -> int:
     )
     parser.add_argument("--fix", action="store_true", help="Apply suggested replacements in-place")
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument(
+        "--tee",
+        action="store_true",
+        help="With --fix --out, also print transformed output text to stdout",
+    )
+    parser.add_argument(
+        "--tee-both",
+        action="store_true",
+        help="With --fix --out, print original and transformed source text to stdout",
+    )
+    parser.add_argument("--run", action="store_true", help="After --fix with changes, build and run transformed source")
+    parser.add_argument(
+        "--run-both",
+        action="store_true",
+        help="Build/run original source, and build/run transformed source when changes are applied",
+    )
+    parser.add_argument(
+        "--run-diff",
+        action="store_true",
+        help="Run original and transformed executables and compare stdout/stderr",
+    )
+    parser.add_argument("--quiet-run", action="store_true", help="Do not print program stdout/stderr on successful runs")
+    parser.add_argument("--keep-exe", action="store_true", help="Keep generated executables after running")
     parser.add_argument("--annotate", action="store_true", help="Insert annotated suggestion blocks")
     parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
@@ -5388,6 +5577,14 @@ def main() -> int:
     if args.limit is not None and args.limit < 1:
         print("--limit must be >= 1.")
         return 2
+    if args.run_diff:
+        args.run_both = True
+    if args.run_both:
+        args.run = True
+    if args.tee_both:
+        args.tee = True
+    if args.run and args.out is None:
+        args.out = Path("temp.f90")
     if args.out is not None:
         args.fix = True
     if args.diff and not args.fix:
@@ -5405,6 +5602,12 @@ def main() -> int:
         return 2
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
+        return 2
+    if args.tee and args.out is None:
+        print("--tee requires --out.")
+        return 2
+    if args.run and len(files) != 1:
+        print("--run/--run-both require exactly one input source file.")
         return 2
     baseline_compile_paths = files
     after_compile_paths = [args.out] if (args.fix and args.out is not None) else files
@@ -5431,6 +5634,18 @@ def main() -> int:
     pre_lines: Dict[Path, int] = {p: count_file_lines(p) for p in files}
 
     if not findings:
+        orig_out = ""
+        orig_err = ""
+        if args.run_both:
+            src = files[0]
+            orig_exe = Path(f"{src.stem}_orig.exe")
+            ok_orig, orig_out, orig_err = compile_and_run_capture(
+                src, exe_path=orig_exe, label="original", quiet_run=args.quiet_run, keep_exe=args.keep_exe
+            )
+            if not ok_orig:
+                return 5
+        if args.run_diff:
+            print("Run diff: SKIP (no transformations suggested)")
         if args.summary:
             for p in files:
                 before = pre_lines.get(p, 0)
@@ -5449,14 +5664,25 @@ def main() -> int:
         if args.verbose:
             print(f"  suggest: {f.suggestion}")
 
+    transformed_changed = False
+    transformed_target: Optional[Path] = None
+    orig_out = ""
+    orig_err = ""
+    xform_out = ""
+    xform_err = ""
     if args.fix:
         by_file = by_file_candidates
         touched = 0
         total = 0
         post_lines: Dict[Path, int] = {}
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
-            before = p.read_text(encoding="utf-8")
             out_path = args.out if args.out is not None else None
+            before = p.read_text(encoding="utf-8")
+            if out_path is not None and args.tee_both:
+                print(f"--- original: {p} ---")
+                print(before, end="")
+                if not before.endswith("\n"):
+                    print("")
             n, backup, removed_locals = apply_fix_file(
                 p,
                 by_file[p],
@@ -5466,9 +5692,13 @@ def main() -> int:
             )
             total += n
             if n > 0:
+                transformed_changed = True
                 touched += 1
                 if out_path is not None:
                     print(f"\nFixed {p.name}: replaced {n} block(s), wrote {out_path}")
+                    if args.tee:
+                        print(f"--- transformed: {out_path} ---")
+                        print((out_path).read_text(encoding="utf-8"), end="")
                 else:
                     print(f"\nFixed {p.name}: replaced {n} block(s), backup {backup.name if backup else '(none)'}")
                 if args.verbose and removed_locals:
@@ -5487,7 +5717,12 @@ def main() -> int:
                         print(line)
             elif args.verbose:
                 print(f"\nNo fixes applied in {p.name}")
+            elif out_path is not None and args.tee:
+                if args.tee_both:
+                    print(f"--- transformed: {out_path} ---")
+                print((out_path).read_text(encoding="utf-8"), end="")
             target = out_path if out_path is not None else p
+            transformed_target = target
             post_lines[p] = count_file_lines(target)
         print(f"\n--fix summary: files changed {touched}, replaced {total}")
         if args.summary:
@@ -5525,6 +5760,41 @@ def main() -> int:
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, after_compile_paths, "after-fix", fscan.display_path):
             return 5
+    if args.run_both:
+        src = files[0]
+        orig_exe = Path(f"{src.stem}_orig.exe")
+        ok_orig, orig_out, orig_err = compile_and_run_capture(
+            src, exe_path=orig_exe, label="original", quiet_run=args.quiet_run, keep_exe=args.keep_exe
+        )
+        if not ok_orig:
+            return 5
+    if args.run and transformed_changed and transformed_target is not None:
+        out_src = transformed_target
+        out_exe = Path(f"{out_src.stem}.exe")
+        ok_xf, xform_out, xform_err = compile_and_run_capture(
+            out_src, exe_path=out_exe, label="transformed", quiet_run=args.quiet_run, keep_exe=args.keep_exe
+        )
+        if not ok_xf:
+            return 5
+    if args.run_diff:
+        if not transformed_changed:
+            print("Run diff: SKIP (no transformations applied)")
+        else:
+            same = (orig_out == xform_out) and (orig_err == xform_err)
+            if same:
+                print("Run diff: MATCH")
+            else:
+                print("Run diff: DIFF")
+                orig_blob = f"STDOUT:\n{orig_out}\nSTDERR:\n{orig_err}\n"
+                xform_blob = f"STDOUT:\n{xform_out}\nSTDERR:\n{xform_err}\n"
+                for line in difflib.unified_diff(
+                    orig_blob.splitlines(),
+                    xform_blob.splitlines(),
+                    fromfile="original",
+                    tofile="transformed",
+                    lineterm="",
+                ):
+                    print(line)
     return 0
 
 
