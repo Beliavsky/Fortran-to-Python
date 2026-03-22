@@ -740,6 +740,7 @@ class basic_f2p:
         self._subr_sigs: dict[str, dict[str, list[str]]] = {}
         self._current_result_name: str | None = None
         self._derived_types: set[str] = set()
+        self._seen_scipy_special = False
 
     def _type_hint(self, ftype: str, type_name: str | None = None, is_array: bool = False) -> str:
         if ftype == "type":
@@ -918,6 +919,9 @@ class basic_f2p:
         text = "\n".join(lines)
         if re.search(r"\bnp\.", text) is None:
             _drop_line("import numpy as np")
+        text = "\n".join(lines)
+        if re.search(r"\bsps\.", text) is None:
+            _drop_line("import scipy.special as sps")
         return lines
 
     def emit(self, s: str = "") -> None:
@@ -1112,6 +1116,45 @@ class basic_f2p:
 
         s = _rewrite_np_sum_calls(s)
 
+        def _translate_special_call(name: str, inner: str) -> str | None:
+            lname = name.lower()
+            if lname not in {
+                "gamma",
+                "log_gamma",
+                "erf",
+                "erfc",
+                "bessel_j0",
+                "bessel_j1",
+                "bessel_jn",
+                "bessel_yn",
+            }:
+                return None
+            parts = [p.strip() for p in split_args(inner)]
+            args_py = [self.translate_expr(p, arrays_1d) for p in parts]
+            if lname == "gamma" and len(args_py) == 1:
+                return f"sps.gamma({args_py[0]})"
+            if lname == "log_gamma" and len(args_py) == 1:
+                return f"sps.gammaln({args_py[0]})"
+            if lname == "erf" and len(args_py) == 1:
+                return f"sps.erf({args_py[0]})"
+            if lname == "erfc" and len(args_py) == 1:
+                return f"sps.erfc({args_py[0]})"
+            if lname == "bessel_j0" and len(args_py) == 1:
+                return f"sps.j0({args_py[0]})"
+            if lname == "bessel_j1" and len(args_py) == 1:
+                return f"sps.j1({args_py[0]})"
+            if lname == "bessel_jn":
+                if len(args_py) == 2:
+                    return f"sps.jv({args_py[0]}, {args_py[1]})"
+                if len(args_py) == 3:
+                    return f"sps.jv(np.arange(int({args_py[0]}), int({args_py[1]}) + 1), {args_py[2]})"
+            if lname == "bessel_yn":
+                if len(args_py) == 2:
+                    return f"sps.yn({args_py[0]}, {args_py[1]})"
+                if len(args_py) == 3:
+                    return f"sps.yn(np.arange(int({args_py[0]}), int({args_py[1]}) + 1), {args_py[2]})"
+            return None
+
         # 1d array element: a(i) -> a[(i)-1] (assume 1-based Fortran indexing)
         # Use a scanner (not regex) so nested references like x(idx(i)+1) work.
         def _convert_refs(txt: str) -> str:
@@ -1135,7 +1178,12 @@ class basic_f2p:
                         inner = txt[k + 1 : pclose]
                         inner_py = self.translate_expr(inner, arrays_1d)
                         root = name.split(".", 1)[0].lower()
-                        dotted_array_ref = ("." in name) and (root not in {"np", "math", "random"})
+                        dotted_array_ref = ("." in name) and (root not in {"np", "math", "random", "sps"})
+                        special_call = None if "." in name else _translate_special_call(name, inner)
+                        if special_call is not None:
+                            out.append(special_call)
+                            i = pclose + 1
+                            continue
                         if name in arrays_1d or dotted_array_ref:
                             if "," in inner:
                                 parts = [p.strip() for p in split_args(inner)]
@@ -2370,6 +2418,10 @@ class basic_f2p:
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
         self.seen_parameter = any(re.search(r"\bparameter\b", code, re.I) for code, _c in raw)
+        self._seen_scipy_special = any(
+            re.search(r"\b(?:gamma|log_gamma|erf|erfc|bessel_j0|bessel_j1|bessel_jn|bessel_yn)\s*\(", code, re.I)
+            for code, _c in raw
+        )
 
         self.out = []
         self.indent = 0
@@ -2381,6 +2433,8 @@ class basic_f2p:
         self.emit("from dataclasses import dataclass")
         self.emit("from types import SimpleNamespace")
         self.emit("from fortran_py_runtime import *")
+        if self._seen_scipy_special:
+            self.emit("import scipy.special as sps")
         if self.seen_parameter:
             self.emit("from typing import Final")
         self.emit("")
