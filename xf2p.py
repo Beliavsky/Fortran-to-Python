@@ -253,6 +253,76 @@ def _strip_one_outer_paren(s: str) -> str:
     return s
 
 
+def _fortran_implied_do_expr(raw: str, translate_expr, arrays_1d: set[str]) -> str | None:
+    """Translate an I/O implied-DO item, including nested implied-DOs."""
+    s = raw.strip()
+    if not (len(s) >= 2 and s[0] == "(" and s[-1] == ")" and find_matching_paren(s, 0) == len(s) - 1):
+        return None
+    inner = s[1:-1].strip()
+    parts = [p.strip() for p in split_args(inner) if p.strip()]
+    if len(parts) < 3:
+        return None
+
+    obj_parts: list[str] | None = None
+    var = lo = hi = step = None
+
+    if len(parts) >= 4:
+        mm = re.fullmatch(r"([a-z_]\w*)\s*=\s*(.+)", parts[-3], re.I)
+        if mm:
+            obj_parts = parts[:-3]
+            var = mm.group(1)
+            lo = mm.group(2).strip()
+            hi = parts[-2]
+            step = parts[-1]
+    if obj_parts is None:
+        mm = re.fullmatch(r"([a-z_]\w*)\s*=\s*(.+)", parts[-2], re.I)
+        if mm:
+            obj_parts = parts[:-2]
+            var = mm.group(1)
+            lo = mm.group(2).strip()
+            hi = parts[-1]
+            step = None
+    if obj_parts is None or not obj_parts or var is None or lo is None or hi is None:
+        return None
+
+    lo_py = translate_expr(lo, arrays_1d)
+    hi_py = translate_expr(hi, arrays_1d)
+    if step is None:
+        range_py = f"range(int({lo_py}), int({hi_py}) + 1)"
+    else:
+        step_py = translate_expr(step, arrays_1d)
+        range_py = f"range(int({lo_py}), int({hi_py}) + (1 if int({step_py}) > 0 else -1), int({step_py}))"
+
+    seq_parts: list[str] = []
+    all_scalar = True
+    scalar_exprs: list[str] = []
+    for p in obj_parts:
+        nested_py = _fortran_implied_do_expr(p, translate_expr, arrays_1d)
+        if nested_py is not None:
+            all_scalar = False
+            seq_parts.append(nested_py)
+        else:
+            expr_py = translate_expr(p, arrays_1d)
+            scalar_exprs.append(expr_py)
+            seq_parts.append(f"[{expr_py}]")
+
+    if all_scalar and len(scalar_exprs) == 1:
+        return f"[{scalar_exprs[0]} for {var} in {range_py}]"
+
+    seq_py = " + ".join(seq_parts)
+    return f"[_xf2p_subitem for {var} in {range_py} for _xf2p_subitem in {seq_py}]"
+
+
+def _is_recyclable_io_iterable(raw: str, decl_array_types: dict[str, str]) -> bool:
+    s = raw.strip()
+    return (
+        s.startswith('[')
+        or s.startswith('(/')
+        or _fortran_implied_do_expr(s, lambda x, _a: x, set()) is not None
+        or (re.fullmatch(r"[a-z_]\w*", s, flags=re.I) and s.lower() in decl_array_types)
+    )
+
+
 def _fortran_format_arg_count(fmt_literal: str) -> int | None:
     """Return the number of data items consumed by one pass of a limited format."""
     try:
@@ -1511,7 +1581,11 @@ class basic_f2p:
         if mm:
             raw_args = [a.strip() for a in split_args(mm.group(1))]
             if len(raw_args) == 1:
-                a0 = raw_args[0]
+                a0 = raw_args[0].strip()
+                implied_py = _fortran_implied_do_expr(a0, self.translate_expr, arrays_1d)
+                if implied_py is not None:
+                    self.emit(f"print(*{implied_py})")
+                    return True
                 if re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types:
                     self.emit(f"print(*np.ravel({a0}, order='F'))")
                     return True
@@ -1520,7 +1594,11 @@ class basic_f2p:
                 if a.startswith(("'", '"')):
                     args2.append(a)
                 else:
-                    args2.append(self.translate_expr(a, arrays_1d))
+                    implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                    if implied_py is not None:
+                        args2.append(f"*{implied_py}")
+                    else:
+                        args2.append(self.translate_expr(a, arrays_1d))
             self.emit(f"print({', '.join(args2)})")
             return True
 
@@ -1534,10 +1612,14 @@ class basic_f2p:
                 if a.startswith(("'", "\"")):
                     args2.append(a)
                 else:
-                    args2.append(self.translate_expr(a, arrays_1d))
+                    implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                    if implied_py is not None:
+                        args2.append(implied_py)
+                    else:
+                        args2.append(self.translate_expr(a, arrays_1d))
             if len(raw_args) == 1:
                 a0 = raw_args[0].strip()
-                if a0.startswith('[') or a0.startswith('(/') or (re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types):
+                if _is_recyclable_io_iterable(a0, self._decl_array_types):
                     fmt_expr = _fortran_format_recycled_expr(fmt, args2[0])
                     if fmt_expr is not None:
                         self.emit(f"print({fmt_expr})")
@@ -1554,7 +1636,11 @@ class basic_f2p:
         if mm:
             raw_args = [a.strip() for a in split_args(mm.group(1))]
             if len(raw_args) == 1:
-                a0 = raw_args[0]
+                a0 = raw_args[0].strip()
+                implied_py = _fortran_implied_do_expr(a0, self.translate_expr, arrays_1d)
+                if implied_py is not None:
+                    self.emit(f"print(*{implied_py})")
+                    return True
                 if re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types:
                     self.emit(f"print(*np.ravel({a0}, order='F'))")
                     return True
@@ -1563,7 +1649,11 @@ class basic_f2p:
                 if a.startswith(("'", "\"")):
                     args2.append(a)
                 else:
-                    args2.append(self.translate_expr(a, arrays_1d))
+                    implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                    if implied_py is not None:
+                        args2.append(f"*{implied_py}")
+                    else:
+                        args2.append(self.translate_expr(a, arrays_1d))
             self.emit(f"print({', '.join(args2)})")
             return True
 
@@ -1576,12 +1666,21 @@ class basic_f2p:
                 self.emit(f"print(file={unit})")
                 return True
             args2 = []
-            for a in split_args(rest):
-                a = a.strip()
+            raw_args = [a.strip() for a in split_args(rest)]
+            if len(raw_args) == 1:
+                implied_py = _fortran_implied_do_expr(raw_args[0], self.translate_expr, arrays_1d)
+                if implied_py is not None:
+                    self.emit(f"print(*{implied_py}, file={unit})")
+                    return True
+            for a in raw_args:
                 if a.startswith(("'", "\"")):
                     args2.append(a)
                 else:
-                    args2.append(self.translate_expr(a, arrays_1d))
+                    implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                    if implied_py is not None:
+                        args2.append(f"*{implied_py}")
+                    else:
+                        args2.append(self.translate_expr(a, arrays_1d))
             self.emit(f"print({', '.join(args2)}, file={unit})")
             return True
 
@@ -1599,10 +1698,14 @@ class basic_f2p:
                 if a.startswith(("'", "\"")):
                     args2.append(a)
                 else:
-                    args2.append(self.translate_expr(a, arrays_1d))
+                    implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                    if implied_py is not None:
+                        args2.append(implied_py)
+                    else:
+                        args2.append(self.translate_expr(a, arrays_1d))
             if len(raw_args) == 1:
                 a0 = raw_args[0].strip()
-                if a0.startswith('[') or a0.startswith('(/') or (re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types):
+                if _is_recyclable_io_iterable(a0, self._decl_array_types):
                     fmt_expr = _fortran_format_recycled_expr(fmt, args2[0])
                     if fmt_expr is not None:
                         self.emit(f"print({fmt_expr})")
@@ -1629,10 +1732,14 @@ class basic_f2p:
                 if a.startswith(("'", "\"")):
                     args2.append(a)
                 else:
-                    args2.append(self.translate_expr(a, arrays_1d))
+                    implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                    if implied_py is not None:
+                        args2.append(implied_py)
+                    else:
+                        args2.append(self.translate_expr(a, arrays_1d))
             if len(raw_args) == 1:
                 a0 = raw_args[0].strip()
-                if a0.startswith('[') or a0.startswith('(/') or (re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types):
+                if _is_recyclable_io_iterable(a0, self._decl_array_types):
                     fmt_expr = _fortran_format_recycled_expr(fmt, args2[0])
                     if fmt_expr is not None:
                         self.emit(f"print({fmt_expr}, file={unit})")
