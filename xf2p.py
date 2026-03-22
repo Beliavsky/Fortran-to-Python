@@ -136,9 +136,9 @@ def _parse_file_interface(src: str) -> tuple[list[str], list[str], list[UseSpec]
                     nm = it.strip()
                     if not nm:
                         continue
-                    # keep original symbol before rename clause (a => b)
+                    # For USE renames, keep the local imported name (a => b -> keep a).
                     if "=>" in nm:
-                        nm = nm.split("=>", 1)[1].strip()
+                        nm = nm.split("=>", 1)[0].strip()
                     nm = nm.strip()
                     if re.match(r"^[a-z_]\w*$", nm, re.I):
                         only_items.append(nm)
@@ -742,6 +742,44 @@ class basic_f2p:
         self._derived_types: set[str] = set()
         self._seen_scipy_special = False
 
+    def _kind_alias_value(self, remote: str) -> str | None:
+        r = remote.strip().lower()
+        mapping = {
+            "real32": "4",
+            "real64": "8",
+            "int8": "1",
+            "int16": "2",
+            "int32": "4",
+            "int64": "8",
+        }
+        return mapping.get(r)
+
+    def _emit_intrinsic_use_aliases(self, lines: list[tuple[str, str]]) -> None:
+        for code, _comment in lines:
+            s = code.strip()
+            mu = re.match(r"^use\s*,\s*intrinsic\s*::\s*([a-z_]\w*)\s*(.*)$", s, re.I)
+            if not mu:
+                continue
+            mod = mu.group(1).strip().lower()
+            tail = mu.group(2).strip()
+            if mod != "iso_fortran_env":
+                continue
+            mo = re.search(r"\bonly\s*:\s*(.+)$", tail, re.I)
+            if not mo:
+                continue
+            for it in split_args(mo.group(1).strip()):
+                nm = it.strip()
+                if not nm:
+                    continue
+                if "=>" in nm:
+                    local_name, remote_name = [p.strip() for p in nm.split("=>", 1)]
+                else:
+                    local_name = nm.strip()
+                    remote_name = nm.strip()
+                alias_val = self._kind_alias_value(remote_name)
+                if alias_val is not None and re.match(r"^[a-z_]\w*$", local_name, re.I):
+                    self.emit(f"{local_name} = {alias_val}")
+
     def _type_hint(self, ftype: str, type_name: str | None = None, is_array: bool = False) -> str:
         if ftype == "type":
             if is_array:
@@ -1038,8 +1076,6 @@ class basic_f2p:
         s = re.sub(r"\bmaxval\s*\(", "np.max(", s, flags=re.I)
         s = re.sub(r"\bminval\s*\(", "np.min(", s, flags=re.I)
         s = re.sub(r"\bcount\s*\(", "np.count_nonzero(", s, flags=re.I)
-        s = re.sub(r"\breal\s*\(", "np.float64(", s, flags=re.I)
-        s = re.sub(r"\bint\s*\(", "int(", s, flags=re.I)
         s = re.sub(r"\bsum\s*\(", "np.sum(", s, flags=re.I)
         s = re.sub(
             r"\ballocated\s*\(\s*([a-z_]\w*)\.([a-z_]\w*)\s*\)",
@@ -1052,12 +1088,6 @@ class basic_f2p:
         s = re.sub(r"\btiny\s*\(\s*[^)]*\)", "np.finfo(float).tiny", s, flags=re.I)
         s = re.sub(r"\bhuge\s*\(\s*[^)]*\)", "np.finfo(float).max", s, flags=re.I)
         s = s.replace("np.np.", "np.")
-        s = re.sub(
-            r"np\.float64\s*\(\s*(.+?)\s*,\s*kind\s*=\s*[a-z_]\w*\s*\)",
-            r"np.asarray(\1, dtype=np.float64)",
-            s,
-            flags=re.I,
-        )
 
         s = re.sub(r"\bsize\s*\(\s*([a-z_]\w*)\s*\)", r"_f_size(\1)", s, flags=re.I)
         s = re.sub(r"\bsize\s*\(\s*([^)]+)\s*\)", r"_f_size(\1)", s, flags=re.I)
@@ -1144,10 +1174,36 @@ class basic_f2p:
                 "cospi",
                 "sinpi",
                 "tanpi",
+                "real",
+                "int",
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
             args_py = [self.translate_expr(p, arrays_1d) for p in parts]
+            if lname == "real":
+                if len(parts) >= 1:
+                    arg0_raw = parts[0].strip()
+                    arg0_py = args_py[0]
+                    if (
+                        arg0_raw.startswith("[")
+                        or arg0_raw.startswith("(/")
+                        or arg0_raw.lower() in arrays_1d
+                    ):
+                        return f"np.asarray({arg0_py}, dtype=np.float64)"
+                    return f"np.float64({arg0_py})"
+                return None
+            if lname == "int":
+                if len(parts) >= 1:
+                    arg0_raw = parts[0].strip()
+                    arg0_py = args_py[0]
+                    if (
+                        arg0_raw.startswith("[")
+                        or arg0_raw.startswith("(/")
+                        or arg0_raw.lower() in arrays_1d
+                    ):
+                        return f"np.asarray({arg0_py}, dtype=int)"
+                    return f"int({arg0_py})"
+                return None
             if lname == "gamma" and len(args_py) == 1:
                 return f"sps.gamma({args_py[0]})"
             if lname == "log_gamma" and len(args_py) == 1:
@@ -1970,6 +2026,8 @@ class basic_f2p:
         result_is_derived = False
         result_type_name: str | None = None
 
+        self._emit_intrinsic_use_aliases(body_lines)
+
         # declarations pass
         for code, _comment in body_lines:
             s = code.strip()
@@ -2111,6 +2169,7 @@ class basic_f2p:
 
     def transpile_program_body(self, body_lines: list[tuple[str, str]]) -> None:
         # gather decls and arrays
+        self._emit_intrinsic_use_aliases(body_lines)
         sym: dict[str, dict] = {}
         arrays_1d: set[str] = set()
 
@@ -2205,6 +2264,8 @@ class basic_f2p:
             filtered_decl.append(decl_lines[i])
             i += 1
         decl_lines = filtered_decl
+
+        self._emit_intrinsic_use_aliases(decl_lines)
 
         sym: dict[str, dict] = {}
         arrays_1d: set[str] = set()
@@ -2371,6 +2432,8 @@ class basic_f2p:
         sym: dict[str, dict] = {}
         arrays_1d: set[str] = set()
         arg_hints: dict[str, str] = {}
+
+        self._emit_intrinsic_use_aliases(body_lines)
 
         for code, _comment in body_lines:
             s = code.strip()
