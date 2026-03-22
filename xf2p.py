@@ -288,29 +288,24 @@ def _fortran_implied_do_expr(raw: str, translate_expr, arrays_1d: set[str]) -> s
     lo_py = translate_expr(lo, arrays_1d)
     hi_py = translate_expr(hi, arrays_1d)
     if step is None:
-        range_py = f"range(int({lo_py}), int({hi_py}) + 1)"
+        step_py = "1"
     else:
         step_py = translate_expr(step, arrays_1d)
-        range_py = f"range(int({lo_py}), int({hi_py}) + (1 if int({step_py}) > 0 else -1), int({step_py}))"
 
-    seq_parts: list[str] = []
-    all_scalar = True
-    scalar_exprs: list[str] = []
+    body_parts: list[str] = []
     for p in obj_parts:
         nested_py = _fortran_implied_do_expr(p, translate_expr, arrays_1d)
         if nested_py is not None:
-            all_scalar = False
-            seq_parts.append(nested_py)
+            body_parts.append(nested_py)
         else:
             expr_py = translate_expr(p, arrays_1d)
-            scalar_exprs.append(expr_py)
-            seq_parts.append(f"[{expr_py}]")
+            body_parts.append(f"[{expr_py}]")
 
-    if all_scalar and len(scalar_exprs) == 1:
-        return f"[{scalar_exprs[0]} for {var} in {range_py}]"
-
-    seq_py = " + ".join(seq_parts)
-    return f"[_xf2p_subitem for {var} in {range_py} for _xf2p_subitem in {seq_py}]"
+    if len(body_parts) == 1:
+        body_py = body_parts[0]
+    else:
+        body_py = " + ".join(body_parts)
+    return f"_xf2p_implied_do(lambda {var}: {body_py}, {lo_py}, {hi_py}, {step_py})"
 
 
 def _is_recyclable_io_iterable(raw: str, decl_array_types: dict[str, str]) -> bool:
@@ -2238,6 +2233,37 @@ class basic_f2p:
         self.emit("from fortran_py_runtime import *")
         if self.seen_parameter:
             self.emit("from typing import Final")
+        self.emit("")
+        self.emit("def _xf2p_flatten(x):")
+        self.indent += 1
+        self.emit('"""Flatten nested list/tuple values emitted by transpiled implied-DOs."""')
+        self.emit("if isinstance(x, (list, tuple)):")
+        self.indent += 1
+        self.emit("for item in x:")
+        self.indent += 1
+        self.emit("yield from _xf2p_flatten(item)")
+        self.indent -= 1
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("yield x")
+        self.indent -= 1
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_implied_do(func, lo, hi, step=1):")
+        self.indent += 1
+        self.emit('"""Expand a Fortran I/O implied-DO into a flat Python list."""')
+        self.emit("ilo = int(lo)")
+        self.emit("ihi = int(hi)")
+        self.emit("istep = int(step)")
+        self.emit("stop = ihi + (1 if istep > 0 else -1)")
+        self.emit("out = []")
+        self.emit("for _xf2p_i in range(ilo, stop, istep):")
+        self.indent += 1
+        self.emit("out.extend(_xf2p_flatten(func(_xf2p_i)))")
+        self.indent -= 1
+        self.emit("return out")
+        self.indent -= 1
         self.emit("")
 
         i = 0
