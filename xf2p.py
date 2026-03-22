@@ -1127,6 +1127,23 @@ class basic_f2p:
                 "bessel_j1",
                 "bessel_jn",
                 "bessel_yn",
+                "asinh",
+                "acosh",
+                "atanh",
+                "hypot",
+                "norm2",
+                "acosd",
+                "asind",
+                "atand",
+                "cosd",
+                "sind",
+                "tand",
+                "acospi",
+                "asinpi",
+                "atanpi",
+                "cospi",
+                "sinpi",
+                "tanpi",
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
@@ -1153,6 +1170,40 @@ class basic_f2p:
                     return f"sps.yn({args_py[0]}, {args_py[1]})"
                 if len(args_py) == 3:
                     return f"sps.yn(np.arange(int({args_py[0]}), int({args_py[1]}) + 1), {args_py[2]})"
+            if lname == "asinh" and len(args_py) == 1:
+                return f"np.asinh({args_py[0]})"
+            if lname == "acosh" and len(args_py) == 1:
+                return f"np.acosh({args_py[0]})"
+            if lname == "atanh" and len(args_py) == 1:
+                return f"np.atanh({args_py[0]})"
+            if lname == "hypot" and len(args_py) == 2:
+                return f"np.hypot({args_py[0]}, {args_py[1]})"
+            if lname == "norm2" and len(args_py) == 1:
+                return f"np.linalg.norm({args_py[0]})"
+            if lname == "acosd" and len(args_py) == 1:
+                return f"np.degrees(np.arccos({args_py[0]}))"
+            if lname == "asind" and len(args_py) == 1:
+                return f"np.degrees(np.arcsin({args_py[0]}))"
+            if lname == "atand" and len(args_py) == 1:
+                return f"np.degrees(np.arctan({args_py[0]}))"
+            if lname == "cosd" and len(args_py) == 1:
+                return f"np.cos(np.radians({args_py[0]}))"
+            if lname == "sind" and len(args_py) == 1:
+                return f"np.sin(np.radians({args_py[0]}))"
+            if lname == "tand" and len(args_py) == 1:
+                return f"np.tan(np.radians({args_py[0]}))"
+            if lname == "acospi" and len(args_py) == 1:
+                return f"(np.arccos({args_py[0]}) / np.pi)"
+            if lname == "asinpi" and len(args_py) == 1:
+                return f"(np.arcsin({args_py[0]}) / np.pi)"
+            if lname == "atanpi" and len(args_py) == 1:
+                return f"(np.arctan({args_py[0]}) / np.pi)"
+            if lname == "cospi" and len(args_py) == 1:
+                return f"np.cos(np.pi * ({args_py[0]}))"
+            if lname == "sinpi" and len(args_py) == 1:
+                return f"np.sin(np.pi * ({args_py[0]}))"
+            if lname == "tanpi" and len(args_py) == 1:
+                return f"np.tan(np.pi * ({args_py[0]}))"
             return None
 
         # 1d array element: a(i) -> a[(i)-1] (assume 1-based Fortran indexing)
@@ -2593,7 +2644,7 @@ def main() -> int:
     ap.add_argument("--time-both", action="store_true", help="time both original Fortran and translated Python (implies --run-both)")
     ap.add_argument(
         "--compiler",
-        default="gfortran -O3 -march=native -flto",
+        default="gfortran -O3 -march=native",
         help='compiler command, e.g. "gfortran -O2 -Wall"',
     )
     args = ap.parse_args()
