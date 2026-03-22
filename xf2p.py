@@ -57,6 +57,9 @@ def _parse_file_interface(src: str) -> tuple[list[str], list[str], list[UseSpec]
     mods: list[str] = []
     uses: list[UseSpec] = []
 
+    in_module = False
+    in_module_contains = False
+
     for s in code_lines:
         sl = s.lower()
 
@@ -64,6 +67,17 @@ def _parse_file_interface(src: str) -> tuple[list[str], list[str], list[UseSpec]
         mm = re.match(r"^module\s+([a-z_]\w*)\b", sl, re.I)
         if mm and not re.match(r"^module\s+procedure\b", sl, re.I):
             mods.append(mm.group(1))
+            in_module = True
+            in_module_contains = False
+            continue
+
+        if re.match(r"^end\s+module\b", sl, re.I):
+            in_module = False
+            in_module_contains = False
+            continue
+
+        if in_module and sl == "contains":
+            in_module_contains = True
             continue
 
         # type declarations
@@ -71,6 +85,21 @@ def _parse_file_interface(src: str) -> tuple[list[str], list[str], list[UseSpec]
         if mt:
             defs.append(mt.group(1))
             continue
+
+        # module declarative-part variables/parameters
+        if in_module and not in_module_contains:
+            pd = parse_decl(s)
+            if pd:
+                _ftype, attrs, rest = pd
+                for nm, _shape, _init in parse_decl_items(rest, parse_decl_attr_dimension(attrs)):
+                    defs.append(nm)
+                continue
+            td = re.match(r"^type\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
+            if td:
+                attrs = td.group(2).strip()
+                for nm, _shape, _init in parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(attrs)):
+                    defs.append(nm)
+                continue
 
         # function declarations
         mf = re.match(
@@ -2041,6 +2070,118 @@ class basic_f2p:
                 continue
             self.handle_exec_line(s, arrays_1d)
 
+
+    def transpile_module(self, header: str, body_lines: list[tuple[str, str]]) -> None:
+        # Flatten a Fortran module into top-level Python definitions:
+        # declarative-part parameters/variables/types become module globals,
+        # and contained procedures are emitted as top-level defs.
+        decl_lines = body_lines
+        tail: list[tuple[str, str]] = []
+        contains_idx = None
+        for i, (code, _comment) in enumerate(body_lines):
+            if code.strip().lower() == "contains":
+                contains_idx = i
+                break
+        if contains_idx is not None:
+            decl_lines = body_lines[:contains_idx]
+            tail = body_lines[contains_idx + 1 :]
+
+        # Emit derived types from the module declarative part.
+        filtered_decl: list[tuple[str, str]] = []
+        i = 0
+        ndecl = len(decl_lines)
+        while i < ndecl:
+            line = decl_lines[i][0].strip()
+            if re.match(r"^type\b", line, re.I) and not re.match(r"^type\s*\(", line, re.I):
+                dtype_header = line
+                dtype_body: list[tuple[str, str]] = []
+                i += 1
+                while i < ndecl and not re.match(r"\s*end\s+type\b", decl_lines[i][0], re.I):
+                    dtype_body.append(decl_lines[i])
+                    i += 1
+                if i < ndecl:
+                    i += 1
+                self.transpile_derived_type(dtype_header, dtype_body)
+                continue
+            filtered_decl.append(decl_lines[i])
+            i += 1
+        decl_lines = filtered_decl
+
+        sym: dict[str, dict] = {}
+        arrays_1d: set[str] = set()
+
+        for code, _comment in decl_lines:
+            s = code.strip()
+            if not s:
+                continue
+            parsed = self._parse_decl_line(s)
+            if not parsed:
+                continue
+            ftype, type_name, attrs_l, items = parsed
+            for name, shape, init in items:
+                is_array = shape is not None
+                is_alloc = "allocatable" in attrs_l
+                sym[name] = {
+                    "ftype": ftype,
+                    "type_name": type_name,
+                    "is_array": is_array,
+                    "shape": shape,
+                    "init": init,
+                    "alloc": is_alloc,
+                    "attrs_l": attrs_l,
+                }
+                if is_array:
+                    arrays_1d.add(name)
+
+        parameter_names: set[str] = set()
+        for code, _comment in decl_lines:
+            s = code.strip()
+            if not s:
+                continue
+            pd = parse_decl(s)
+            if not pd:
+                continue
+            ftype, attrs, rest = pd
+            attrs_l = attrs.lower()
+            if "parameter" in attrs_l:
+                parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
+
+        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names)
+        if sym or parameter_names:
+            self.emit("")
+
+        if contains_idx is not None:
+            i = 0
+            n = len(tail)
+            while i < n:
+                line = tail[i][0].strip()
+                if not line:
+                    i += 1
+                    continue
+                if re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure\s+)?\w+(?:\s*\([^)]*\))?\s+)*function\b", line, re.I):
+                    func_header = line
+                    fbody: list[tuple[str, str]] = []
+                    i += 1
+                    while i < n and not re.match(r"\s*end\s+function\b", tail[i][0], re.I):
+                        fbody.append(tail[i])
+                        i += 1
+                    if i < n:
+                        i += 1
+                    self.transpile_function(func_header, fbody)
+                    continue
+                if re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:pure\s+)?subroutine\b", line, re.I):
+                    sub_header = line
+                    sbody: list[tuple[str, str]] = []
+                    i += 1
+                    while i < n and not re.match(r"\s*end\s+subroutine\b", tail[i][0], re.I):
+                        sbody.append(tail[i])
+                        i += 1
+                    if i < n:
+                        i += 1
+                    self.transpile_subroutine(sub_header, sbody)
+                    continue
+                i += 1
+
     def transpile_program(self, body_lines: list[tuple[str, str]]) -> None:
         # Handle internal procedures after "contains".
         main_lines = body_lines
@@ -2289,14 +2430,18 @@ class basic_f2p:
                 i += 1
                 continue
 
-            if re.match(r"module\b", line, re.I):
+            if re.match(r"module\b", line, re.I) and not re.match(r"module\s+procedure\b", line, re.I):
                 in_module = True
+                header = line
+                mbody: list[tuple[str, str]] = []
                 i += 1
-                continue
-
-            if re.match(r"end\s+module\b", line, re.I):
+                while i < n and not re.match(r"\s*end\s+module\b", raw[i][0], re.I):
+                    mbody.append(raw[i])
+                    i += 1
+                if i < n:
+                    i += 1
+                self.transpile_module(header, mbody)
                 in_module = False
-                i += 1
                 continue
 
             if re.match(r"^type\b", line, re.I) and not re.match(r"^type\s*\(", line, re.I):
@@ -2413,8 +2558,8 @@ def main() -> int:
     if args.tee_both:
         args.tee = True
 
-    show_fortran_output = bool(args.tee_both)
-    show_python_output = bool(args.tee or args.tee_both)
+    show_fortran_output = bool(args.run_both or args.tee_both)
+    show_python_output = bool(args.run_both or args.tee or args.tee_both)
 
     if args.mode_program and args.mode_each:
         print("Transpile: FAIL (choose at most one of --mode-program and --mode-each)")
@@ -2486,8 +2631,12 @@ def main() -> int:
                 return ft_run.returncode
             print("Run (original-fortran): PASS")
             if show_fortran_output and ft_run.stdout.strip():
+                if args.run_both and not args.tee_both:
+                    print("--- output (original-fortran) ---")
                 print(ft_run.stdout.rstrip())
             if show_fortran_output and ft_run.stderr.strip():
+                if args.run_both and not args.tee_both and not ft_run.stdout.strip():
+                    print("--- output (original-fortran) ---")
                 print(ft_run.stderr.rstrip())
 
         t0_transpile = time.perf_counter()
@@ -2540,8 +2689,12 @@ def main() -> int:
             if args.run_both:
                 print("Run (translated-python): PASS")
             if show_python_output and rp.stdout.strip():
+                if args.run_both and not args.tee_both:
+                    print("--- output (translated-python) ---")
                 print(rp.stdout.rstrip())
             if show_python_output and rp.stderr.strip():
+                if args.run_both and not args.tee_both and not rp.stdout.strip():
+                    print("--- output (translated-python) ---")
                 print(rp.stderr.rstrip())
 
             if args.run_diff and ft_run is not None:
@@ -2649,8 +2802,12 @@ def main() -> int:
                 return ft_run.returncode
             print("Run (original-fortran): PASS")
             if show_fortran_output and ft_run.stdout.strip():
+                if args.run_both and not args.tee_both:
+                    print("--- output (original-fortran) ---")
                 print(ft_run.stdout.rstrip())
             if show_fortran_output and ft_run.stderr.strip():
+                if args.run_both and not args.tee_both and not ft_run.stdout.strip():
+                    print("--- output (original-fortran) ---")
                 print(ft_run.stderr.rstrip())
 
         t0_transpile = time.perf_counter()
@@ -2752,8 +2909,12 @@ def main() -> int:
             else:
                 print("Run: PASS")
             if show_python_output and rp.stdout.strip():
+                if args.run_both and not args.tee_both:
+                    print("--- output (translated-python) ---")
                 print(rp.stdout.rstrip())
             if show_python_output and rp.stderr.strip():
+                if args.run_both and not args.tee_both and not rp.stdout.strip():
+                    print("--- output (translated-python) ---")
                 print(rp.stderr.rstrip())
 
             if args.run_diff and ft_run is not None:
