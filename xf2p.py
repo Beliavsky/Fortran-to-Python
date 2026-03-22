@@ -239,6 +239,275 @@ def split_args(s: str) -> list[str]:
         args.append(tail)
     return args
 
+def _fortran_unquote(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", "\""):
+        q = s[0]
+        return s[1:-1].replace(q + q, q)
+    return s
+
+
+def _strip_one_outer_paren(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == "(" and s[-1] == ")" and find_matching_paren(s, 0) == len(s) - 1:
+        return s[1:-1].strip()
+    return s
+
+
+def _fortran_format_arg_count(fmt_literal: str) -> int | None:
+    """Return the number of data items consumed by one pass of a limited format."""
+    try:
+        fmt_text = _strip_one_outer_paren(_fortran_unquote(fmt_literal.strip()))
+    except Exception:
+        return None
+
+    def count_token(tok: str) -> int | None:
+        tok = tok.strip()
+        if not tok:
+            return 0
+        low = tok.lower()
+
+        if tok[0] in ("'", '"') and tok[-1] == tok[0]:
+            return 0
+
+        mm = re.fullmatch(r"\*\((.*)\)", tok, re.I)
+        if mm:
+            return None
+
+        mm = re.fullmatch(r"(\d+)\((.*)\)", tok, re.I)
+        if mm:
+            rep = int(mm.group(1))
+            inner_total = 0
+            for sub in split_args(mm.group(2).strip()):
+                nsub = count_token(sub)
+                if nsub is None:
+                    return None
+                inner_total += nsub
+            return rep * inner_total
+
+        mm = re.fullmatch(r"(\d*)/", low)
+        if mm:
+            return 0
+
+        if low == ":":
+            return 0
+
+        mm = re.fullmatch(r"(\d*)x", low)
+        if mm:
+            return 0
+
+        mm = re.fullmatch(r"(\d*)a(\d+)?", low)
+        if mm:
+            return int(mm.group(1) or "1")
+
+        mm = re.fullmatch(r"(\d*)l(\d+)", low)
+        if mm:
+            return int(mm.group(1) or "1")
+
+        mm = re.fullmatch(r"(\d*)i(\d+)(?:\.\d+)?", low)
+        if mm:
+            return int(mm.group(1) or "1")
+
+        mm = re.fullmatch(r"(\d*)(es|en|e|d|g|f)(\d+)(?:\.(\d+))?(?:e(\d+))?", low)
+        if mm:
+            return int(mm.group(1) or "1")
+
+        if tok.startswith("(") and tok.endswith(")") and find_matching_paren(tok, 0) == len(tok) - 1:
+            total = 0
+            for sub in split_args(tok[1:-1]):
+                nsub = count_token(sub)
+                if nsub is None:
+                    return None
+                total += nsub
+            return total
+
+        return None
+
+    total = 0
+    for item in split_args(fmt_text):
+        nitem = count_token(item)
+        if nitem is None:
+            return None
+        total += nitem
+    return total
+
+
+
+def _fortran_format_recycled_expr(fmt_literal: str, iterable_expr: str) -> str | None:
+    """Return a Python expression for one-argument finite-format recycling over an iterable."""
+    if _fortran_format_arg_count(fmt_literal) != 1:
+        return None
+    item_expr = _fortran_format_expr(fmt_literal, ["_xf2p_item"])
+    if item_expr is None:
+        return None
+    # For finite format reversion during output, each new cycle starts a new record.
+    return f"'\\n'.join({item_expr} for _xf2p_item in {iterable_expr})"
+
+
+def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
+    """Return a Python expression for a limited Fortran character format string."""
+    try:
+        fmt_text = _strip_one_outer_paren(_fortran_unquote(fmt_literal.strip()))
+    except Exception:
+        return None
+
+    parts: list[str] = []
+    arg_i = 0
+    STOP = "__xf2p_stop__"
+
+    def take_arg() -> str:
+        nonlocal arg_i
+        if arg_i >= len(arg_exprs):
+            return repr("")
+        out = arg_exprs[arg_i]
+        arg_i += 1
+        return out
+
+    def add_token(tok: str) -> str:
+        nonlocal arg_i
+        tok = tok.strip()
+        if not tok:
+            return "ok"
+        low = tok.lower()
+
+        mm = re.fullmatch(r"\*\((.*)\)", tok, re.I)
+        if mm:
+            inner = mm.group(1).strip()
+            if arg_i >= len(arg_exprs):
+                return "ok"
+            iterable = arg_exprs[arg_i]
+            arg_i += 1
+            inner_items = split_args(inner)
+            if ":" in [it.strip().lower() for it in inner_items]:
+                colon_i = next(i for i, it in enumerate(inner_items) if it.strip().lower() == ":")
+                left = ",".join(inner_items[:colon_i]).strip()
+                right = ",".join(inner_items[colon_i + 1:]).strip()
+                if left and right:
+                    left_n = _fortran_format_arg_count(repr("(" + left + ")"))
+                    right_n = _fortran_format_arg_count(repr("(" + right + ")"))
+                    if left_n == 1 and right_n == 0:
+                        item_expr = _fortran_format_expr(repr("(" + left + ")"), ["_xf2p_item"])
+                        sep_expr = _fortran_format_expr(repr("(" + right + ")"), [])
+                        if item_expr is not None and sep_expr is not None:
+                            parts.append(f"({sep_expr}).join({item_expr} for _xf2p_item in {iterable})")
+                            return "ok"
+            inner_expr = _fortran_format_expr(repr("(" + inner + ")"), ["_xf2p_item"])
+            if inner_expr is None:
+                return "fail"
+            parts.append(f"''.join({inner_expr} for _xf2p_item in {iterable})")
+            return "ok"
+
+        if tok[0] in ("'", '"') and tok[-1] == tok[0]:
+            parts.append(repr(_fortran_unquote(tok)))
+            return "ok"
+
+        mm = re.fullmatch(r"(\d+)\((.*)\)", tok, re.I)
+        if mm:
+            rep = int(mm.group(1))
+            inner = mm.group(2).strip()
+            inner_items = split_args(inner)
+            for _ in range(rep):
+                for sub in inner_items:
+                    status = add_token(sub)
+                    if status == "fail":
+                        return "fail"
+                    if status == STOP:
+                        return STOP
+            return "ok"
+
+        mm = re.fullmatch(r"(\d*)/", low)
+        if mm:
+            rep = int(mm.group(1) or "1")
+            parts.append(repr("\n" * rep))
+            return "ok"
+
+        if low == ":":
+            if arg_i >= len(arg_exprs):
+                return STOP
+            return "ok"
+
+        mm = re.fullmatch(r"(\d*)x", low)
+        if mm:
+            rep = int(mm.group(1) or "1")
+            if rep == 1:
+                parts.append(repr(" "))
+            else:
+                parts.append(f"{rep}*' '")
+            return "ok"
+
+        mm = re.fullmatch(r"(\d*)a(\d+)?", low)
+        if mm:
+            rep = int(mm.group(1) or "1")
+            width = mm.group(2)
+            for _ in range(rep):
+                a = take_arg()
+                if width is None:
+                    parts.append(f"str({a})")
+                else:
+                    parts.append(f"str({a}).rjust({int(width)})")
+            return "ok"
+
+        mm = re.fullmatch(r"(\d*)l(\d+)", low)
+        if mm:
+            rep = int(mm.group(1) or "1")
+            width = int(mm.group(2))
+            for _ in range(rep):
+                a = take_arg()
+                parts.append(f"str(bool({a})).upper().replace('TRUE', 'T').replace('FALSE', 'F').rjust({width})")
+            return "ok"
+
+        mm = re.fullmatch(r"(\d*)i(\d+)(?:\.\d+)?", low)
+        if mm:
+            rep = int(mm.group(1) or "1")
+            width = int(mm.group(2))
+            for _ in range(rep):
+                a = take_arg()
+                if width == 0:
+                    parts.append(f"str(int({a}))")
+                else:
+                    parts.append(f"format(int({a}), '{width}d')")
+            return "ok"
+
+        mm = re.fullmatch(r"(\d*)(es|en|e|d|g|f)(\d+)(?:\.(\d+))?(?:e(\d+))?", low)
+        if mm:
+            rep = int(mm.group(1) or "1")
+            code = mm.group(2)
+            width = int(mm.group(3))
+            prec = mm.group(4)
+            py_code = {"d": "E", "e": "E", "es": "E", "en": "E", "f": "f", "g": "G"}[code]
+            spec = f"{width}.{int(prec)}{py_code}" if prec is not None else f"{width}{py_code}"
+            for _ in range(rep):
+                a = take_arg()
+                parts.append(f"format(float({a}), '{spec}')")
+            return "ok"
+
+        if tok.startswith("(") and tok.endswith(")") and find_matching_paren(tok, 0) == len(tok) - 1:
+            for sub in split_args(tok[1:-1]):
+                status = add_token(sub)
+                if status == "fail":
+                    return "fail"
+                if status == STOP:
+                    return STOP
+            return "ok"
+
+        return "fail"
+
+    items = split_args(fmt_text)
+    if not items:
+        return repr("")
+    for item in items:
+        status = add_token(item)
+        if status == "fail":
+            return None
+        if status == STOP:
+            break
+    if arg_i < len(arg_exprs):
+        for a in arg_exprs[arg_i:]:
+            parts.append(f"str({a})")
+    if not parts:
+        return repr("")
+    return " + ".join(parts)
+
+
 
 def unique_preserve(items: list[str]) -> list[str]:
     seen: set[str] = set()
@@ -1052,6 +1321,43 @@ class basic_f2p:
                 self.emit(f"{name} = np.empty({sz})")
             return True
 
+        # open(newunit=fp, file="temp.txt", status="replace", action="write", ...)
+        mm = re.match(r"open\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            spec = mm.group(1).strip()
+            parts = split_args(spec)
+            kws = {}
+            for p in parts:
+                mk = re.match(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", p, re.I)
+                if mk:
+                    kws[mk.group(1).lower()] = mk.group(2).strip()
+            newunit = kws.get("newunit", None)
+            file_expr = kws.get("file", None)
+            status = kws.get("status", None)
+            action = kws.get("action", None)
+            position = kws.get("position", None)
+            if newunit is None or file_expr is None:
+                # fallback for unsupported OPEN forms
+                self.emit(f"# unsupported open form: {s}")
+                return True
+            mode = "r"
+            st = status.strip().strip("'\"").lower() if status else ""
+            act = action.strip().strip("'\"").lower() if action else ""
+            pos = position.strip().strip("'\"").lower() if position else ""
+            if act == "write" or st == "replace":
+                mode = "w"
+            if pos == "append":
+                mode = "a"
+            self.emit(f"{newunit} = open({self.translate_expr(file_expr, arrays_1d)}, {mode!r})")
+            return True
+
+        # close(fp)
+        mm = re.match(r"close\s*\(\s*(.+?)\s*\)\s*$", s, re.I)
+        if mm:
+            unit = self.translate_expr(mm.group(1), arrays_1d)
+            self.emit(f"{unit}.close()")
+            return True
+
         # call random_number(x)
         mm = re.match(r"call\s+random_number\s*\(\s*([a-z_]\w*)\s*\)\s*$", s, re.I)
         if mm:
@@ -1060,6 +1366,79 @@ class basic_f2p:
                 self.emit(f"{name} = _f_assign_array({name}, np.random.random(size={name}.shape))")
             else:
                 self.emit(f"{name} = np.float64(np.random.random())")
+            return True
+
+        # open(newunit=fp, file="temp.txt", status="replace", action="write", ...)
+        mm = re.match(r"open\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            spec = mm.group(1).strip()
+            parts = split_args(spec)
+            kws = {}
+            for p in parts:
+                mk = re.match(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", p, re.I)
+                if mk:
+                    kws[mk.group(1).lower()] = mk.group(2).strip()
+            newunit = kws.get("newunit", None)
+            file_expr = kws.get("file", None)
+            status = kws.get("status", None)
+            action = kws.get("action", None)
+            position = kws.get("position", None)
+            if newunit is None or file_expr is None:
+                self.emit(f"# unsupported open form: {s}")
+                return True
+            mode = "r"
+            st = status.strip().strip("'\"").lower() if status else ""
+            act = action.strip().strip("'\"").lower() if action else ""
+            pos = position.strip().strip("'\"").lower() if position else ""
+            if act == "write" or st == "replace":
+                mode = "w"
+            if pos == "append":
+                mode = "a"
+            self.emit(f"{newunit} = open({self.translate_expr(file_expr, arrays_1d)}, {mode!r})")
+            return True
+
+        # close(fp)
+        mm = re.match(r"close\s*\(\s*(.+?)\s*\)\s*$", s, re.I)
+        if mm:
+            unit = self.translate_expr(mm.group(1), arrays_1d)
+            self.emit(f"{unit}.close()")
+            return True
+
+        # read(fp,*) a, b, arr(i,:), ...
+        mm = re.match(r"read\s*\(\s*([a-z_]\w*)\s*,\s*\*\s*\)\s*(.+)$", s, re.I)
+        if mm:
+            unit = mm.group(1)
+            rest = mm.group(2).strip()
+            items = [a.strip() for a in split_args(rest) if a.strip()]
+            if len(items) == 1:
+                tgt = items[0]
+                # row-slice target: mat(i,:)
+                mrow = re.match(r"^([a-z_]\w*)\s*\(\s*([^,]+)\s*,\s*:\s*\)\s*$", tgt, re.I)
+                if mrow:
+                    arr = mrow.group(1)
+                    ridx = self.translate_expr(mrow.group(2), arrays_1d)
+                    ftype = self._decl_array_types.get(arr.lower(), "")
+                    cast = "int" if ftype == "integer" else "float"
+                    self.emit(f"__read_vals = [{cast}(v) for v in {unit}.readline().split()]")
+                    self.emit(f"{arr}[({ridx}) - 1, :] = np.asarray(__read_vals[:{arr}.shape[1]], dtype={arr}.dtype)")
+                    return True
+                # scalar target
+                lhs = self.translate_expr(tgt, arrays_1d)
+                base = re.match(r"^([a-z_]\w*)", tgt, re.I)
+                bnm = base.group(1).lower() if base else ""
+                ftype = self._decl_types.get(bnm, "")
+                cast = "int" if ftype == "integer" else ("bool" if ftype == "logical" else "float")
+                self.emit(f"{lhs} = {cast}({unit}.readline().split()[0])")
+                return True
+            # multiple scalar targets
+            self.emit(f"__read_parts = {unit}.readline().split()")
+            for i, tgt in enumerate(items):
+                lhs = self.translate_expr(tgt, arrays_1d)
+                base = re.match(r"^([a-z_]\w*)", tgt, re.I)
+                bnm = base.group(1).lower() if base else ""
+                ftype = self._decl_types.get(bnm, "")
+                cast = "int" if ftype == "integer" else ("bool" if ftype == "logical" else "float")
+                self.emit(f"{lhs} = {cast}(__read_parts[{i}])")
             return True
 
         # call foo(...)
@@ -1130,44 +1509,139 @@ class basic_f2p:
         # print *, ...
         mm = re.match(r"print\s*\*\s*,\s*(.+)$", s, re.I)
         if mm:
+            raw_args = [a.strip() for a in split_args(mm.group(1))]
+            if len(raw_args) == 1:
+                a0 = raw_args[0]
+                if re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types:
+                    self.emit(f"print(*np.ravel({a0}, order='F'))")
+                    return True
             args2 = []
-            for a in split_args(mm.group(1)):
-                a = a.strip()
+            for a in raw_args:
                 if a.startswith(("'", '"')):
                     args2.append(a)
                 else:
                     args2.append(self.translate_expr(a, arrays_1d))
             self.emit(f"print({', '.join(args2)})")
+            return True
+
+        # print "fmt", ...
+        mm = re.match(r"print\s*((\"|').*?\2)\s*,\s*(.+)$", s, re.I)
+        if mm:
+            fmt = mm.group(1)
+            raw_args = [a.strip() for a in split_args(mm.group(3))]
+            args2 = []
+            for a in raw_args:
+                if a.startswith(("'", "\"")):
+                    args2.append(a)
+                else:
+                    args2.append(self.translate_expr(a, arrays_1d))
+            if len(raw_args) == 1:
+                a0 = raw_args[0].strip()
+                if a0.startswith('[') or a0.startswith('(/') or (re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types):
+                    fmt_expr = _fortran_format_recycled_expr(fmt, args2[0])
+                    if fmt_expr is not None:
+                        self.emit(f"print({fmt_expr})")
+                        return True
+            fmt_expr = _fortran_format_expr(fmt, args2)
+            if fmt_expr is not None:
+                self.emit(f"print({fmt_expr})")
+            else:
+                self.emit(f"print({', '.join(args2)})")
             return True
 
         # write(*,*) ...
         mm = re.match(r"write\s*\(\s*\*\s*,\s*\*\s*\)\s*(.+)$", s, re.I)
         if mm:
+            raw_args = [a.strip() for a in split_args(mm.group(1))]
+            if len(raw_args) == 1:
+                a0 = raw_args[0]
+                if re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types:
+                    self.emit(f"print(*np.ravel({a0}, order='F'))")
+                    return True
             args2 = []
-            for a in split_args(mm.group(1)):
-                a = a.strip()
-                if a.startswith(("'", '"')):
+            for a in raw_args:
+                if a.startswith(("'", "\"")):
                     args2.append(a)
                 else:
                     args2.append(self.translate_expr(a, arrays_1d))
             self.emit(f"print({', '.join(args2)})")
             return True
 
-        # write(*,"fmt") ...  -> fallback to print(...)
-        mm = re.match(r"write\s*\(\s*\*\s*,\s*([\"'].*[\"'])\s*\)\s*(.*)$", s, re.I)
+        # write(unit,*) ...
+        mm = re.match(r"write\s*\(\s*([a-z_]\w*)\s*,\s*\*\s*\)\s*(.*)$", s, re.I)
         if mm:
+            unit = mm.group(1)
             rest = mm.group(2).strip()
             if not rest:
-                self.emit("print()")
+                self.emit(f"print(file={unit})")
                 return True
             args2 = []
             for a in split_args(rest):
                 a = a.strip()
-                if a.startswith(("'", '"')):
+                if a.startswith(("'", "\"")):
                     args2.append(a)
                 else:
                     args2.append(self.translate_expr(a, arrays_1d))
-            self.emit(f"print({', '.join(args2)})")
+            self.emit(f"print({', '.join(args2)}, file={unit})")
+            return True
+
+        # write(*,"fmt") ...
+        mm = re.match(r"write\s*\(\s*\*\s*,\s*(([\"']).*?\2)\s*\)\s*(.*)$", s, re.I)
+        if mm:
+            fmt = mm.group(1)
+            rest = mm.group(3).strip()
+            if not rest:
+                self.emit("print()")
+                return True
+            raw_args = [a.strip() for a in split_args(rest)]
+            args2 = []
+            for a in raw_args:
+                if a.startswith(("'", "\"")):
+                    args2.append(a)
+                else:
+                    args2.append(self.translate_expr(a, arrays_1d))
+            if len(raw_args) == 1:
+                a0 = raw_args[0].strip()
+                if a0.startswith('[') or a0.startswith('(/') or (re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types):
+                    fmt_expr = _fortran_format_recycled_expr(fmt, args2[0])
+                    if fmt_expr is not None:
+                        self.emit(f"print({fmt_expr})")
+                        return True
+            fmt_expr = _fortran_format_expr(fmt, args2)
+            if fmt_expr is not None:
+                self.emit(f"print({fmt_expr})")
+            else:
+                self.emit(f"print({', '.join(args2)})")
+            return True
+
+        # write(unit,"fmt") ...
+        mm = re.match(r"write\s*\(\s*([^,]+?)\s*,\s*(([\"']).*?\3)\s*\)\s*(.*)$", s, re.I)
+        if mm:
+            unit = mm.group(1).strip()
+            fmt = mm.group(2)
+            rest = mm.group(4).strip()
+            if not rest:
+                self.emit(f"print(file={unit})")
+                return True
+            raw_args = [a.strip() for a in split_args(rest)]
+            args2 = []
+            for a in raw_args:
+                if a.startswith(("'", "\"")):
+                    args2.append(a)
+                else:
+                    args2.append(self.translate_expr(a, arrays_1d))
+            if len(raw_args) == 1:
+                a0 = raw_args[0].strip()
+                if a0.startswith('[') or a0.startswith('(/') or (re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types):
+                    fmt_expr = _fortran_format_recycled_expr(fmt, args2[0])
+                    if fmt_expr is not None:
+                        self.emit(f"print({fmt_expr}, file={unit})")
+                        return True
+            fmt_expr = _fortran_format_expr(fmt, args2)
+            if fmt_expr is not None:
+                self.emit(f"print({fmt_expr}, file={unit})")
+            else:
+                self.emit(f"print({', '.join(args2)}, file={unit})")
             return True
 
         # generic write(...) ... fallback
@@ -1175,6 +1649,10 @@ class basic_f2p:
         if mm:
             ctl = mm.group(1).strip().lower()
             rest = mm.group(2).strip()
+            ctl_parts = split_args(ctl)
+            unit_expr = "*"
+            if ctl_parts:
+                unit_expr = ctl_parts[0].strip()
             args2 = []
             if rest:
                 for a in split_args(rest):
@@ -1184,10 +1662,16 @@ class basic_f2p:
                     else:
                         args2.append(self.translate_expr(a, arrays_1d))
             end_txt = ', end=""' if "advance" in ctl and "'no'" in ctl else ""
+            file_txt = ""
+            if unit_expr != "*":
+                file_txt = f", file={unit_expr}"
             if args2:
-                self.emit(f"print({', '.join(args2)}{end_txt})")
+                self.emit(f"print({', '.join(args2)}{end_txt}{file_txt})")
             else:
-                self.emit("print()")
+                if file_txt:
+                    self.emit(f"print({file_txt[2:]})")
+                else:
+                    self.emit("print()")
             return True
 
         # single-line if: if (cond) stmt
@@ -1516,7 +2000,10 @@ class basic_f2p:
 
         self.emit("def main() -> None:")
         self.indent += 1
+        code0 = self._code_emit_count
         self.transpile_program_body(main_lines)
+        if self._code_emit_count == code0:
+            self.emit("pass")
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
@@ -1641,62 +2128,9 @@ class basic_f2p:
         self.emit("import numpy.typing as npt")
         self.emit("from dataclasses import dataclass")
         self.emit("from types import SimpleNamespace")
+        self.emit("from fortran_py_runtime import *")
         if self.seen_parameter:
             self.emit("from typing import Final")
-        self.emit("")
-        self.emit("def _f_size(a, dim=None):")
-        self.emit("    arr = np.asarray(a)")
-        self.emit("    if dim is None:")
-        self.emit("        return arr.size")
-        self.emit("    return arr.shape[int(dim) - 1]")
-        self.emit("")
-        self.emit("def _f_spread(a, dim=None, ncopies=None):")
-        self.emit("    arr = np.asarray(a)")
-        self.emit("    d = 1 if dim is None else int(dim)")
-        self.emit("    ncopy = 1 if ncopies is None else int(ncopies)")
-        self.emit("    axis = d - 1")
-        self.emit("    ex = np.expand_dims(arr, axis=axis)")
-        self.emit("    return np.repeat(ex, ncopy, axis=axis)")
-        self.emit("")
-        self.emit("def _f_assign_array(lhs, rhs):")
-        self.emit("    arr = np.array(rhs, copy=True)")
-        self.emit("    if lhs is None:")
-        self.emit("        return arr")
-        self.emit("    lhs_arr = np.asarray(lhs)")
-        self.emit("    if arr.ndim == 0 and lhs_arr.ndim > 0:")
-        self.emit("        lhs_arr[...] = arr.item()")
-        self.emit("        return lhs")
-        self.emit("    if lhs_arr.shape != arr.shape or lhs_arr.dtype != arr.dtype:")
-        self.emit("        return arr")
-        self.emit("    lhs_arr[...] = arr")
-        self.emit("    return lhs")
-        self.emit("")
-        self.emit("def mean_1d(x):")
-        self.emit("    a = np.asarray(x, dtype=np.float64)")
-        self.emit("    return np.float64(np.mean(a)) if a.size else np.float64(0.0)")
-        self.emit("")
-        self.emit("def var_1d(x):")
-        self.emit("    a = np.asarray(x, dtype=np.float64)")
-        self.emit("    return np.float64(np.var(a, ddof=1)) if a.size > 1 else np.float64(0.0)")
-        self.emit("")
-        self.emit("def argsort_real(x):")
-        self.emit("    return np.argsort(np.asarray(x, dtype=np.float64))")
-        self.emit("")
-        self.emit("def random_normal_vec(x):")
-        self.emit("    return _f_assign_array(x, np.random.normal(size=np.asarray(x).shape))")
-        self.emit("")
-        self.emit("def random_choice2(weights, n, z=None):")
-        self.emit("    p = np.asarray(weights, dtype=np.float64)")
-        self.emit("    p = p / np.sum(p)")
-        self.emit("    out = np.random.choice(np.arange(p.size), size=int(n), p=p)")
-        self.emit("    return _f_assign_array(z, out)")
-        self.emit("")
-        self.emit("def random_choice_prob(weights, n, z=None):")
-        self.emit("    return random_choice2(weights, n, z)")
-        self.emit("")
-        self.emit("def random_choice_norep(n, k, out=None):")
-        self.emit("    vals = np.random.choice(np.arange(int(n)), size=int(k), replace=False)")
-        self.emit("    return _f_assign_array(out, vals)")
         self.emit("")
 
         i = 0
@@ -1778,7 +2212,7 @@ class basic_f2p:
 
         # unnamed main program (no "program" statement)
         if not found_program:
-            if any(l.strip() for l in loose_main):
+            if any(code.strip() or comment.strip() for code, comment in loose_main):
                 self.transpile_program(loose_main)
 
         lines = "\n".join(self.out).rstrip().splitlines()
@@ -1812,6 +2246,8 @@ def main() -> int:
     ap.add_argument("--compile", action="store_true", help="compile original Fortran source")
     ap.add_argument("--run-both", action="store_true", help="run original Fortran and translated Python (no timing)")
     ap.add_argument("--run-diff", action="store_true", help="run Fortran and Python and compare outputs")
+    ap.add_argument("--tee", action="store_true", help="print transformed output (run output, or transpiled source when not running)")
+    ap.add_argument("--tee-both", action="store_true", help="print both original and transformed outputs (run output, or source when not running)")
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run stages (implies --run)")
     ap.add_argument("--time-both", action="store_true", help="time both original Fortran and translated Python (implies --run-both)")
     ap.add_argument(
@@ -1832,6 +2268,11 @@ def main() -> int:
         args.time = True
     if args.time:
         args.run = True
+    if args.tee_both:
+        args.tee = True
+
+    show_fortran_output = bool(args.tee_both)
+    show_python_output = bool(args.tee or args.tee_both)
 
     if args.mode_program and args.mode_each:
         print("Transpile: FAIL (choose at most one of --mode-program and --mode-each)")
@@ -1856,6 +2297,13 @@ def main() -> int:
         while lines and lines[-1] == "":
             lines.pop()
         return lines
+
+    def _ensure_runtime_file(dst_dir: Path) -> None:
+        rt = Path(__file__).with_name("fortran_py_runtime.py")
+        if rt.exists():
+            dst = dst_dir / "fortran_py_runtime.py"
+            if not dst.exists():
+                dst.write_text(rt.read_text(encoding="utf-8"), encoding="utf-8")
 
     def process_one(src_paths: list[Path], out_path: Path) -> int:
         timings = {}
@@ -1895,9 +2343,9 @@ def main() -> int:
                     print(ft_run.stderr.rstrip())
                 return ft_run.returncode
             print("Run (original-fortran): PASS")
-            if ft_run.stdout.strip():
+            if show_fortran_output and ft_run.stdout.strip():
                 print(ft_run.stdout.rstrip())
-            if ft_run.stderr.strip():
+            if show_fortran_output and ft_run.stderr.strip():
                 print(ft_run.stderr.rstrip())
 
         t0_transpile = time.perf_counter()
@@ -1912,6 +2360,24 @@ def main() -> int:
         src_tag = ", ".join(p.name for p in src_paths)
         py = f"# transpiled by xf2p.py from {src_tag} on {stamp}\n" + py
         out_path.write_text(py, encoding="utf-8")
+        _ensure_runtime_file(out_path.parent)
+        if args.tee_both:
+            try:
+                src_text = src_paths[0].read_text(encoding="utf-8") if len(src_paths) == 1 else "\n\n".join(
+                    p.read_text(encoding="utf-8") for p in src_paths
+                )
+                src_tag = src_paths[0].name if len(src_paths) == 1 else ", ".join(p.name for p in src_paths)
+                print(f"--- original: {src_tag} ---")
+                print(src_text.rstrip())
+            except OSError:
+                pass
+        if args.tee:
+            try:
+                out_text = out_path.read_text(encoding="utf-8")
+                print(f"--- transpiled: {out_path} ---")
+                print(out_text.rstrip())
+            except OSError:
+                pass
         timings["transpile"] = time.perf_counter() - t0_transpile
 
         if args.run:
@@ -1931,9 +2397,9 @@ def main() -> int:
                 return rp.returncode
             if args.run_both:
                 print("Run (translated-python): PASS")
-            if rp.stdout.strip():
+            if show_python_output and rp.stdout.strip():
                 print(rp.stdout.rstrip())
-            if rp.stderr.strip():
+            if show_python_output and rp.stderr.strip():
                 print(rp.stderr.rstrip())
 
             if args.run_diff and ft_run is not None:
@@ -2040,9 +2506,9 @@ def main() -> int:
                     print(ft_run.stderr.rstrip())
                 return ft_run.returncode
             print("Run (original-fortran): PASS")
-            if ft_run.stdout.strip():
+            if show_fortran_output and ft_run.stdout.strip():
                 print(ft_run.stdout.rstrip())
-            if ft_run.stderr.strip():
+            if show_fortran_output and ft_run.stderr.strip():
                 print(ft_run.stderr.rstrip())
 
         t0_transpile = time.perf_counter()
@@ -2077,6 +2543,14 @@ def main() -> int:
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             py = f"# transpiled by xf2p.py from {p.name} on {stamp}\n" + py
             out_path.write_text(py, encoding="utf-8")
+            _ensure_runtime_file(out_path.parent)
+            if not args.run:
+                if args.tee_both:
+                    print(f"--- original: {p} ---")
+                    print(src.rstrip())
+                if args.tee:
+                    print(f"--- transpiled: {out_path} ---")
+                    print(py.rstrip())
             generated[p] = out_path
 
         # Add inter-file imports according to USE dependencies.
@@ -2135,9 +2609,9 @@ def main() -> int:
                 print("Run (translated-python): PASS")
             else:
                 print("Run: PASS")
-            if rp.stdout.strip():
+            if show_python_output and rp.stdout.strip():
                 print(rp.stdout.rstrip())
-            if rp.stderr.strip():
+            if show_python_output and rp.stderr.strip():
                 print(rp.stderr.rstrip())
 
             if args.run_diff and ft_run is not None:
