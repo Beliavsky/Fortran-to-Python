@@ -665,7 +665,14 @@ def parse_decl(line: str):
     return ftype, attrs, rest
 
 
-def parse_decl_items(rest: str):
+def parse_decl_attr_dimension(attrs: str) -> str | None:
+    m = re.search(r"\bdimension\s*\(\s*(.*?)\s*\)", attrs, re.I)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def parse_decl_items(rest: str, default_shape: str | None = None):
     items = []
     for part in split_args(rest):
         part = part.strip()
@@ -686,6 +693,7 @@ def parse_decl_items(rest: str):
             shape = mm.group(2).strip()
         else:
             name = left
+            shape = default_shape
 
         items.append((name, shape, init))
     return items
@@ -717,10 +725,11 @@ class basic_f2p:
         pd = parse_decl(s)
         if pd:
             ftype, attrs, rest = pd
-            return ftype, None, attrs.lower(), parse_decl_items(rest)
+            return ftype, None, attrs.lower(), parse_decl_items(rest, parse_decl_attr_dimension(attrs))
         td = re.match(r"^type\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
         if td:
-            return "type", td.group(1), td.group(2).strip().lower(), parse_decl_items(td.group(3).strip())
+            attrs = td.group(2).strip()
+            return "type", td.group(1), attrs.lower(), parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(attrs))
         return None
 
     def _validate_unit_symbols(self, unit_kind: str, unit_name: str, args: list[str], body_lines: list[tuple[str, str]]) -> None:
@@ -787,7 +796,7 @@ class basic_f2p:
             if pd:
                 ftype, attrs, rest = pd
                 attrs_l = attrs.lower()
-                items = parse_decl_items(rest)
+                items = parse_decl_items(rest, parse_decl_attr_dimension(attrs))
                 type_name = None
             else:
                 td = re.match(r"^type\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
@@ -795,7 +804,7 @@ class basic_f2p:
                     continue
                 ftype = "type"
                 attrs_l = td.group(2).strip().lower()
-                items = parse_decl_items(td.group(3).strip())
+                items = parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(td.group(2).strip()))
                 type_name = td.group(1)
             for name, shape, init in items:
                 had_field = True
@@ -1840,7 +1849,7 @@ class basic_f2p:
             if pd:
                 ftype, attrs, rest = pd
                 attrs_l = attrs.lower()
-                items = parse_decl_items(rest)
+                items = parse_decl_items(rest, parse_decl_attr_dimension(attrs))
                 type_name = None
             else:
                 td = re.match(r"^type\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
@@ -1848,7 +1857,7 @@ class basic_f2p:
                     continue
                 ftype = "type"
                 attrs_l = td.group(2).strip().lower()
-                items = parse_decl_items(td.group(3).strip())
+                items = parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(td.group(2).strip()))
                 type_name = td.group(1)
 
             for name, shape, init in items:
@@ -1988,7 +1997,7 @@ class basic_f2p:
             attrs_l = attrs.lower()
             if "parameter" in attrs_l:
                 continue
-            items = parse_decl_items(rest)
+            items = parse_decl_items(rest, parse_decl_attr_dimension(attrs))
             for name, shape, init in items:
                 is_array = shape is not None
                 is_alloc = "allocatable" in attrs_l
@@ -2129,7 +2138,7 @@ class basic_f2p:
             if pd:
                 ftype, attrs, rest = pd
                 attrs_l = attrs.lower()
-                items = parse_decl_items(rest)
+                items = parse_decl_items(rest, parse_decl_attr_dimension(attrs))
                 type_name = None
             else:
                 td = re.match(r"^type\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
@@ -2137,7 +2146,7 @@ class basic_f2p:
                     continue
                 ftype = "type"
                 attrs_l = td.group(2).strip().lower()
-                items = parse_decl_items(td.group(3).strip())
+                items = parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(td.group(2).strip()))
                 type_name = td.group(1)
             for name, shape, init in items:
                 is_array = shape is not None
