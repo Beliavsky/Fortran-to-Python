@@ -437,6 +437,21 @@ def _fortran_format_recycled_expr(fmt_literal: str, iterable_expr: str) -> str |
     return f"'\\n'.join({item_expr} for _xf2p_item in {iterable_expr})"
 
 
+def _single_iterable_formatted_arg_plan(fmt_literal: str, raw_args: list[str], decl_array_types: dict[str, str]) -> tuple[int, int] | None:
+    """Plan finite-format expansion when exactly one I/O argument is an iterable."""
+    total = _fortran_format_arg_count(fmt_literal)
+    if total is None:
+        return None
+    iterable_pos = [i for i, raw in enumerate(raw_args) if _is_recyclable_io_iterable(raw, decl_array_types)]
+    if len(iterable_pos) != 1:
+        return None
+    pos = iterable_pos[0]
+    needed = total - (len(raw_args) - 1)
+    if needed <= 0:
+        return None
+    return pos, needed
+
+
 def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
     """Return a Python expression for a limited Fortran character format string."""
     try:
@@ -448,10 +463,10 @@ def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
     arg_i = 0
     STOP = "__xf2p_stop__"
 
-    def take_arg() -> str:
+    def take_arg() -> str | None:
         nonlocal arg_i
         if arg_i >= len(arg_exprs):
-            return repr("")
+            return None
         out = arg_exprs[arg_i]
         arg_i += 1
         return out
@@ -534,6 +549,8 @@ def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
             width = mm.group(2)
             for _ in range(rep):
                 a = take_arg()
+                if a is None:
+                    return STOP
                 if width is None:
                     parts.append(f"str({a})")
                 else:
@@ -546,6 +563,8 @@ def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
             width = int(mm.group(2))
             for _ in range(rep):
                 a = take_arg()
+                if a is None:
+                    return STOP
                 parts.append(f"str(bool({a})).upper().replace('TRUE', 'T').replace('FALSE', 'F').rjust({width})")
             return "ok"
 
@@ -555,6 +574,8 @@ def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
             width = int(mm.group(2))
             for _ in range(rep):
                 a = take_arg()
+                if a is None:
+                    return STOP
                 if width == 0:
                     parts.append(f"str(int({a}))")
                 else:
@@ -571,6 +592,8 @@ def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
             spec = f"{width}.{int(prec)}{py_code}" if prec is not None else f"{width}{py_code}"
             for _ in range(rep):
                 a = take_arg()
+                if a is None:
+                    return STOP
                 parts.append(f"format(float({a}), '{spec}')")
             return "ok"
 
@@ -1812,6 +1835,21 @@ class basic_f2p:
                     if fmt_expr is not None:
                         self.emit(f"print({fmt_expr})")
                         return True
+            if len(raw_args) > 1:
+                plan = _single_iterable_formatted_arg_plan(fmt, raw_args, self._decl_array_types)
+                if plan is not None:
+                    iter_pos, iter_need = plan
+                    iter_raw = raw_args[iter_pos].strip()
+                    iter_tmp = f"_xf2p_fmt_items_{self._code_emit_count + 1}"
+                    if re.fullmatch(r"[a-z_]\w*", iter_raw, flags=re.I) and iter_raw.lower() in self._decl_array_types:
+                        self.emit(f"{iter_tmp} = list(np.ravel({args2[iter_pos]}, order='F'))")
+                    else:
+                        self.emit(f"{iter_tmp} = list({args2[iter_pos]})")
+                    expanded_args = args2[:iter_pos] + [f"{iter_tmp}[{k}]" for k in range(iter_need)] + args2[iter_pos + 1:]
+                    fmt_expr = _fortran_format_expr(fmt, expanded_args)
+                    if fmt_expr is not None:
+                        self.emit(f"print({fmt_expr})")
+                        return True
             fmt_expr = _fortran_format_expr(fmt, args2)
             if fmt_expr is not None:
                 self.emit(f"print({fmt_expr})")
@@ -1898,6 +1936,21 @@ class basic_f2p:
                     if fmt_expr is not None:
                         self.emit(f"print({fmt_expr})")
                         return True
+            if len(raw_args) > 1:
+                plan = _single_iterable_formatted_arg_plan(fmt, raw_args, self._decl_array_types)
+                if plan is not None:
+                    iter_pos, iter_need = plan
+                    iter_raw = raw_args[iter_pos].strip()
+                    iter_tmp = f"_xf2p_fmt_items_{self._code_emit_count + 1}"
+                    if re.fullmatch(r"[a-z_]\w*", iter_raw, flags=re.I) and iter_raw.lower() in self._decl_array_types:
+                        self.emit(f"{iter_tmp} = list(np.ravel({args2[iter_pos]}, order='F'))")
+                    else:
+                        self.emit(f"{iter_tmp} = list({args2[iter_pos]})")
+                    expanded_args = args2[:iter_pos] + [f"{iter_tmp}[{k}]" for k in range(iter_need)] + args2[iter_pos + 1:]
+                    fmt_expr = _fortran_format_expr(fmt, expanded_args)
+                    if fmt_expr is not None:
+                        self.emit(f"print({fmt_expr})")
+                        return True
             fmt_expr = _fortran_format_expr(fmt, args2)
             if fmt_expr is not None:
                 self.emit(f"print({fmt_expr})")
@@ -1929,6 +1982,21 @@ class basic_f2p:
                 a0 = raw_args[0].strip()
                 if _is_recyclable_io_iterable(a0, self._decl_array_types):
                     fmt_expr = _fortran_format_recycled_expr(fmt, args2[0])
+                    if fmt_expr is not None:
+                        self.emit(f"print({fmt_expr}, file={unit})")
+                        return True
+            if len(raw_args) > 1:
+                plan = _single_iterable_formatted_arg_plan(fmt, raw_args, self._decl_array_types)
+                if plan is not None:
+                    iter_pos, iter_need = plan
+                    iter_raw = raw_args[iter_pos].strip()
+                    iter_tmp = f"_xf2p_fmt_items_{self._code_emit_count + 1}"
+                    if re.fullmatch(r"[a-z_]\w*", iter_raw, flags=re.I) and iter_raw.lower() in self._decl_array_types:
+                        self.emit(f"{iter_tmp} = list(np.ravel({args2[iter_pos]}, order='F'))")
+                    else:
+                        self.emit(f"{iter_tmp} = list({args2[iter_pos]})")
+                    expanded_args = args2[:iter_pos] + [f"{iter_tmp}[{k}]" for k in range(iter_need)] + args2[iter_pos + 1:]
+                    fmt_expr = _fortran_format_expr(fmt, expanded_args)
                     if fmt_expr is not None:
                         self.emit(f"print({fmt_expr}, file={unit})")
                         return True
