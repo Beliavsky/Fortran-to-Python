@@ -1745,6 +1745,10 @@ class basic_f2p:
                 "cmplx",
                 "int",
                 "nint",
+                "anint",
+                "aint",
+                "ceiling",
+                "floor",
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
@@ -1785,6 +1789,14 @@ class basic_f2p:
                 return None
             if lname == "nint" and len(args_py) == 1:
                 return f"_xf2p_nint({args_py[0]})"
+            if lname == "anint" and len(args_py) == 1:
+                return f"_xf2p_anint({args_py[0]})"
+            if lname == "aint" and len(args_py) == 1:
+                return f"_xf2p_aint({args_py[0]})"
+            if lname == "ceiling" and len(args_py) == 1:
+                return f"_xf2p_ceiling({args_py[0]})"
+            if lname == "floor" and len(args_py) == 1:
+                return f"_xf2p_floor({args_py[0]})"
             if lname == "gamma" and len(args_py) == 1:
                 return f"sps.gamma({args_py[0]})"
             if lname == "log_gamma" and len(args_py) == 1:
@@ -4169,12 +4181,42 @@ class basic_f2p:
         self.emit('    """Fortran NINT with ties away from zero and array support."""')
         self.emit("    if _xf2p_is_arraylike(x):")
         self.emit("        xx = np.asarray(x, dtype=np.float64)")
-        self.emit("        rr = np.where(xx >= 0.0, np.floor(xx + 0.5), np.ceil(xx - 0.5))")
+        self.emit("        rr = np.copysign(np.floor(np.abs(xx) + 0.5), xx)")
         self.emit("        return np.asarray(rr, dtype=int)")
         self.emit("    xx = float(np.asarray(x))")
-        self.emit("    if xx >= 0.0:")
-        self.emit("        return int(np.floor(xx + 0.5))")
-        self.emit("    return int(np.ceil(xx - 0.5))")
+        self.emit("    return int(np.copysign(np.floor(abs(xx) + 0.5), xx))")
+        self.emit("")
+        self.emit("def _xf2p_anint(x):")
+        self.emit('    """Fortran ANINT with ties away from zero and array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        return np.copysign(np.floor(np.abs(xx) + 0.5), xx)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    return float(np.copysign(np.floor(abs(xx) + 0.5), xx))")
+        self.emit("")
+        self.emit("def _xf2p_aint(x):")
+        self.emit('    """Fortran AINT with truncation toward zero and array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        return np.trunc(xx)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    return float(np.trunc(xx))")
+        self.emit("")
+        self.emit("def _xf2p_ceiling(x):")
+        self.emit('    """Fortran CEILING with scalar/array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        return np.asarray(np.ceil(xx), dtype=int)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    return int(np.ceil(xx))")
+        self.emit("")
+        self.emit("def _xf2p_floor(x):")
+        self.emit('    """Fortran FLOOR with scalar/array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        return np.asarray(np.floor(xx), dtype=int)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    return int(np.floor(xx))")
         self.emit("")
         self.emit("def _xf2p_mod(a, p):")
         self.indent += 1
