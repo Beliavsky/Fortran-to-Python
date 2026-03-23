@@ -832,6 +832,7 @@ class basic_f2p:
         self._subr_sigs: dict[str, dict[str, list[str]]] = {}
         self._current_result_name: str | None = None
         self._derived_types: set[str] = set()
+        self._select_case_stack: list[dict[str, object]] = []
         self._seen_scipy_special = False
 
     def _kind_alias_value(self, remote: str) -> str | None:
@@ -1696,6 +1697,55 @@ class basic_f2p:
                     init_py = self.translate_expr(init, arrays_1d)
                     self.emit(f"{name}: {hint} = {init_py}")
 
+    def _xf2p_select_case_cond(self, select_expr_py: str, raw_case_list: str, arrays_1d: set[str]) -> str:
+        conds: list[str] = []
+        for item in split_args(raw_case_list):
+            tok = item.strip()
+            if not tok:
+                continue
+            if ":" in tok:
+                lo, hi = tok.split(":", 1)
+                lo = lo.strip()
+                hi = hi.strip()
+                parts: list[str] = []
+                if lo:
+                    lo_py = self.translate_expr(lo, arrays_1d)
+                    parts.append(f"({select_expr_py}) >= ({lo_py})")
+                if hi:
+                    hi_py = self.translate_expr(hi, arrays_1d)
+                    parts.append(f"({select_expr_py}) <= ({hi_py})")
+                conds.append(" and ".join(parts) if parts else "True")
+            else:
+                tok_py = self.translate_expr(tok, arrays_1d)
+                conds.append(f"({select_expr_py}) == ({tok_py})")
+        if not conds:
+            return "False"
+        return " or ".join(f"({c})" for c in conds)
+
+    def _xf2p_select_case_start(self, head: str, arrays_1d: set[str], inline_stmt: str | None = None) -> None:
+        if not self._select_case_stack:
+            return
+        st = self._select_case_stack[-1]
+        if st.get("in_case", False):
+            start = int(st.get("case_start", self._code_emit_count))
+            if self._code_emit_count == start:
+                self.emit("pass")
+            self.indent = max(0, self.indent - 1)
+        if head == "default":
+            kw = "else"
+            line = f"{kw}:"
+        else:
+            cond = self._xf2p_select_case_cond(str(st["expr"]), head, arrays_1d)
+            kw = "if" if not st.get("had_case", False) else "elif"
+            line = f"{kw} {cond}:"
+        self.emit(line)
+        self.indent += 1
+        st["had_case"] = True
+        st["in_case"] = True
+        st["case_start"] = self._code_emit_count
+        if inline_stmt and inline_stmt.strip():
+            self.transpile_simple_stmt(inline_stmt.strip(), arrays_1d)
+
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
 
@@ -1707,6 +1757,32 @@ class basic_f2p:
         if sl.startswith("end function") or sl.startswith("end program") or sl.startswith("end module"):
             return True
         if sl == "end":
+            return True
+
+        mm = re.match(r"select\s+case\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            expr = self.translate_expr(mm.group(1), arrays_1d)
+            self._select_case_stack.append({"expr": expr, "had_case": False, "in_case": False, "case_start": self._code_emit_count})
+            return True
+
+        mm = re.match(r"case\s+default\s*(?:;\s*(.*))?$", s, re.I)
+        if mm and self._select_case_stack:
+            self._xf2p_select_case_start("default", arrays_1d, mm.group(1))
+            return True
+
+        mm = re.match(r"case\s*\(\s*(.*?)\s*\)\s*(?:;\s*(.*))?$", s, re.I)
+        if mm and self._select_case_stack:
+            self._xf2p_select_case_start(mm.group(1), arrays_1d, mm.group(2))
+            return True
+
+        if sl.startswith("end select"):
+            if self._select_case_stack:
+                st = self._select_case_stack.pop()
+                if st.get("in_case", False):
+                    start = int(st.get("case_start", self._code_emit_count))
+                    if self._code_emit_count == start:
+                        self.emit("pass")
+                    self.indent = max(0, self.indent - 1)
             return True
 
         # if (...) then
@@ -2840,6 +2916,7 @@ class basic_f2p:
         self.indent = 0
         self._code_emit_count = 0
         self._block_code_start = []
+        self._select_case_stack = []
 
         self.emit("import numpy as np")
         self.emit("import numpy.typing as npt")
