@@ -1986,8 +1986,11 @@ class basic_f2p:
             else:
                 self.emit("return")
             return True
-        if sl == "exit":
+        if re.match(r"^exit(?:\s+[a-z_]\w*)?$", s, re.I):
             self.emit("break")
+            return True
+        if re.match(r"^cycle(?:\s+[a-z_]\w*)?$", s, re.I):
+            self.emit("continue")
             return True
         mm = re.match(r"(?:error\s+)?stop(?:\s+(.+))?$", s, re.I)
         if mm:
