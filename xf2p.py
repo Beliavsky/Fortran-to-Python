@@ -1081,6 +1081,8 @@ class basic_f2p:
         self._decl_pointer: set[str] = set()
         self._decl_target: set[str] = set()
         self._decl_char_len: dict[str, str] = {}
+        self._decl_lbounds: dict[str, list[str]] = {}
+        self._decl_ubounds: dict[str, list[str]] = {}
         self._save_stack: list[tuple[str, list[str]]] = []
         self._subr_sigs: dict[str, dict] = {}
         self._func_sigs: dict[str, dict] = {}
@@ -1558,6 +1560,62 @@ class basic_f2p:
             return dims[0]
         return "(" + ", ".join(dims) + ")"
 
+    def _shape_bounds(self, shape: str) -> list[tuple[str, str]]:
+        bounds: list[tuple[str, str]] = []
+        for d in split_args(shape):
+            ds = d.strip()
+            if ":" in ds:
+                lo, hi = ds.split(":", 1)
+                lo = lo.strip() or "1"
+                hi = hi.strip()
+                bounds.append((lo, hi))
+            else:
+                bounds.append(("1", ds))
+        return bounds
+
+    def _decl_bound_expr(self, name: str, dim0: int, which: str, arrays_1d: set[str]) -> str | None:
+        key = name.split(".", 1)[0].lower()
+        src = self._decl_lbounds if which == "lo" else self._decl_ubounds
+        vals = src.get(key)
+        if not vals or dim0 < 0 or dim0 >= len(vals):
+            return None
+        raw = str(vals[dim0]).strip()
+        if which == "hi":
+            if raw == "":
+                lo_vals = self._decl_lbounds.get(key)
+                lo_raw = "1"
+                if lo_vals and 0 <= dim0 < len(lo_vals):
+                    lo_raw = str(lo_vals[dim0]).strip() or "1"
+                lo_py = self.translate_expr(lo_raw, arrays_1d)
+                base_name = name.split(".", 1)[0]
+                return f"(_f_size({base_name}, dim={dim0 + 1}) + ({lo_py}) - 1)"
+            if raw == "*":
+                return None
+        return self.translate_expr(raw, arrays_1d)
+
+    def _index_expr_from_decl_bounds(self, name: str, idx_txt: str, dim0: int, arrays_1d: set[str]) -> str:
+        idx_py = self.translate_expr(idx_txt, arrays_1d)
+        lo_py = self._decl_bound_expr(name, dim0, "lo", arrays_1d)
+        if lo_py is None or lo_py == "1":
+            return f"({idx_py}) - 1"
+        return f"({idx_py}) - ({lo_py})"
+
+    def _slice_expr_from_decl_bounds(self, name: str, lo_txt: str, hi_txt: str, dim0: int, arrays_1d: set[str]) -> str:
+        base_lo_py = self._decl_bound_expr(name, dim0, "lo", arrays_1d)
+        lo_txt = lo_txt.strip()
+        hi_txt = hi_txt.strip()
+        if lo_txt:
+            lo_py = self.translate_expr(lo_txt, arrays_1d)
+            start = f"(int({lo_py}) - 1)" if base_lo_py is None or base_lo_py == "1" else f"(int({lo_py}) - int({base_lo_py}))"
+        else:
+            start = ""
+        if hi_txt:
+            hi_py = self.translate_expr(hi_txt, arrays_1d)
+            stop = f"int({hi_py})" if base_lo_py is None or base_lo_py == "1" else f"(int({hi_py}) - int({base_lo_py}) + 1)"
+        else:
+            stop = ""
+        return f"{start}:{stop}"
+
     def translate_expr(self, expr: str, arrays_1d: set[str]) -> str:
         s = expr.strip()
         s = s.replace("%", ".")
@@ -1749,6 +1807,8 @@ class basic_f2p:
                 "aint",
                 "ceiling",
                 "floor",
+                "lbound",
+                "ubound",
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
@@ -1797,6 +1857,42 @@ class basic_f2p:
                 return f"_xf2p_ceiling({args_py[0]})"
             if lname == "floor" and len(args_py) == 1:
                 return f"_xf2p_floor({args_py[0]})"
+            if lname in {"lbound", "ubound"} and len(parts) >= 1:
+                base_raw = parts[0].strip()
+                base_py = self.translate_expr(base_raw, arrays_1d)
+                dim_raw = None
+                dim_py = None
+                for idx_part, p in enumerate(parts[1:], start=1):
+                    pm = re.match(r"(?is)^dim\s*=\s*(.+)$", p.strip())
+                    if pm:
+                        dim_raw = pm.group(1).strip()
+                        dim_py = self.translate_expr(dim_raw, arrays_1d)
+                    elif idx_part == 1 and dim_raw is None:
+                        dim_raw = p.strip()
+                        dim_py = self.translate_expr(dim_raw, arrays_1d)
+                if re.fullmatch(r"[a-z_]\w*(?:\.[a-z_]\w*)*", base_raw, flags=re.I):
+                    key = base_raw.split(".", 1)[0].lower()
+                    vals = self._decl_lbounds.get(key) if lname == "lbound" else self._decl_ubounds.get(key)
+                    if vals:
+                        if dim_raw is None:
+                            parts_py: list[str] = []
+                            for idx0 in range(len(vals)):
+                                bnd = self._decl_bound_expr(base_raw, idx0, "lo" if lname == "lbound" else "hi", arrays_1d)
+                                if bnd is None:
+                                    parts_py = []
+                                    break
+                                parts_py.append(bnd)
+                            if parts_py:
+                                return "np.asarray([" + ", ".join(parts_py) + "], dtype=int)"
+                        if re.fullmatch(r"[+-]?\d+", dim_raw):
+                            idx0 = int(dim_raw) - 1
+                            bnd = self._decl_bound_expr(base_raw, idx0, "lo" if lname == "lbound" else "hi", arrays_1d)
+                            if bnd is not None:
+                                return bnd
+                helper = "_xf2p_lbound" if lname == "lbound" else "_xf2p_ubound"
+                if dim_py is None:
+                    return f"{helper}({base_py})"
+                return f"{helper}({base_py}, dim={dim_py})"
             if lname == "gamma" and len(args_py) == 1:
                 return f"sps.gamma({args_py[0]})"
             if lname == "log_gamma" and len(args_py) == 1:
@@ -1895,13 +1991,9 @@ class basic_f2p:
                                         lo, hi = ptxt.split(":", 1)
                                         lo = lo.strip()
                                         hi = hi.strip()
-                                        lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                                        hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                                        start = f"(int({lo_py}) - 1)" if lo_py else ""
-                                        stop = f"int({hi_py})" if hi_py else ""
-                                        idx_parts.append(f"{start}:{stop}")
+                                        idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
                                     else:
-                                        idx_parts.append(f"({self.translate_expr(ptxt, arrays_1d)}) - 1")
+                                        idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
                                 out.append(f"{name}[{', '.join(idx_parts)}]")
                                 i = pclose + 1
                                 continue
@@ -1909,13 +2001,9 @@ class basic_f2p:
                                 lo, hi = inner.split(":", 1)
                                 lo = lo.strip()
                                 hi = hi.strip()
-                                lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                                hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                                start = f"(int({lo_py}) - 1)" if lo_py else ""
-                                stop = f"int({hi_py})" if hi_py else ""
-                                out.append(f"{name}[{start}:{stop}]")
+                                out.append(f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}]")
                             else:
-                                out.append(f"{name}[({inner_py}) - 1]")
+                                out.append(f"{name}[{self._index_expr_from_decl_bounds(name, inner, 0, arrays_1d)}]")
                         else:
                             if ":" in inner and "," not in inner:
                                 lo, hi = inner.split(":", 1)
@@ -2091,27 +2179,18 @@ class basic_f2p:
                             lo, hi = ptxt.split(":", 1)
                             lo = lo.strip()
                             hi = hi.strip()
-                            lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                            hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                            start = f"(int({lo_py}) - 1)" if lo_py else ""
-                            stop = f"int({hi_py})" if hi_py else ""
-                            idx_parts.append(f"{start}:{stop}")
+                            idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
                         else:
-                            idx_parts.append(f"({self.translate_expr(ptxt, arrays_1d)}) - 1")
+                            idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
                     self.emit(f"{name}[{', '.join(idx_parts)}] = {rhs_py}")
                     return
                 if ":" in idx:
                     lo, hi = idx.split(":", 1)
                     lo = lo.strip()
                     hi = hi.strip()
-                    lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                    hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                    start = f"(int({lo_py}) - 1)" if lo_py else ""
-                    stop = f"int({hi_py})" if hi_py else ""
-                    self.emit(f"{name}[{start}:{stop}] = {rhs_py}")
+                    self.emit(f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}] = {rhs_py}")
                 else:
-                    idx_py = self.translate_expr(idx, arrays_1d)
-                    self.emit(f"{name}[({idx_py}) - 1] = {rhs_py}")
+                    self.emit(f"{name}[{self._index_expr_from_decl_bounds(name, idx, 0, arrays_1d)}] = {rhs_py}")
                 return
         # Whole-array assignment or scalar assignment.
         # POINTER and TARGET entities need in-place updates to preserve aliasing.
@@ -2526,23 +2605,15 @@ class basic_f2p:
                         lo, hi = ptxt.split(":", 1)
                         lo = lo.strip()
                         hi = hi.strip()
-                        lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                        hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                        start = f"(int({lo_py}) - 1)" if lo_py else ""
-                        stop = f"int({hi_py})" if hi_py else ""
-                        idx_parts.append(f"{start}:{stop}")
+                        idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
                     else:
-                        idx_parts.append(f"({self.translate_expr(ptxt, arrays_1d)}) - 1")
+                        idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
                 target = f"{name}[{', '.join(idx_parts)}]"
             else:
                 lo, hi = idx.split(":", 1)
                 lo = lo.strip()
                 hi = hi.strip()
-                lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                start = f"(int({lo_py}) - 1)" if lo_py else ""
-                stop = f"int({hi_py})" if hi_py else ""
-                target = f"{name}[{start}:{stop}]"
+                target = f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}]"
             self.emit(f"{target} = np.where({mask_expr}, {rhs_py}, {target})")
             return True
         is_array_target = (lhs in arrays_1d) or (lhs_base in self._decl_array_types)
@@ -2976,7 +3047,7 @@ class basic_f2p:
                     ftype = self._decl_array_types.get(arr.lower(), "")
                     cast = "int" if ftype == "integer" else "float"
                     self.emit(f"__read_vals = [{cast}(v) for v in {unit}.readline().split()]")
-                    self.emit(f"{arr}[({ridx}) - 1, :] = np.asarray(__read_vals[:{arr}.shape[1]], dtype={arr}.dtype)")
+                    self.emit(f"{arr}[{self._index_expr_from_decl_bounds(arr, mrow.group(2), 0, arrays_1d)}, :] = np.asarray(__read_vals[:{arr}.shape[1]], dtype={arr}.dtype)")
                     return True
                 # scalar target
                 lhs = self.translate_expr(tgt, arrays_1d)
@@ -3566,6 +3637,8 @@ class basic_f2p:
         self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
         self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
         self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
+        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
 
         # exec pass
         prev_result_name = self._current_result_name
@@ -3645,6 +3718,8 @@ class basic_f2p:
         self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
         self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
         self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
+        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
 
         # exec statements
         for code, comment in body_lines:
@@ -4053,6 +4128,8 @@ class basic_f2p:
         self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
         self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
         self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
+        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
 
         for code, comment in main_lines:
             s = code.strip()
@@ -4260,6 +4337,54 @@ class basic_f2p:
         self.emit("return int(np.rint(rr))")
         self.indent -= 1
         self.emit("return rr")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_lbound(x, dim=None):")
+        self.indent += 1
+        self.emit('"""Fortran LBOUND for arraylike values with default lower bound 1."""')
+        self.emit("if dim is not None:")
+        self.indent += 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("if x.ndim == 0:")
+        self.indent += 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("return np.ones(x.ndim, dtype=int)")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_ubound(x, dim=None):")
+        self.indent += 1
+        self.emit('"""Fortran UBOUND for arraylike values with default lower bound 1."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("if x.ndim == 0:")
+        self.indent += 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("if dim is not None:")
+        self.indent += 1
+        self.emit("return int(x.shape[int(dim) - 1])")
+        self.indent -= 1
+        self.emit("return np.asarray(x.shape, dtype=int)")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("if dim is not None:")
+        self.indent += 1
+        self.emit("return len(x)")
+        self.indent -= 1
+        self.emit("return np.asarray([len(x)], dtype=int)")
+        self.indent -= 1
+        self.emit("return 1")
         self.indent -= 1
         self.emit("")
         self.emit("def _f_len(x):")
