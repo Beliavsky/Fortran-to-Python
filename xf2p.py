@@ -972,6 +972,8 @@ class basic_f2p:
         self._do_stack: list[int] = []
         self._seen_scipy_special = False
         self._elemental_funcs: set[str] = set()
+        self._current_save_state_name: str | None = None
+        self._current_save_var_names: list[str] = []
 
     def _kind_alias_value(self, remote: str) -> str | None:
         r = remote.strip().lower()
@@ -1805,6 +1807,125 @@ class basic_f2p:
             self.emit(f"{name}: Final[{hint}] = {val}")
             names.add(name)
         return names
+
+    def _collect_save_vars(self, sym: dict[str, dict], args: list[str], body_lines: list[tuple[str, str]]) -> list[str]:
+        """Return local variables in a procedure that need Fortran SAVE semantics."""
+        arg_l = {a.lower() for a in args}
+        save_all = False
+        explicit: set[str] = set()
+        implicit: set[str] = set()
+
+        for name, info in sym.items():
+            attrs_l = str(info.get("attrs_l", "")).lower()
+            if name.lower() in arg_l:
+                continue
+            if "save" in attrs_l:
+                explicit.add(name)
+            if info.get("init") is not None:
+                implicit.add(name)
+
+        for code, _comment in body_lines:
+            s = code.strip()
+            if not s:
+                continue
+            m = re.match(r"^save(.*)$", s, re.I)
+            if not m:
+                continue
+            rest = m.group(1).strip()
+            if rest.startswith("::"):
+                rest = rest[2:].strip()
+            if not rest:
+                save_all = True
+                continue
+            for item in split_args(rest):
+                nm = item.strip()
+                if not nm:
+                    continue
+                if nm.lower() in arg_l:
+                    continue
+                if nm in sym:
+                    explicit.add(nm)
+
+        out: list[str] = []
+        for name in sym:
+            if name.lower() in arg_l:
+                continue
+            if save_all or name in explicit or name in implicit:
+                out.append(name)
+        return out
+
+    def _default_init_expr(self, info: dict, arrays_1d: set[str]) -> str:
+        """Return Python expression for a variable's default/declared initial value."""
+        ftype = cast(str, info["ftype"])
+        ftype_name = cast(str | None, info.get("type_name"))
+        is_array = bool(info.get("is_array"))
+        shape = info.get("shape")
+        init = info.get("init")
+        alloc = bool(info.get("alloc"))
+        attrs_l = str(info.get("attrs_l", ""))
+        is_ptr = bool(info.get("pointer")) or ("pointer" in attrs_l)
+        is_tgt = bool(info.get("target")) or ("target" in attrs_l)
+
+        if is_array:
+            if is_ptr:
+                if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
+                    return "None"
+                return self.translate_expr(str(init), arrays_1d)
+            if alloc:
+                return "None"
+            if shape is None or str(shape).strip() == ':':
+                return "None"
+            shape_py = self._shape_to_py(str(shape), arrays_1d)
+            if ftype == "type":
+                return f"np.empty({shape_py}, dtype=object)"
+            dtype = _type_dtype[ftype]
+            if init is None:
+                return f"np.empty({shape_py}, dtype={dtype})"
+            init_py = self.translate_expr(str(init), arrays_1d)
+            return f"np.full({shape_py}, {init_py}, dtype={dtype})"
+
+        if ftype == "type":
+            cls = ftype_name if ftype_name else "SimpleNamespace"
+            if is_ptr:
+                return "None"
+            return f"{cls}()"
+
+        if is_ptr:
+            if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
+                return "None"
+            return self.translate_expr(str(init), arrays_1d)
+
+        if is_tgt and ftype in _type_dtype and ftype != "character":
+            dtype = _type_dtype[ftype]
+            if init is None:
+                default_val = _type_default_scalar_value.get(ftype, "0")
+                return f"np.array({default_val}, dtype={dtype})"
+            init_py = self.translate_expr(str(init), arrays_1d)
+            return f"np.array({init_py}, dtype={dtype})"
+
+        if init is None:
+            return _type_default_scalar_value.get(ftype, "0")
+        return self.translate_expr(str(init), arrays_1d)
+
+    def _emit_save_loads(self, save_state_name: str, save_vars: list[str], sym: dict[str, dict], arrays_1d: set[str]) -> None:
+        for name in save_vars:
+            info = sym[name]
+            init_expr = self._default_init_expr(info, arrays_1d)
+            self.emit(f"if {name!r} not in {save_state_name}:")
+            self.indent += 1
+            self.emit(f"{save_state_name}[{name!r}] = _xf2p_copy_value({init_expr})")
+            self.indent -= 1
+            ftype = cast(str, info["ftype"])
+            type_name = cast(str | None, info.get("type_name"))
+            is_array = bool(info.get("is_array"))
+            hint = self._type_hint(ftype, type_name, is_array=is_array)
+            self.emit(f"{name}: {hint} = _xf2p_copy_value({save_state_name}[{name!r}])")
+
+    def _emit_save_stores(self) -> None:
+        if not self._current_save_state_name:
+            return
+        for name in self._current_save_var_names:
+            self.emit(f"{self._current_save_state_name}[{name!r}] = _xf2p_copy_value({name})")
 
     def emit_var_inits_from_sym(
         self,
@@ -2648,8 +2769,13 @@ class basic_f2p:
             self.emit(f"{cname}({', '.join(merged)})")
             return True
 
+        # SAVE statement in procedure declarative part
+        if re.match(r"^save", s, re.I):
+            return True
+
         # return
         if sl == "return":
+            self._emit_save_stores()
             if self._current_result_name:
                 self.emit(f"return {self._current_result_name}")
             else:
@@ -3079,6 +3205,12 @@ class basic_f2p:
             else:
                 args_annot.append(f"{a}: {hint}")
 
+        save_vars = self._collect_save_vars(sym, args, main_lines)
+        save_state_name = f"_xf2p_save_{fname}"
+        if save_vars:
+            self.emit(f"{save_state_name} = {{}}")
+            self.emit("")
+
         self.emit(f"def {fname}({', '.join(args_annot)}) -> {result_hint}:")
         self.indent += 1
 
@@ -3100,6 +3232,13 @@ class basic_f2p:
                 for ln in lead_doc:
                     self.emit(ln)
                 self.emit('"""')
+
+        prev_save_state_name = self._current_save_state_name
+        prev_save_var_names = self._current_save_var_names
+        self._current_save_state_name = save_state_name if save_vars else None
+        self._current_save_var_names = list(save_vars)
+        if save_vars:
+            self._emit_save_loads(save_state_name, save_vars, sym, arrays_1d)
 
         if is_elemental:
             self._elemental_funcs.add(fname.lower())
@@ -3128,7 +3267,7 @@ class basic_f2p:
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
         # allocate/init explicit-shape arrays and scalars
-        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args))
+        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_vars))
         # initialize derived-type/component bases that appear as name%field
         comp_bases: set[str] = set()
         for code, _comment in main_lines:
@@ -3164,8 +3303,11 @@ class basic_f2p:
             self.handle_exec_line(s, arrays_1d)
 
         # basic default return (safe)
+        self._emit_save_stores()
         self.emit(f"return {result_name}")
         self._current_result_name = prev_result_name
+        self._current_save_state_name = prev_save_state_name
+        self._current_save_var_names = prev_save_var_names
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
@@ -3493,6 +3635,11 @@ class basic_f2p:
                 args_annot.append(f"{a}: {hint} = None")
             else:
                 args_annot.append(f"{a}: {hint}")
+        save_vars = self._collect_save_vars(sym, args, main_lines)
+        save_state_name = f"_xf2p_save_{sname}"
+        if save_vars:
+            self.emit(f"{save_state_name} = {{}}")
+            self.emit("")
         out_formals: list[str] = []
         pure_out_formals: list[str] = []
         vector_formals: list[str] = []
@@ -3514,6 +3661,13 @@ class basic_f2p:
 
         self.emit(f"def {sname}({', '.join(args_annot)}):")
         self.indent += 1
+
+        prev_save_state_name = self._current_save_state_name
+        prev_save_var_names = self._current_save_var_names
+        self._current_save_state_name = save_state_name if save_vars else None
+        self._current_save_var_names = list(save_vars)
+        if save_vars:
+            self._emit_save_loads(save_state_name, save_vars, sym, arrays_1d)
 
         for kind, header, ibody in internals:
             if kind == "function":
@@ -3549,7 +3703,7 @@ class basic_f2p:
             if "parameter" in attrs_l:
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
-        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args))
+        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_vars))
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
         self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
@@ -3564,12 +3718,15 @@ class basic_f2p:
                 continue
             self.handle_exec_line(s, arrays_1d)
 
+        self._emit_save_stores()
         if out_formals:
             if len(out_formals) == 1:
                 self.emit(f"return {out_formals[0]}")
             else:
                 self.emit("return " + ", ".join(out_formals))
 
+        self._current_save_state_name = prev_save_state_name
+        self._current_save_var_names = prev_save_var_names
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
