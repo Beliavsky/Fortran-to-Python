@@ -1603,6 +1603,8 @@ class basic_f2p:
 
         s = re.sub(r"\.true\.", "True", s, flags=re.I)
         s = re.sub(r"\.false\.", "False", s, flags=re.I)
+        s = re.sub(r"\.eqv\.", " == ", s, flags=re.I)
+        s = re.sub(r"\.neqv\.", " != ", s, flags=re.I)
         s = re.sub(r"\.eq\.", " == ", s, flags=re.I)
         s = re.sub(r"\.ne\.", " != ", s, flags=re.I)
         s = re.sub(r"\.lt\.", " < ", s, flags=re.I)
