@@ -332,6 +332,61 @@ def split_args(s: str) -> list[str]:
         args.append(tail)
     return args
 
+def split_top_level(s: str, delim: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    pdepth = 0
+    bdepth = 0
+    in_str = False
+    quote = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            buf.append(ch)
+            if ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '(':
+            pdepth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ')':
+            pdepth = max(0, pdepth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '[':
+            bdepth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ']':
+            bdepth = max(0, bdepth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == delim and pdepth == 0 and bdepth == 0:
+            parts.append(''.join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = ''.join(buf).strip()
+    if tail or not parts:
+        parts.append(tail)
+    return parts
+
 def _fortran_unquote(s: str) -> str:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", "\""):
         q = s[0]
@@ -913,6 +968,7 @@ class basic_f2p:
         self._select_case_stack: list[dict[str, object]] = []
         self._associate_stack: list[dict[str, object]] = []
         self._where_stack: list[dict[str, str]] = []
+        self._forall_stack: list[int] = []
         self._seen_scipy_special = False
         self._elemental_funcs: set[str] = set()
 
@@ -2123,6 +2179,57 @@ class basic_f2p:
             return True
         return False
 
+    def _parse_forall_header(self, raw: str, arrays_1d: set[str]) -> tuple[list[tuple[str, str, str, str | None]], str | None]:
+        loops: list[tuple[str, str, str, str | None]] = []
+        mask_raw: str | None = None
+        for part in split_args(raw):
+            part = part.strip()
+            if not part:
+                continue
+            mm = re.match(r"^([a-z_]\w*)\s*=\s*(.+)$", part, re.I)
+            if mm:
+                var = mm.group(1)
+                rhs = mm.group(2).strip()
+                trip = [p.strip() for p in split_top_level(rhs, ':')]
+                if len(trip) in (2, 3) and trip[0] != '' and trip[1] != '':
+                    lo_py = self.translate_expr(trip[0], arrays_1d)
+                    hi_py = self.translate_expr(trip[1], arrays_1d)
+                    step_py = self.translate_expr(trip[2], arrays_1d) if len(trip) == 3 and trip[2] != '' else None
+                    loops.append((var, lo_py, hi_py, step_py))
+                    continue
+            if mask_raw is None:
+                mask_raw = part
+            else:
+                mask_raw = mask_raw + ', ' + part
+        mask_py = self.translate_expr(mask_raw, arrays_1d) if mask_raw is not None else None
+        return loops, mask_py
+
+    def _emit_forall_block_start(self, header_raw: str, arrays_1d: set[str]) -> int:
+        loops, mask_py = self._parse_forall_header(header_raw, arrays_1d)
+        levels = 0
+        for var, lo_py, hi_py, step_py in loops:
+            if step_py is None:
+                self.emit(f"for {var} in range({lo_py}, ({hi_py}) + 1):")
+            else:
+                self.emit(f"for {var} in range({lo_py}, ({hi_py}) + (1 if ({step_py}) > 0 else -1), {step_py}):")
+            self.indent += 1
+            self._block_code_start.append(self._code_emit_count)
+            levels += 1
+        if mask_py is not None:
+            self.emit(f"if {mask_py}:")
+            self.indent += 1
+            self._block_code_start.append(self._code_emit_count)
+            levels += 1
+        return levels
+
+    def _emit_forall_block_end(self, levels: int) -> None:
+        for _ in range(levels):
+            if self._block_code_start:
+                start = self._block_code_start.pop()
+                if self._code_emit_count == start:
+                    self.emit("pass")
+            self.indent = max(0, self.indent - 1)
+
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
 
@@ -2135,6 +2242,16 @@ class basic_f2p:
                 p1 = find_matching_paren(s, p0)
                 if p1 != -1:
                     pwhere = (p0, p1)
+
+        pforall = None
+        if sl.startswith("forall"):
+            p0 = s.lower().find("forall") + len("forall")
+            while p0 < len(s) and s[p0].isspace():
+                p0 += 1
+            if p0 < len(s) and s[p0] == "(":
+                p1 = find_matching_paren(s, p0)
+                if p1 != -1:
+                    pforall = (p0, p1)
 
         # ignore some non-exec lines
         if sl in ("implicit none", "contains"):
@@ -2181,6 +2298,23 @@ class basic_f2p:
                 self._end_where_block()
             else:
                 self._start_where_block(cond_raw, arrays_1d)
+            return True
+
+        if re.match(r"end\s+forall", s, re.I):
+            levels = self._forall_stack.pop() if self._forall_stack else 0
+            self._emit_forall_block_end(levels)
+            return True
+
+        if pforall is not None:
+            p0, p1 = pforall
+            header_raw = s[p0 + 1 : p1].strip()
+            tail = s[p1 + 1 :].strip()
+            levels = self._emit_forall_block_start(header_raw, arrays_1d)
+            if tail:
+                self.transpile_simple_stmt(tail, arrays_1d)
+                self._emit_forall_block_end(levels)
+            else:
+                self._forall_stack.append(levels)
             return True
 
         mm = re.match(r"select\s+case\s*\(\s*(.+)\s*\)\s*$", s, re.I)
