@@ -962,6 +962,8 @@ class basic_f2p:
         self._decl_array_types: dict[str, str] = {}
         self._decl_pointer: set[str] = set()
         self._decl_target: set[str] = set()
+        self._decl_char_len: dict[str, str] = {}
+        self._save_stack: list[tuple[str, list[str]]] = []
         self._subr_sigs: dict[str, dict[str, list[str]]] = {}
         self._current_result_name: str | None = None
         self._derived_types: set[str] = set()
@@ -972,8 +974,6 @@ class basic_f2p:
         self._do_stack: list[int] = []
         self._seen_scipy_special = False
         self._elemental_funcs: set[str] = set()
-        self._current_save_state_name: str | None = None
-        self._current_save_var_names: list[str] = []
 
     def _kind_alias_value(self, remote: str) -> str | None:
         r = remote.strip().lower()
@@ -1032,6 +1032,98 @@ class basic_f2p:
             attrs = td.group(2).strip()
             return "type", td.group(1), attrs.lower(), parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(attrs))
         return None
+
+    def _parse_character_len(self, decl_line: str) -> str | None:
+        s = decl_line.strip()
+        m = re.search(r"\bcharacter\s*\(\s*len\s*=\s*([^,)]+)", s, re.I)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"\bcharacter\s*\(\s*([^,)]+)\s*\)", s, re.I)
+        if m and 'kind' not in m.group(1).lower() and '=' not in m.group(1):
+            return m.group(1).strip()
+        m = re.search(r"\bcharacter\s*\*\s*([a-z_]\w*|\d+)", s, re.I)
+        if m:
+            return m.group(1).strip()
+        return None
+
+    def _collect_save_names(self, lines: list[tuple[str, str]], sym: dict[str, dict], args: list[str]) -> list[str]:
+        save_names: set[str] = set()
+        arg_set = {a.lower() for a in args}
+        for name, info in sym.items():
+            attrs_l = str(info.get("attrs_l", "")).lower()
+            if name.lower() in arg_set:
+                continue
+            if "save" in attrs_l or info.get("init") is not None:
+                save_names.add(name)
+        for code, _comment in lines:
+            s = code.strip()
+            if re.fullmatch(r"save", s, re.I):
+                for name in sym:
+                    if name.lower() not in arg_set:
+                        save_names.add(name)
+                continue
+            m = re.match(r"save\s*(?:::)?\s*(.+)$", s, re.I)
+            if m:
+                for item in split_args(m.group(1)):
+                    nm = item.strip()
+                    if nm and nm.lower() not in arg_set and nm in sym:
+                        save_names.add(nm)
+        return sorted(save_names)
+
+    def _emit_save_restore(self, save_dict_name: str, save_names: list[str], sym: dict[str, dict], arrays_1d: set[str]) -> None:
+        for name in save_names:
+            info = sym.get(name, {})
+            ftype = info.get("ftype")
+            is_array = bool(info.get("is_array"))
+            init = info.get("init")
+            if is_array:
+                shape = info.get("shape")
+                if shape is None:
+                    init_py = "None"
+                else:
+                    shape_py = self._shape_to_py(str(shape), arrays_1d)
+                    if ftype == "type":
+                        init_py = f"np.empty({shape_py}, dtype=object)"
+                    else:
+                        dtype = _type_dtype.get(ftype, "object")
+                        if init is None:
+                            init_py = f"np.empty({shape_py}, dtype={dtype})"
+                        else:
+                            rhs = self.translate_expr(str(init), arrays_1d)
+                            if ftype == "character" and info.get("char_len") is not None:
+                                clen = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                                rhs = f"_f_str_assign({rhs}, {clen})"
+                            init_py = f"np.full({shape_py}, {rhs}, dtype={dtype})"
+            else:
+                if ftype == "type":
+                    cls = info.get("type_name") or "SimpleNamespace"
+                    init_py = f"{cls}()"
+                elif init is None:
+                    default_val = _type_default_scalar_value.get(ftype, "0")
+                    if ftype == "character" and info.get("char_len") is not None:
+                        clen = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                        default_val = f"_f_str_assign({default_val}, {clen})"
+                    init_py = default_val
+                else:
+                    init_py = self.translate_expr(str(init), arrays_1d)
+                    if ftype == "character" and info.get("char_len") is not None:
+                        clen = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                        init_py = f"_f_str_assign({init_py}, {clen})"
+            self.emit(f"if {name!r} in {save_dict_name}:")
+            self.indent += 1
+            self.emit(f"{name} = _xf2p_copy_value({save_dict_name}[{name!r}])")
+            self.indent -= 1
+            self.emit("else:")
+            self.indent += 1
+            self.emit(f"{name} = _xf2p_copy_value({init_py})")
+            self.indent -= 1
+
+    def _emit_save_sync(self) -> None:
+        if not self._save_stack:
+            return
+        save_dict_name, save_names = self._save_stack[-1]
+        for name in save_names:
+            self.emit(f"{save_dict_name}[{name!r}] = _xf2p_copy_value({name})")
 
     def _validate_unit_symbols(self, unit_kind: str, unit_name: str, args: list[str], body_lines: list[tuple[str, str]]) -> None:
         dups = _find_dups_ci(args)
@@ -1519,6 +1611,8 @@ class basic_f2p:
                 "sinpi",
                 "tanpi",
                 "trim",
+                "len_trim",
+                "adjustl",
                 "real",
                 "int",
             }:
@@ -1527,6 +1621,10 @@ class basic_f2p:
             args_py = [self.translate_expr(p, arrays_1d) for p in parts]
             if lname == "trim" and len(args_py) == 1:
                 return f"str({args_py[0]}).rstrip()"
+            if lname == "len_trim" and len(args_py) == 1:
+                return f"_f_len_trim({args_py[0]})"
+            if lname == "adjustl" and len(args_py) == 1:
+                return f"_f_adjustl({args_py[0]})"
             if lname == "real":
                 if len(parts) >= 1:
                     arg0_raw = parts[0].strip()
@@ -1700,9 +1798,14 @@ class basic_f2p:
         if self._where_masked_assignment(lhs, rhs_py, arrays_1d):
             return
         lhs = lhs.replace("%", ".")
-        lhs_base = lhs.split(".", 1)[0].strip().lower()
+        mb = re.match(r"\s*([A-Za-z_]\w*)", lhs)
+        lhs_base = mb.group(1).lower() if mb else lhs.split(".", 1)[0].strip().lower()
         if self._decl_types.get(lhs_base) == "integer":
             rhs_py = f"int({rhs_py})"
+        char_len_raw = self._decl_char_len.get(lhs_base)
+        if char_len_raw is not None:
+            clen_py = self.translate_expr(str(char_len_raw), arrays_1d)
+            rhs_py = f"_f_str_assign({rhs_py}, {clen_py})"
         mname = re.match(r"^\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(", lhs, re.I)
         idx_name = None
         idx = None
@@ -1775,6 +1878,7 @@ class basic_f2p:
             self.emit(f"raise RuntimeError({mm.group(1).strip()})")
             return
         if s.lower() == "return":
+            self._emit_save_sync()
             if self._current_result_name:
                 self.emit(f"return {self._current_result_name}")
             else:
@@ -1807,125 +1911,6 @@ class basic_f2p:
             self.emit(f"{name}: Final[{hint}] = {val}")
             names.add(name)
         return names
-
-    def _collect_save_vars(self, sym: dict[str, dict], args: list[str], body_lines: list[tuple[str, str]]) -> list[str]:
-        """Return local variables in a procedure that need Fortran SAVE semantics."""
-        arg_l = {a.lower() for a in args}
-        save_all = False
-        explicit: set[str] = set()
-        implicit: set[str] = set()
-
-        for name, info in sym.items():
-            attrs_l = str(info.get("attrs_l", "")).lower()
-            if name.lower() in arg_l:
-                continue
-            if "save" in attrs_l:
-                explicit.add(name)
-            if info.get("init") is not None:
-                implicit.add(name)
-
-        for code, _comment in body_lines:
-            s = code.strip()
-            if not s:
-                continue
-            m = re.match(r"^save(.*)$", s, re.I)
-            if not m:
-                continue
-            rest = m.group(1).strip()
-            if rest.startswith("::"):
-                rest = rest[2:].strip()
-            if not rest:
-                save_all = True
-                continue
-            for item in split_args(rest):
-                nm = item.strip()
-                if not nm:
-                    continue
-                if nm.lower() in arg_l:
-                    continue
-                if nm in sym:
-                    explicit.add(nm)
-
-        out: list[str] = []
-        for name in sym:
-            if name.lower() in arg_l:
-                continue
-            if save_all or name in explicit or name in implicit:
-                out.append(name)
-        return out
-
-    def _default_init_expr(self, info: dict, arrays_1d: set[str]) -> str:
-        """Return Python expression for a variable's default/declared initial value."""
-        ftype = cast(str, info["ftype"])
-        ftype_name = cast(str | None, info.get("type_name"))
-        is_array = bool(info.get("is_array"))
-        shape = info.get("shape")
-        init = info.get("init")
-        alloc = bool(info.get("alloc"))
-        attrs_l = str(info.get("attrs_l", ""))
-        is_ptr = bool(info.get("pointer")) or ("pointer" in attrs_l)
-        is_tgt = bool(info.get("target")) or ("target" in attrs_l)
-
-        if is_array:
-            if is_ptr:
-                if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
-                    return "None"
-                return self.translate_expr(str(init), arrays_1d)
-            if alloc:
-                return "None"
-            if shape is None or str(shape).strip() == ':':
-                return "None"
-            shape_py = self._shape_to_py(str(shape), arrays_1d)
-            if ftype == "type":
-                return f"np.empty({shape_py}, dtype=object)"
-            dtype = _type_dtype[ftype]
-            if init is None:
-                return f"np.empty({shape_py}, dtype={dtype})"
-            init_py = self.translate_expr(str(init), arrays_1d)
-            return f"np.full({shape_py}, {init_py}, dtype={dtype})"
-
-        if ftype == "type":
-            cls = ftype_name if ftype_name else "SimpleNamespace"
-            if is_ptr:
-                return "None"
-            return f"{cls}()"
-
-        if is_ptr:
-            if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
-                return "None"
-            return self.translate_expr(str(init), arrays_1d)
-
-        if is_tgt and ftype in _type_dtype and ftype != "character":
-            dtype = _type_dtype[ftype]
-            if init is None:
-                default_val = _type_default_scalar_value.get(ftype, "0")
-                return f"np.array({default_val}, dtype={dtype})"
-            init_py = self.translate_expr(str(init), arrays_1d)
-            return f"np.array({init_py}, dtype={dtype})"
-
-        if init is None:
-            return _type_default_scalar_value.get(ftype, "0")
-        return self.translate_expr(str(init), arrays_1d)
-
-    def _emit_save_loads(self, save_state_name: str, save_vars: list[str], sym: dict[str, dict], arrays_1d: set[str]) -> None:
-        for name in save_vars:
-            info = sym[name]
-            init_expr = self._default_init_expr(info, arrays_1d)
-            self.emit(f"if {name!r} not in {save_state_name}:")
-            self.indent += 1
-            self.emit(f"{save_state_name}[{name!r}] = _xf2p_copy_value({init_expr})")
-            self.indent -= 1
-            ftype = cast(str, info["ftype"])
-            type_name = cast(str | None, info.get("type_name"))
-            is_array = bool(info.get("is_array"))
-            hint = self._type_hint(ftype, type_name, is_array=is_array)
-            self.emit(f"{name}: {hint} = _xf2p_copy_value({save_state_name}[{name!r}])")
-
-    def _emit_save_stores(self) -> None:
-        if not self._current_save_state_name:
-            return
-        for name in self._current_save_var_names:
-            self.emit(f"{self._current_save_state_name}[{name!r}] = _xf2p_copy_value({name})")
 
     def emit_var_inits_from_sym(
         self,
@@ -1989,6 +1974,9 @@ class basic_f2p:
                     self.emit(f"{name}: {hint} = np.empty({shape_py}, dtype={dtype})")
                 else:
                     init_py = self.translate_expr(str(init), arrays_1d)
+                    if ftype == "character" and info.get("char_len") is not None:
+                        clen_py = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                        init_py = f"_f_str_assign({init_py}, {clen_py})"
                     self.emit(f"{name}: {hint} = np.full({shape_py}, {init_py}, dtype={dtype})")
                 continue
 
@@ -2028,9 +2016,15 @@ class basic_f2p:
             hint = _type_scalar_hint.get(ftype, "int")
             if init is None:
                 default_val = _type_default_scalar_value.get(ftype, "0")
+                if ftype == "character" and info.get("char_len") is not None:
+                    clen_py = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                    default_val = f"_f_str_assign({default_val}, {clen_py})"
                 self.emit(f"{name}: {hint} = {default_val}")
             else:
                 init_py = self.translate_expr(str(init), arrays_1d)
+                if ftype == "character" and info.get("char_len") is not None:
+                    clen_py = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                    init_py = f"_f_str_assign({init_py}, {clen_py})"
                 self.emit(f"{name}: {hint} = {init_py}")
 
     def _xf2p_select_case_cond(self, select_expr_py: str, raw_case_list: str, arrays_1d: set[str]) -> str:
@@ -2769,13 +2763,8 @@ class basic_f2p:
             self.emit(f"{cname}({', '.join(merged)})")
             return True
 
-        # SAVE statement in procedure declarative part
-        if re.match(r"^save", s, re.I):
-            return True
-
         # return
         if sl == "return":
-            self._emit_save_stores()
             if self._current_result_name:
                 self.emit(f"return {self._current_result_name}")
             else:
@@ -3168,6 +3157,7 @@ class basic_f2p:
                     "attrs_l": attrs_l,
                     "pointer": "pointer" in attrs_l,
                     "target": "target" in attrs_l,
+                    "char_len": self._parse_character_len(s) if ftype == "character" else None,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -3205,14 +3195,12 @@ class basic_f2p:
             else:
                 args_annot.append(f"{a}: {hint}")
 
-        save_vars = self._collect_save_vars(sym, args, main_lines)
-        save_state_name = f"_xf2p_save_{fname}"
-        if save_vars:
-            self.emit(f"{save_state_name} = {{}}")
-            self.emit("")
-
+        save_names = self._collect_save_names(main_lines, sym, args)
+        save_dict_name = f"_{fname}_save"
+        self.emit(f"{save_dict_name} = {{}}")
         self.emit(f"def {fname}({', '.join(args_annot)}) -> {result_hint}:")
         self.indent += 1
+        self._save_stack.append((save_dict_name, save_names))
 
         # If the first non-code lines are comments (just after signature),
         # emit them as a Python docstring.
@@ -3232,13 +3220,6 @@ class basic_f2p:
                 for ln in lead_doc:
                     self.emit(ln)
                 self.emit('"""')
-
-        prev_save_state_name = self._current_save_state_name
-        prev_save_var_names = self._current_save_var_names
-        self._current_save_state_name = save_state_name if save_vars else None
-        self._current_save_var_names = list(save_vars)
-        if save_vars:
-            self._emit_save_loads(save_state_name, save_vars, sym, arrays_1d)
 
         if is_elemental:
             self._elemental_funcs.add(fname.lower())
@@ -3267,7 +3248,8 @@ class basic_f2p:
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
         # allocate/init explicit-shape arrays and scalars
-        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_vars))
+        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_names))
+        self._emit_save_restore(save_dict_name, save_names, sym, arrays_1d)
         # initialize derived-type/component bases that appear as name%field
         comp_bases: set[str] = set()
         for code, _comment in main_lines:
@@ -3287,6 +3269,7 @@ class basic_f2p:
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
         self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
         self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
+        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
 
         # exec pass
         prev_result_name = self._current_result_name
@@ -3303,11 +3286,11 @@ class basic_f2p:
             self.handle_exec_line(s, arrays_1d)
 
         # basic default return (safe)
-        self._emit_save_stores()
+        self._emit_save_sync()
         self.emit(f"return {result_name}")
         self._current_result_name = prev_result_name
-        self._current_save_state_name = prev_save_state_name
-        self._current_save_var_names = prev_save_var_names
+        if self._save_stack:
+            self._save_stack.pop()
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
@@ -3340,6 +3323,7 @@ class basic_f2p:
                     "attrs_l": attrs_l,
                     "pointer": "pointer" in attrs_l,
                     "target": "target" in attrs_l,
+                    "char_len": self._parse_character_len(s) if ftype == "character" else None,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -3364,6 +3348,7 @@ class basic_f2p:
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
         self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
         self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
+        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
 
         # exec statements
         for code, comment in body_lines:
@@ -3438,6 +3423,7 @@ class basic_f2p:
                     "attrs_l": attrs_l,
                     "pointer": "pointer" in attrs_l,
                     "target": "target" in attrs_l,
+                    "char_len": self._parse_character_len(s) if ftype == "character" else None,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -3615,6 +3601,7 @@ class basic_f2p:
                     "attrs_l": attrs_l,
                     "pointer": "pointer" in attrs_l,
                     "target": "target" in attrs_l,
+                    "char_len": self._parse_character_len(s) if ftype == "character" else None,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -3635,11 +3622,6 @@ class basic_f2p:
                 args_annot.append(f"{a}: {hint} = None")
             else:
                 args_annot.append(f"{a}: {hint}")
-        save_vars = self._collect_save_vars(sym, args, main_lines)
-        save_state_name = f"_xf2p_save_{sname}"
-        if save_vars:
-            self.emit(f"{save_state_name} = {{}}")
-            self.emit("")
         out_formals: list[str] = []
         pure_out_formals: list[str] = []
         vector_formals: list[str] = []
@@ -3659,15 +3641,12 @@ class basic_f2p:
                 vector_formals.append(a)
         self._subr_sigs[sname.lower()] = {"args": list(args), "out": list(out_formals)}
 
+        save_names = self._collect_save_names(main_lines, sym, args)
+        save_dict_name = f"_{sname}_save"
+        self.emit(f"{save_dict_name} = {{}}")
         self.emit(f"def {sname}({', '.join(args_annot)}):")
         self.indent += 1
-
-        prev_save_state_name = self._current_save_state_name
-        prev_save_var_names = self._current_save_var_names
-        self._current_save_state_name = save_state_name if save_vars else None
-        self._current_save_var_names = list(save_vars)
-        if save_vars:
-            self._emit_save_loads(save_state_name, save_vars, sym, arrays_1d)
+        self._save_stack.append((save_dict_name, save_names))
 
         for kind, header, ibody in internals:
             if kind == "function":
@@ -3703,11 +3682,13 @@ class basic_f2p:
             if "parameter" in attrs_l:
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
-        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_vars))
+        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_names))
+        self._emit_save_restore(save_dict_name, save_names, sym, arrays_1d)
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
         self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
         self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
+        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
 
         for code, comment in main_lines:
             s = code.strip()
@@ -3718,15 +3699,15 @@ class basic_f2p:
                 continue
             self.handle_exec_line(s, arrays_1d)
 
-        self._emit_save_stores()
+        self._emit_save_sync()
         if out_formals:
             if len(out_formals) == 1:
                 self.emit(f"return {out_formals[0]}")
             else:
                 self.emit("return " + ", ".join(out_formals))
 
-        self._current_save_state_name = prev_save_state_name
-        self._current_save_var_names = prev_save_var_names
+        if self._save_stack:
+            self._save_stack.pop()
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
