@@ -1,4 +1,5 @@
 import re
+import ast
 import sys
 import argparse
 import subprocess
@@ -1911,7 +1912,12 @@ class basic_f2p:
                                 stop = f"int({hi_py})" if hi_py else ""
                                 out.append(f"{name}[{start}:{stop}]")
                             else:
-                                out.append(f"{name}({inner_py})")
+                                arg_parts = split_args(inner)
+                                if len(arg_parts) > 1:
+                                    args_joined = ", ".join(self.translate_expr(p.strip(), arrays_1d) for p in arg_parts)
+                                    out.append(f"{name}({args_joined})")
+                                else:
+                                    out.append(f"{name}({inner_py})")
                         i = pclose + 1
                         continue
                 root = name.split(".", 1)[0].lower()
@@ -1924,6 +1930,112 @@ class basic_f2p:
             return "".join(out)
 
         s = _convert_refs(s)
+
+        def _expr_kind(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, bool):
+                    return "logical"
+                if isinstance(node.value, int):
+                    return "integer"
+                if isinstance(node.value, float):
+                    return "real"
+                if isinstance(node.value, complex):
+                    return "complex"
+                if isinstance(node.value, str):
+                    return "character"
+                return None
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+                return _expr_kind(node.operand)
+            if isinstance(node, ast.Name):
+                return self._decl_types.get(node.id.lower())
+            if isinstance(node, ast.List):
+                if not node.elts:
+                    return "real"
+                kinds = {_expr_kind(elt) for elt in node.elts}
+                kinds.discard(None)
+                if not kinds:
+                    return None
+                if "character" in kinds:
+                    return "character"
+                if "complex" in kinds:
+                    return "complex"
+                if "real" in kinds:
+                    return "real"
+                if "integer" in kinds:
+                    return "integer"
+                if "logical" in kinds:
+                    return "logical"
+                return None
+            if isinstance(node, ast.Call):
+                fname = None
+                if isinstance(node.func, ast.Name):
+                    fname = node.func.id
+                elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                    fname = f"{node.func.value.id}.{node.func.attr}"
+                if fname in {"int", "_f_len", "_f_len_trim", "_xf2p_mod", "_xf2p_modulo", "_xf2p_div"}:
+                    return "integer"
+                if fname in {"float", "_xf2p_real", "np.float64", "np.sqrt", "np.log", "np.exp", "np.sin", "np.cos", "np.arccos", "np.arcsin", "np.arctan", "np.degrees", "np.radians"}:
+                    return "real"
+                if fname in {"complex", "_xf2p_cmplx", "_xf2p_conjg", "np.conj"}:
+                    return "complex"
+                if fname == "_xf2p_concat":
+                    return "character"
+                if fname == "np.asarray":
+                    for kw in node.keywords:
+                        if kw.arg == "dtype":
+                            if isinstance(kw.value, ast.Name):
+                                if kw.value.id == "int":
+                                    return "integer"
+                                if kw.value.id == "bool":
+                                    return "logical"
+                                if kw.value.id == "object":
+                                    return "character"
+                            if isinstance(kw.value, ast.Attribute) and isinstance(kw.value.value, ast.Name) and kw.value.value.id == "np":
+                                if kw.value.attr in {"float64", "float32"}:
+                                    return "real"
+                                if kw.value.attr in {"complex128", "complex64"}:
+                                    return "complex"
+                    return None
+            return None
+
+        class _ExprFixer(ast.NodeTransformer):
+            def visit_List(self, node: ast.List):
+                self.generic_visit(node)
+                kind = _expr_kind(node)
+                if kind is None:
+                    return node
+                dtype_map = {
+                    "integer": "int",
+                    "real": "np.float64",
+                    "logical": "bool",
+                    "complex": "np.complex128",
+                    "character": "object",
+                }
+                dtype_expr = ast.parse(dtype_map[kind], mode="eval").body
+                return ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="asarray", ctx=ast.Load()),
+                    args=[node],
+                    keywords=[ast.keyword(arg="dtype", value=dtype_expr)],
+                )
+
+            def visit_BinOp(self, node: ast.BinOp):
+                self.generic_visit(node)
+                if isinstance(node.op, ast.Div):
+                    if _expr_kind(node.left) == "integer" and _expr_kind(node.right) == "integer":
+                        return ast.Call(
+                            func=ast.Name(id="_xf2p_div", ctx=ast.Load()),
+                            args=[node.left, node.right],
+                            keywords=[],
+                        )
+                return node
+
+        try:
+            tree = ast.parse(s, mode="eval")
+            tree = _ExprFixer().visit(tree)
+            ast.fix_missing_locations(tree)
+            s = ast.unparse(tree)
+        except Exception:
+            pass
         return s
 
     def transpile_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> None:
@@ -4027,6 +4139,27 @@ class basic_f2p:
         self.emit("return np.vectorize(lambda y: str(aa) + str(y), otypes=[object])(bb)")
         self.indent -= 1
         self.emit("return str(aa) + str(bb)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_div(a, b):")
+        self.indent += 1
+        self.emit('"""Fortran division with integer truncation and scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(a) or _xf2p_is_arraylike(b):")
+        self.indent += 1
+        self.emit("aa = np.asarray(a)")
+        self.emit("bb = np.asarray(b)")
+        self.emit("if np.issubdtype(aa.dtype, np.integer) and np.issubdtype(bb.dtype, np.integer):")
+        self.indent += 1
+        self.emit("rr = np.trunc(aa / bb)")
+        self.emit("return np.asarray(np.rint(rr), dtype=np.result_type(aa.dtype, bb.dtype))")
+        self.indent -= 1
+        self.emit("return aa / bb")
+        self.indent -= 1
+        self.emit("if isinstance(a, (int, np.integer)) and isinstance(b, (int, np.integer)) and not isinstance(a, (bool, np.bool_)) and not isinstance(b, (bool, np.bool_)):")
+        self.indent += 1
+        self.emit("return int(np.trunc(a / b))")
+        self.indent -= 1
+        self.emit("return a / b")
         self.indent -= 1
         self.emit("")
         self.emit("def _xf2p_mod(a, p):")
