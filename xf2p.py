@@ -971,7 +971,8 @@ class basic_f2p:
         self._associate_stack: list[dict[str, object]] = []
         self._where_stack: list[dict[str, str]] = []
         self._forall_stack: list[int] = []
-        self._do_stack: list[int] = []
+        self._do_stack: list[dict[str, object] | int] = []
+        self._loop_counter = 0
         self._seen_scipy_special = False
         self._elemental_funcs: set[str] = set()
 
@@ -1612,6 +1613,7 @@ class basic_f2p:
                 "tanpi",
                 "trim",
                 "len_trim",
+                "new_line",
                 "adjustl",
                 "real",
                 "int",
@@ -1623,6 +1625,8 @@ class basic_f2p:
                 return f"str({args_py[0]}).rstrip()"
             if lname == "len_trim" and len(args_py) == 1:
                 return f"_f_len_trim({args_py[0]})"
+            if lname == "new_line" and len(args_py) == 1:
+                return repr("\n")
             if lname == "adjustl" and len(args_py) == 1:
                 return f"_f_adjustl({args_py[0]})"
             if lname == "real":
@@ -2532,18 +2536,42 @@ class basic_f2p:
             if len(parts) in (2, 3):
                 a = self.translate_expr(parts[0], arrays_1d)
                 b = self.translate_expr(parts[1], arrays_1d)
+                self._loop_counter += 1
+                loop_id = self._loop_counter
+                lo_tmp = f"_xf2p_do_lo_{loop_id}"
+                hi_tmp = f"_xf2p_do_hi_{loop_id}"
+                step_tmp = f"_xf2p_do_step_{loop_id}"
+                stop_tmp = f"_xf2p_do_stop_{loop_id}"
+                self.emit(f"{lo_tmp} = {a}")
+                self.emit(f"{hi_tmp} = {b}")
                 if len(parts) == 2:
-                    self.emit(f"for {var} in range({a}, ({b}) + 1):")
+                    self.emit(f"{step_tmp} = 1")
                 else:
                     step_py = self.translate_expr(parts[2], arrays_1d)
-                    self.emit(f"for {var} in range({a}, ({b}) + (1 if ({step_py}) > 0 else -1), {step_py}):")
+                    self.emit(f"{step_tmp} = {step_py}")
+                self.emit(f"{stop_tmp} = {hi_tmp} + (1 if {step_tmp} > 0 else -1)")
+                self.emit(f"for {var} in range({lo_tmp}, {stop_tmp}, {step_tmp}):")
                 self.indent += 1
                 self._block_code_start.append(self._code_emit_count)
-                self._do_stack.append(1)
+                self._do_stack.append({"kind": "fortran_do", "levels": 1, "post_assign": f"{var} = {hi_tmp} + {step_tmp}"})
                 return True
 
         if re.match(r"end\s+do(?:\s+[a-z_]\w*)?$", s, re.I):
-            levels = self._do_stack.pop() if self._do_stack else 1
+            entry = self._do_stack.pop() if self._do_stack else 1
+            if isinstance(entry, dict) and entry.get("kind") == "fortran_do":
+                if self._block_code_start:
+                    start = self._block_code_start.pop()
+                    if self._code_emit_count == start:
+                        self.emit("pass")
+                self.indent = max(0, self.indent - 1)
+                post_assign = str(entry.get("post_assign", ""))
+                if post_assign:
+                    self.emit("else:")
+                    self.indent += 1
+                    self.emit(post_assign)
+                    self.indent = max(0, self.indent - 1)
+                return True
+            levels = int(entry.get("levels", 1)) if isinstance(entry, dict) else int(entry)
             for _ in range(levels):
                 if self._block_code_start:
                     start = self._block_code_start.pop()
