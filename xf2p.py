@@ -744,6 +744,13 @@ _type_ndarray_hint = {
     "character": "npt.NDArray[object]",
 }
 
+_type_target_scalar_hint = {
+    "integer": "npt.NDArray[np.int_]",
+    "real": "npt.NDArray[np.float64]",
+    "logical": "npt.NDArray[np.bool_]",
+    "complex": "npt.NDArray[np.complex128]",
+}
+
 _LOCAL_RUNTIME_HELPERS = {
     "_f_size",
     "_f_spread",
@@ -795,17 +802,64 @@ def parse_decl_attr_dimension(attrs: str) -> str | None:
 
 def parse_decl_items(rest: str, default_shape: str | None = None):
     items = []
+
+    def _split_init(part: str):
+        """Split a declaration item into (lhs, init, op).
+
+        Fortran allows both normal initialization ("=") and pointer
+        initialization ("=>") in declaration lists.
+
+        We must treat "=>" as a single token (not as "=" + ">") so that
+        pointer initializers don't leak stray ">" characters into Python.
+        """
+        in_str = False
+        quote = ""
+        pdepth = 0
+        bdepth = 0
+        i = 0
+        n = len(part)
+        while i < n:
+            ch = part[i]
+            if in_str:
+                if ch == quote:
+                    in_str = False
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                in_str = True
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                pdepth += 1
+                i += 1
+                continue
+            if ch == ")":
+                pdepth = max(0, pdepth - 1)
+                i += 1
+                continue
+            if ch == "[":
+                bdepth += 1
+                i += 1
+                continue
+            if ch == "]":
+                bdepth = max(0, bdepth - 1)
+                i += 1
+                continue
+            if pdepth == 0 and bdepth == 0:
+                if part.startswith("=>", i):
+                    return part[:i].strip(), part[i + 2 :].strip(), "=>"
+                if ch == "=":
+                    return part[:i].strip(), part[i + 1 :].strip(), "="
+            i += 1
+        return part.strip(), None, None
+
     for part in split_args(rest):
         part = part.strip()
         if not part:
             continue
-        init = None
-        if "=" in part:
-            left, init = part.split("=", 1)
-            left = left.strip()
-            init = init.strip()
-        else:
-            left = part.strip()
+
+        left, init, _op = _split_init(part)
 
         shape = None
         mm = re.match(r"^([a-z_]\w*)\s*\(\s*(.+)\s*\)\s*$", left, re.I)
@@ -817,6 +871,7 @@ def parse_decl_items(rest: str, default_shape: str | None = None):
             shape = default_shape
 
         items.append((name, shape, init))
+
     return items
 
 
@@ -829,6 +884,8 @@ class basic_f2p:
         self._block_code_start: list[int] = []
         self._decl_types: dict[str, str] = {}
         self._decl_array_types: dict[str, str] = {}
+        self._decl_pointer: set[str] = set()
+        self._decl_target: set[str] = set()
         self._subr_sigs: dict[str, dict[str, list[str]]] = {}
         self._current_result_name: str | None = None
         self._derived_types: set[str] = set()
@@ -1055,7 +1112,7 @@ class basic_f2p:
                 had_field = True
                 cmt = f"  # {comment.strip()}" if comment.strip() else ""
                 if shape is not None:
-                    if "allocatable" in attrs_l:
+                    if "allocatable" in attrs_l or "pointer" in attrs_l:
                         self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} | None = None{cmt}")
                         continue
                     shape_py = self._shape_to_py(shape, set())
@@ -1065,7 +1122,7 @@ class basic_f2p:
                         dtype = _type_dtype[ftype]
                         self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} = field(default_factory=lambda: np.empty({shape_py}, dtype={dtype})){cmt}")
                     continue
-                if "allocatable" in attrs_l:
+                if "allocatable" in attrs_l or "pointer" in attrs_l:
                     self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=False)} | None = None{cmt}")
                     continue
                 if ftype == "type":
@@ -1273,6 +1330,8 @@ class basic_f2p:
         )
         s = re.sub(r"\ballocated\s*\(\s*([^)]+?)\s*\)", r"(\1 is not None)", s, flags=re.I)
         s = re.sub(r"\bpresent\s*\(\s*([a-z_]\w*)\s*\)", r"(\1 is not None)", s, flags=re.I)
+        s = re.sub(r"\bassociated\s*\(\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\)", r"(\1 is not None)", s, flags=re.I)
+        s = re.sub(r"\bnull\s*\(\s*\)", "None", s, flags=re.I)
         s = re.sub(r"\btiny\s*\(\s*[^)]*\)", "np.finfo(float).tiny", s, flags=re.I)
         s = re.sub(r"\bhuge\s*\(\s*[^)]*\)", "np.finfo(float).max", s, flags=re.I)
         s = s.replace("np.np.", "np.")
@@ -1593,9 +1652,19 @@ class basic_f2p:
                     idx_py = self.translate_expr(idx, arrays_1d)
                     self.emit(f"{name}[({idx_py}) - 1] = {rhs_py}")
                 return
+        # Whole-array assignment or scalar assignment.
+        # POINTER and TARGET entities need in-place updates to preserve aliasing.
         if lhs in arrays_1d:
-            self.emit(f"{lhs} = _f_assign_array({lhs}, {rhs_py})")
+            if re.fullmatch(r"[A-Za-z_]\w*", lhs) and (lhs.lower() in self._decl_pointer or lhs.lower() in self._decl_target):
+                self.emit(f"{lhs}[...] = {rhs_py}")
+            else:
+                self.emit(f"{lhs} = _f_assign_array({lhs}, {rhs_py})")
             return
+
+        if re.fullmatch(r"[A-Za-z_]\w*", lhs) and (lhs.lower() in self._decl_pointer or lhs.lower() in self._decl_target):
+            self.emit(f"{lhs}[...] = {rhs_py}")
+            return
+
         self.emit(f"{lhs} = _xf2p_copy_value({rhs_py})")
 
     def transpile_simple_stmt(self, stmt: str, arrays_1d: set[str]) -> None:
@@ -1647,7 +1716,10 @@ class basic_f2p:
         parameter_names: set[str],
         skip_names: set[str] | None = None,
     ) -> None:
-        # allocate explicit-shape arrays and initialize scalars so python is always valid
+        # Allocate explicit-shape arrays and initialize scalars so Python is always valid.
+        # Special handling:
+        #   * POINTER entities start disassociated (None) unless initialized with => target.
+        #   * TARGET scalars are represented as 0-d numpy arrays so pointers can alias them.
         if skip_names is None:
             skip_names = set()
         for name, info in sym.items():
@@ -1655,47 +1727,93 @@ class basic_f2p:
                 continue
             if name in skip_names:
                 continue
+
             ftype = info["ftype"]
             ftype_name = info.get("type_name")
-            is_array = info["is_array"]
-            shape = info["shape"]
-            init = info["init"]
-            alloc = info["alloc"]
+            is_array = bool(info.get("is_array"))
+            shape = info.get("shape")
+            init = info.get("init")
+            alloc = bool(info.get("alloc"))
+            attrs_l = str(info.get("attrs_l", ""))
+            is_ptr = bool(info.get("pointer")) or ("pointer" in attrs_l)
+            is_tgt = bool(info.get("target")) or ("target" in attrs_l)
 
+            # Arrays
             if is_array:
-                # only allocate explicit-shape, non-allocatable arrays
+                # Pointer arrays: start disassociated (None) unless explicitly initialized.
+                if is_ptr:
+                    if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
+                        self.emit(f"{name} = None")
+                    else:
+                        init_py = self.translate_expr(str(init), arrays_1d)
+                        self.emit(f"{name} = {init_py}")
+                    continue
+
+                # Allocatable arrays start unallocated.
                 if alloc:
                     self.emit(f"{name} = None")
                     continue
+
+                # Only allocate explicit-shape, non-allocatable arrays here.
                 if shape is None:
                     continue
-                if shape.strip() == ":":
+                if str(shape).strip() == ":":
                     continue
+
+                shape_py = self._shape_to_py(str(shape), arrays_1d)
                 if ftype == "type":
-                    shape_py = self._shape_to_py(shape, arrays_1d)
                     self.emit(f"{name} = np.empty({shape_py}, dtype=object)")
                     continue
+
                 dtype = _type_dtype[ftype]
-                shape_py = self._shape_to_py(shape, arrays_1d)
                 hint = _type_ndarray_hint[ftype]
                 if init is None:
                     self.emit(f"{name}: {hint} = np.empty({shape_py}, dtype={dtype})")
                 else:
-                    init_py = self.translate_expr(init, arrays_1d)
+                    init_py = self.translate_expr(str(init), arrays_1d)
                     self.emit(f"{name}: {hint} = np.full({shape_py}, {init_py}, dtype={dtype})")
-            else:
-                # scalar
-                if ftype == "type":
-                    cls = ftype_name if ftype_name else "SimpleNamespace"
+                continue
+
+            # Scalars
+            if ftype == "type":
+                # Derived-type scalars.
+                cls = ftype_name if ftype_name else "SimpleNamespace"
+                if is_ptr:
+                    # Pointer-to-derived-type starts disassociated.
+                    self.emit(f"{name} = None")
+                else:
                     self.emit(f"{name} = {cls}()")
-                    continue
-                hint = _type_scalar_hint.get(ftype, "int")
+                continue
+
+            # Pointer scalars start disassociated unless explicitly initialized.
+            if is_ptr:
+                if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
+                    self.emit(f"{name} = None")
+                else:
+                    init_py = self.translate_expr(str(init), arrays_1d)
+                    self.emit(f"{name} = {init_py}")
+                continue
+
+            # Target scalars are stored as 0-d numpy arrays for aliasing.
+            if is_tgt and ftype in _type_dtype and ftype != "character":
+                dtype = _type_dtype[ftype]
+                hint = _type_target_scalar_hint.get(ftype, "np.ndarray")
                 if init is None:
                     default_val = _type_default_scalar_value.get(ftype, "0")
-                    self.emit(f"{name}: {hint} = {default_val}")
+                    self.emit(f"{name}: {hint} = np.array({default_val}, dtype={dtype})")
                 else:
-                    init_py = self.translate_expr(init, arrays_1d)
-                    self.emit(f"{name}: {hint} = {init_py}")
+                    init_py = self.translate_expr(str(init), arrays_1d)
+                    self.emit(f"{name}: {hint} = np.array({init_py}, dtype={dtype})")
+                continue
+
+            # Regular (non-target) scalars.
+            hint = _type_scalar_hint.get(ftype, "int")
+            if init is None:
+                default_val = _type_default_scalar_value.get(ftype, "0")
+                self.emit(f"{name}: {hint} = {default_val}")
+            else:
+                init_py = self.translate_expr(str(init), arrays_1d)
+                self.emit(f"{name}: {hint} = {init_py}")
 
     def _xf2p_select_case_cond(self, select_expr_py: str, raw_case_list: str, arrays_1d: set[str]) -> str:
         conds: list[str] = []
@@ -2081,6 +2199,50 @@ class basic_f2p:
             self.emit(f"raise RuntimeError({msg})")
             return True
 
+        # pointer association: p => target_expr
+        mm = re.match(r"^([a-z_]\w*(?:%[a-z_]\w*)*)\s*=>\s*(.+)$", s, re.I)
+        if mm:
+            lhs = mm.group(1).replace("%", ".")
+            rhs_raw = mm.group(2).strip()
+            if re.match(r"^null\s*\(\s*\)\s*$", rhs_raw, re.I):
+                self.emit(f"{lhs} = None")
+            else:
+                # If associating to an array element (no ':' sections), create a 0-d view
+                # so that scalar pointers can update the underlying array storage.
+                rhs_py = None
+                mm_el = re.match(r"^([a-z_]\w*)\s*\(\s*(.*?)\s*\)\s*$", rhs_raw, re.I)
+                if mm_el and (":" not in mm_el.group(2)) and (mm_el.group(1).lower() in self._decl_array_types):
+                    base = mm_el.group(1)
+                    idx_txt = mm_el.group(2)
+                    idx_parts = [p.strip() for p in split_args(idx_txt)]
+                    py_slices = []
+                    for p in idx_parts:
+                        p_py = self.translate_expr(p, arrays_1d)
+                        py_slices.append(f"(int({p_py}) - 1):int({p_py})")
+                    rhs_py = f"{base}[{', '.join(py_slices)}].reshape(())"
+                if rhs_py is None:
+                    rhs_py = self.translate_expr(rhs_raw, arrays_1d)
+                self.emit(f"{lhs} = {rhs_py}")
+            return True
+
+        # nullify(p1, p2, ...)
+        mm = re.match(r"nullify\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            for a in split_args(mm.group(1)):
+                nm = a.strip().replace("%", ".")
+                if nm:
+                    self.emit(f"{nm} = None")
+            return True
+
+        # deallocate(p) / deallocate(a) -- model as None
+        mm = re.match(r"deallocate\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            for a in split_args(mm.group(1)):
+                nm = a.strip().replace("%", ".")
+                if nm:
+                    self.emit(f"{nm} = None")
+            return True
+
         # print *, ...
         mm = re.match(r"print\s*\*\s*,\s*(.+)$", s, re.I)
         if mm:
@@ -2103,7 +2265,16 @@ class basic_f2p:
                     if implied_py is not None:
                         args2.append(f"*{implied_py}")
                     else:
-                        args2.append(self.translate_expr(a, arrays_1d))
+                        # Expand array-valued args in list-directed output (Fortran prints elements).
+                        is_iterable = _is_recyclable_io_iterable(a, self._decl_array_types)
+                        mm_sec = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", a, re.I)
+                        if (not is_iterable) and mm_sec and (mm_sec.group(1).lower() in self._decl_array_types) and (":" in mm_sec.group(2)):
+                            is_iterable = True
+                        if is_iterable:
+                            a_py = self.translate_expr(a, arrays_1d)
+                            args2.append(f"*np.ravel(np.asarray({a_py}), order='F')")
+                        else:
+                            args2.append(self.translate_expr(a, arrays_1d))
             self.emit(f"print({', '.join(args2)})")
             return True
 
@@ -2173,7 +2344,16 @@ class basic_f2p:
                     if implied_py is not None:
                         args2.append(f"*{implied_py}")
                     else:
-                        args2.append(self.translate_expr(a, arrays_1d))
+                        # Expand array-valued args in list-directed output (Fortran prints elements).
+                        is_iterable = _is_recyclable_io_iterable(a, self._decl_array_types)
+                        mm_sec = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", a, re.I)
+                        if (not is_iterable) and mm_sec and (mm_sec.group(1).lower() in self._decl_array_types) and (":" in mm_sec.group(2)):
+                            is_iterable = True
+                        if is_iterable:
+                            a_py = self.translate_expr(a, arrays_1d)
+                            args2.append(f"*np.ravel(np.asarray({a_py}), order='F')")
+                        else:
+                            args2.append(self.translate_expr(a, arrays_1d))
             self.emit(f"print({', '.join(args2)})")
             return True
 
@@ -2200,7 +2380,16 @@ class basic_f2p:
                     if implied_py is not None:
                         args2.append(f"*{implied_py}")
                     else:
-                        args2.append(self.translate_expr(a, arrays_1d))
+                        # Expand array-valued args in list-directed output (Fortran prints elements).
+                        is_iterable = _is_recyclable_io_iterable(a, self._decl_array_types)
+                        mm_sec = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", a, re.I)
+                        if (not is_iterable) and mm_sec and (mm_sec.group(1).lower() in self._decl_array_types) and (":" in mm_sec.group(2)):
+                            is_iterable = True
+                        if is_iterable:
+                            a_py = self.translate_expr(a, arrays_1d)
+                            args2.append(f"*np.ravel(np.asarray({a_py}), order='F')")
+                        else:
+                            args2.append(self.translate_expr(a, arrays_1d))
             self.emit(f"print({', '.join(args2)}, file={unit})")
             return True
 
@@ -2317,7 +2506,16 @@ class basic_f2p:
                     if a.startswith(("'", '"')):
                         args2.append(a)
                     else:
-                        args2.append(self.translate_expr(a, arrays_1d))
+                        # Expand array-valued args in list-directed output (Fortran prints elements).
+                        is_iterable = _is_recyclable_io_iterable(a, self._decl_array_types)
+                        mm_sec = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", a, re.I)
+                        if (not is_iterable) and mm_sec and (mm_sec.group(1).lower() in self._decl_array_types) and (":" in mm_sec.group(2)):
+                            is_iterable = True
+                        if is_iterable:
+                            a_py = self.translate_expr(a, arrays_1d)
+                            args2.append(f"*np.ravel(np.asarray({a_py}), order='F')")
+                        else:
+                            args2.append(self.translate_expr(a, arrays_1d))
             end_txt = ', end=""' if "advance" in ctl and "'no'" in ctl else ""
             file_txt = ""
             if unit_expr != "*":
@@ -2352,9 +2550,11 @@ class basic_f2p:
             lhs, rhs = s.split("=", 1)
             lhs = lhs.strip()
             rhs_py = self.translate_expr(rhs, arrays_1d)
-            if lhs in arrays_1d:
-                self.emit(f"{lhs} = _f_assign_array({lhs}, {rhs_py})")
+            # Boolean scalar to whole array (common pattern)
+            if lhs in arrays_1d and rhs_py in ("True", "False"):
+                self.emit(f"{lhs}[:] = {rhs_py}")
                 return True
+            # Defer to transpile_assignment so POINTER/TARGET aliasing is preserved.
             self.transpile_assignment(lhs, rhs_py, arrays_1d)
             return True
 
@@ -2420,6 +2620,8 @@ class basic_f2p:
                     "init": init,
                     "alloc": is_alloc,
                     "attrs_l": attrs_l,
+                    "pointer": "pointer" in attrs_l,
+                    "target": "target" in attrs_l,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -2515,6 +2717,8 @@ class basic_f2p:
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
+        self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
+        self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
 
         # exec pass
         prev_result_name = self._current_result_name
@@ -2563,6 +2767,8 @@ class basic_f2p:
                     "init": init,
                     "alloc": is_alloc,
                     "attrs_l": attrs_l,
+                    "pointer": "pointer" in attrs_l,
+                    "target": "target" in attrs_l,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -2585,6 +2791,8 @@ class basic_f2p:
         self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names)
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
+        self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
+        self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
 
         # exec statements
         for code, comment in body_lines:
@@ -2657,6 +2865,8 @@ class basic_f2p:
                     "init": init,
                     "alloc": is_alloc,
                     "attrs_l": attrs_l,
+                    "pointer": "pointer" in attrs_l,
+                    "target": "target" in attrs_l,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -2831,6 +3041,8 @@ class basic_f2p:
                     "init": init,
                     "alloc": is_alloc,
                     "attrs_l": attrs_l,
+                    "pointer": "pointer" in attrs_l,
+                    "target": "target" in attrs_l,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -2884,6 +3096,8 @@ class basic_f2p:
         self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args))
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
+        self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
+        self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
 
         for code, comment in main_lines:
             s = code.strip()
