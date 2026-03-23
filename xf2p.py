@@ -969,6 +969,7 @@ class basic_f2p:
         self._associate_stack: list[dict[str, object]] = []
         self._where_stack: list[dict[str, str]] = []
         self._forall_stack: list[int] = []
+        self._do_stack: list[int] = []
         self._seen_scipy_special = False
         self._elemental_funcs: set[str] = set()
 
@@ -2253,6 +2254,17 @@ class basic_f2p:
                 if p1 != -1:
                     pforall = (p0, p1)
 
+        pdo_concurrent = None
+        mm = re.match(r"(?:[a-z_]\w*\s*:\s*)?do\s+concurrent", s, re.I)
+        if mm:
+            p0 = mm.end()
+            while p0 < len(s) and s[p0].isspace():
+                p0 += 1
+            if p0 < len(s) and s[p0] == "(":
+                p1 = find_matching_paren(s, p0)
+                if p1 != -1:
+                    pdo_concurrent = (p0, p1)
+
         # ignore some non-exec lines
         if sl in ("implicit none", "contains"):
             return True
@@ -2315,6 +2327,18 @@ class basic_f2p:
                 self._emit_forall_block_end(levels)
             else:
                 self._forall_stack.append(levels)
+            return True
+
+        if pdo_concurrent is not None:
+            p0, p1 = pdo_concurrent
+            header_raw = s[p0 + 1 : p1].strip()
+            tail = s[p1 + 1 :].strip()
+            levels = self._emit_forall_block_start(header_raw, arrays_1d)
+            if tail:
+                self.transpile_simple_stmt(tail, arrays_1d)
+                self._emit_forall_block_end(levels)
+            else:
+                self._do_stack.append(levels)
             return True
 
         mm = re.match(r"select\s+case\s*\(\s*(.+)\s*\)\s*$", s, re.I)
@@ -2381,6 +2405,7 @@ class basic_f2p:
             self.emit(f"while {cond}:")
             self.indent += 1
             self._block_code_start.append(self._code_emit_count)
+            self._do_stack.append(1)
             return True
 
         # [label:] do i = a, b[, step]
@@ -2399,14 +2424,17 @@ class basic_f2p:
                     self.emit(f"for {var} in range({a}, ({b}) + (1 if ({step_py}) > 0 else -1), {step_py}):")
                 self.indent += 1
                 self._block_code_start.append(self._code_emit_count)
+                self._do_stack.append(1)
                 return True
 
         if re.match(r"end\s+do(?:\s+[a-z_]\w*)?$", s, re.I):
-            if self._block_code_start:
-                start = self._block_code_start.pop()
-                if self._code_emit_count == start:
-                    self.emit("pass")
-            self.indent = max(0, self.indent - 1)
+            levels = self._do_stack.pop() if self._do_stack else 1
+            for _ in range(levels):
+                if self._block_code_start:
+                    start = self._block_code_start.pop()
+                    if self._code_emit_count == start:
+                        self.emit("pass")
+                self.indent = max(0, self.indent - 1)
             return True
 
         # allocate(a(n))
