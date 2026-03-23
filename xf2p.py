@@ -3166,6 +3166,12 @@ class basic_f2p:
                     self.emit(f"{nm} = None")
             return True
 
+        # print *
+        mm = re.match(r"print\s*\*\s*$", s, re.I)
+        if mm:
+            self.emit("print()")
+            return True
+
         # print *, ...
         mm = re.match(r"print\s*\*\s*,\s*(.+)$", s, re.I)
         if mm:
@@ -3234,6 +3240,12 @@ class basic_f2p:
                 self.emit(f"print({fmt_expr})")
             else:
                 self.emit(f"print({', '.join(args2)})")
+            return True
+
+        # write(*,*)
+        mm = re.match(r"write\s*\(\s*\*\s*,\s*\*\s*\)\s*$", s, re.I)
+        if mm:
+            self.emit("print()")
             return True
 
         # write(*,*) ...
