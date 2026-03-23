@@ -912,6 +912,7 @@ class basic_f2p:
         self._derived_types: set[str] = set()
         self._select_case_stack: list[dict[str, object]] = []
         self._associate_stack: list[dict[str, object]] = []
+        self._where_stack: list[dict[str, str]] = []
         self._seen_scipy_special = False
         self._elemental_funcs: set[str] = set()
 
@@ -1637,6 +1638,8 @@ class basic_f2p:
         return s
 
     def transpile_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> None:
+        if self._where_masked_assignment(lhs, rhs_py, arrays_1d):
+            return
         lhs = lhs.replace("%", ".")
         lhs_base = lhs.split(".", 1)[0].strip().lower()
         if self._decl_types.get(lhs_base) == "integer":
@@ -2012,8 +2015,126 @@ class basic_f2p:
             self.emit("pass")
         self.indent = max(0, self.indent - 1)
 
+    def _where_parent_mask_expr(self) -> str | None:
+        if len(self._where_stack) <= 1:
+            return None
+        parts = [frame["active"] for frame in self._where_stack[:-1]]
+        if not parts:
+            return None
+        return " & ".join(f"({p})" for p in parts)
+
+    def _where_current_mask_expr(self) -> str | None:
+        if not self._where_stack:
+            return None
+        parts = [frame["active"] for frame in self._where_stack]
+        return " & ".join(f"({p})" for p in parts)
+
+    def _start_where_block(self, cond_raw: str, arrays_1d: set[str]) -> None:
+        cond_py = self.translate_expr(cond_raw, arrays_1d)
+        tag = f"{len(self._where_stack) + 1}_{self._code_emit_count + 1}"
+        active_name = f"_xf2p_where_mask_{tag}"
+        matched_name = f"_xf2p_where_matched_{tag}"
+        outer = self._where_current_mask_expr()
+        if outer is None:
+            active_expr = f"np.asarray({cond_py}, dtype=bool)"
+        else:
+            active_expr = f"(np.asarray({outer}, dtype=bool) & np.asarray({cond_py}, dtype=bool))"
+        self.emit(f"{active_name} = np.asarray({active_expr}, dtype=bool)")
+        self.emit(f"{matched_name} = np.array({active_name}, copy=True)")
+        self._where_stack.append({"active": active_name, "matched": matched_name})
+
+    def _where_elsewhere(self, cond_raw: str | None, arrays_1d: set[str]) -> None:
+        if not self._where_stack:
+            return
+        frame = self._where_stack[-1]
+        active_name = frame["active"]
+        matched_name = frame["matched"]
+        parent = self._where_parent_mask_expr()
+        if cond_raw is None:
+            base_expr = f"np.ones_like({matched_name}, dtype=bool)"
+        else:
+            cond_py = self.translate_expr(cond_raw, arrays_1d)
+            base_expr = f"np.asarray({cond_py}, dtype=bool)"
+        if parent is not None:
+            base_expr = f"(np.asarray({parent}, dtype=bool) & ({base_expr}))"
+        self.emit(f"{active_name} = np.asarray(({base_expr}) & (~{matched_name}), dtype=bool)")
+        self.emit(f"{matched_name} = np.asarray({matched_name} | {active_name}, dtype=bool)")
+
+    def _end_where_block(self) -> None:
+        if self._where_stack:
+            self._where_stack.pop()
+
+    def _where_masked_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> bool:
+        mask_expr = self._where_current_mask_expr()
+        if mask_expr is None:
+            return False
+        lhs = lhs.replace("%", ".")
+        lhs_base = lhs.split(".", 1)[0].strip().lower()
+        if self._decl_types.get(lhs_base) == "integer":
+            rhs_py = f"int({rhs_py})"
+        mname = re.match(r"^\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(", lhs, re.I)
+        idx_name = None
+        idx = None
+        if mname:
+            name_try = mname.group(1)
+            open_pos = lhs.find("(", mname.end(1))
+            if open_pos >= 0:
+                close_pos = find_matching_paren(lhs, open_pos)
+                if close_pos == len(lhs) - 1:
+                    idx_name = name_try
+                    idx = lhs[open_pos + 1 : close_pos].strip()
+        if idx_name is not None and idx is not None and (":" in idx or "," in idx):
+            name = idx_name
+            if "," in idx:
+                parts = [p.strip() for p in split_args(idx)]
+                idx_parts: list[str] = []
+                for ptxt in parts:
+                    if ptxt == ":":
+                        idx_parts.append(":")
+                    elif ":" in ptxt:
+                        lo, hi = ptxt.split(":", 1)
+                        lo = lo.strip()
+                        hi = hi.strip()
+                        lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
+                        hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
+                        start = f"(int({lo_py}) - 1)" if lo_py else ""
+                        stop = f"int({hi_py})" if hi_py else ""
+                        idx_parts.append(f"{start}:{stop}")
+                    else:
+                        idx_parts.append(f"({self.translate_expr(ptxt, arrays_1d)}) - 1")
+                target = f"{name}[{', '.join(idx_parts)}]"
+            else:
+                lo, hi = idx.split(":", 1)
+                lo = lo.strip()
+                hi = hi.strip()
+                lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
+                hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
+                start = f"(int({lo_py}) - 1)" if lo_py else ""
+                stop = f"int({hi_py})" if hi_py else ""
+                target = f"{name}[{start}:{stop}]"
+            self.emit(f"{target} = np.where({mask_expr}, {rhs_py}, {target})")
+            return True
+        is_array_target = (lhs in arrays_1d) or (lhs_base in self._decl_array_types)
+        if is_array_target:
+            if re.fullmatch(r"[A-Za-z_]\w*", lhs) and (lhs.lower() in self._decl_pointer or lhs.lower() in self._decl_target):
+                self.emit(f"{lhs}[...] = np.where({mask_expr}, {rhs_py}, {lhs})")
+            else:
+                self.emit(f"{lhs} = _f_assign_array({lhs}, np.where({mask_expr}, {rhs_py}, {lhs}))")
+            return True
+        return False
+
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
+
+        pwhere = None
+        if sl.startswith("where"):
+            p0 = s.lower().find("where") + len("where")
+            while p0 < len(s) and s[p0].isspace():
+                p0 += 1
+            if p0 < len(s) and s[p0] == "(":
+                p1 = find_matching_paren(s, p0)
+                if p1 != -1:
+                    pwhere = (p0, p1)
 
         # ignore some non-exec lines
         if sl in ("implicit none", "contains"):
@@ -2035,6 +2156,31 @@ class basic_f2p:
 
         if re.match(r"end\s+associate", s, re.I):
             self._end_associate_block(arrays_1d)
+            return True
+
+        if re.match(r"end\s+where", s, re.I):
+            self._end_where_block()
+            return True
+
+        mm = re.match(r"elsewhere\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            self._where_elsewhere(mm.group(1), arrays_1d)
+            return True
+
+        if re.match(r"elsewhere\s*$", s, re.I):
+            self._where_elsewhere(None, arrays_1d)
+            return True
+
+        if pwhere is not None:
+            p0, p1 = pwhere
+            cond_raw = s[p0 + 1 : p1].strip()
+            tail = s[p1 + 1 :].strip()
+            if tail:
+                self._start_where_block(cond_raw, arrays_1d)
+                self.transpile_simple_stmt(tail, arrays_1d)
+                self._end_where_block()
+            else:
+                self._start_where_block(cond_raw, arrays_1d)
             return True
 
         mm = re.match(r"select\s+case\s*\(\s*(.+)\s*\)\s*$", s, re.I)
