@@ -40,6 +40,69 @@ class UseSpec:
     intrinsic: bool = False
 
 
+
+
+def _replace_identifier_outside_strings(code: str, old: str, new: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(code)
+    in_str = False
+    quote = ""
+    pat = re.compile(rf"(?i)\b{re.escape(old)}\b")
+    while i < n:
+        ch = code[i]
+        if in_str:
+            out.append(ch)
+            if ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        j = i
+        while j < n and code[j] not in ("'", '"'):
+            j += 1
+        out.append(pat.sub(new, code[i:j]))
+        i = j
+    return "".join(out)
+
+
+def _choose_fresh_identifier(src: str, base: str) -> str:
+    ids: set[str] = set()
+    for raw in src.splitlines():
+        code, _comment = split_fortran_comment(raw)
+        ids.update(m.group(0).lower() for m in re.finditer(r"\b[a-z_]\w*\b", code, re.I))
+    cand = base
+    while cand.lower() in ids:
+        cand += "_"
+    return cand
+
+
+def _preprocess_fortran_source(src: str) -> str:
+    ids: set[str] = set()
+    for raw in src.splitlines():
+        code, _comment = split_fortran_comment(raw)
+        ids.update(m.group(0).lower() for m in re.finditer(r"\b[a-z_]\w*\b", code, re.I))
+    if "lambda" not in ids:
+        return src
+    repl = _choose_fresh_identifier(src, "lambda_")
+    out_lines: list[str] = []
+    for raw in src.splitlines():
+        code, comment = split_fortran_comment(raw)
+        new_code = _replace_identifier_outside_strings(code, "lambda", repl)
+        if comment:
+            if new_code:
+                out_lines.append(f"{new_code} ! {comment}")
+            else:
+                out_lines.append(f"! {comment}")
+        else:
+            out_lines.append(new_code)
+    return "\n".join(out_lines)
+
 def _clean_fortran_code_lines(src: str) -> list[str]:
     out: list[str] = []
     for raw in src.splitlines():
@@ -3008,7 +3071,7 @@ def main() -> int:
                 print(ft_run.stderr.rstrip())
 
         t0_transpile = time.perf_counter()
-        src = "\n\n".join(p.read_text(encoding="utf-8") for p in src_paths)
+        src = _preprocess_fortran_source("\n\n".join(p.read_text(encoding="utf-8") for p in src_paths))
         t = basic_f2p()
         try:
             py = t.transpile(src)
@@ -3179,7 +3242,7 @@ def main() -> int:
                 print(ft_run.stderr.rstrip())
 
         t0_transpile = time.perf_counter()
-        file_src: dict[Path, str] = {p: p.read_text(encoding="utf-8") for p in in_paths}
+        file_src: dict[Path, str] = {p: _preprocess_fortran_source(p.read_text(encoding="utf-8")) for p in in_paths}
         file_mods: dict[Path, list[str]] = {}
         file_defs: dict[Path, list[str]] = {}
         file_uses: dict[Path, list[UseSpec]] = {}
