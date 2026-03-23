@@ -1744,6 +1744,7 @@ class basic_f2p:
                 "conjg",
                 "cmplx",
                 "int",
+                "nint",
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
@@ -1782,6 +1783,8 @@ class basic_f2p:
                         return f"np.asarray({arg0_py}, dtype=int)"
                     return f"int({arg0_py})"
                 return None
+            if lname == "nint" and len(args_py) == 1:
+                return f"_xf2p_nint({args_py[0]})"
             if lname == "gamma" and len(args_py) == 1:
                 return f"sps.gamma({args_py[0]})"
             if lname == "log_gamma" and len(args_py) == 1:
@@ -1972,7 +1975,7 @@ class basic_f2p:
                     fname = node.func.id
                 elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
                     fname = f"{node.func.value.id}.{node.func.attr}"
-                if fname in {"int", "_f_len", "_f_len_trim", "_xf2p_mod", "_xf2p_modulo", "_xf2p_div"}:
+                if fname in {"int", "_f_len", "_f_len_trim", "_xf2p_mod", "_xf2p_modulo", "_xf2p_div", "_xf2p_nint"}:
                     return "integer"
                 if fname in {"float", "_xf2p_real", "np.float64", "np.sqrt", "np.log", "np.exp", "np.sin", "np.cos", "np.arccos", "np.arcsin", "np.arctan", "np.degrees", "np.radians"}:
                     return "real"
@@ -4161,6 +4164,17 @@ class basic_f2p:
         self.indent -= 1
         self.emit("return a / b")
         self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_nint(x):")
+        self.emit('    """Fortran NINT with ties away from zero and array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        rr = np.where(xx >= 0.0, np.floor(xx + 0.5), np.ceil(xx - 0.5))")
+        self.emit("        return np.asarray(rr, dtype=int)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    if xx >= 0.0:")
+        self.emit("        return int(np.floor(xx + 0.5))")
+        self.emit("    return int(np.ceil(xx - 0.5))")
         self.emit("")
         self.emit("def _xf2p_mod(a, p):")
         self.indent += 1
