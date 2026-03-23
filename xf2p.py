@@ -209,7 +209,64 @@ def _parse_file_interface(src: str) -> tuple[list[str], list[str], list[UseSpec]
             uses.append(UseSpec(module=mod, only_items=only_items, intrinsic=intrinsic))
             continue
 
+    i = 0
+    n = len(code_lines)
+    while i < n:
+        s = code_lines[i].strip()
+        mgi = re.match(r"^interface(?:\s+([a-z_]\w*))?\s*$", s, re.I)
+        if not mgi:
+            i += 1
+            continue
+        gname = mgi.group(1)
+        block: list[str] = []
+        i += 1
+        while i < n and not re.match(r"^\s*end\s+interface\b", code_lines[i], re.I):
+            block.append(code_lines[i].strip())
+            i += 1
+        if i < n:
+            i += 1
+        if not gname:
+            continue
+        has_module_proc = any(re.match(r"^module\s+procedure\b", b, re.I) for b in block)
+        if has_module_proc:
+            defs.append(gname)
+
     return unique_preserve(mods), unique_preserve(defs), uses
+
+
+def _extract_generic_interfaces(lines: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], list[dict[str, list[str]]]]:
+    """Extract generic interface blocks that name module procedures."""
+    filtered: list[tuple[str, str]] = []
+    generics: list[dict[str, list[str]]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        s = lines[i][0].strip()
+        m = re.match(r"^interface(?:\s+([a-z_]\w*))?\s*$", s, re.I)
+        if not m:
+            filtered.append(lines[i])
+            i += 1
+            continue
+        gname = m.group(1)
+        block: list[tuple[str, str]] = []
+        i += 1
+        while i < n and not re.match(r"^\s*end\s+interface\b", lines[i][0], re.I):
+            block.append(lines[i])
+            i += 1
+        if i < n:
+            i += 1
+        procs: list[str] = []
+        for code, _comment in block:
+            mm = re.match(r"^\s*module\s+procedure\s+(.+)$", code.strip(), re.I)
+            if mm:
+                procs.extend([p.strip() for p in split_args(mm.group(1)) if p.strip()])
+        if gname and procs:
+            generics.append({"name": gname, "procedures": unique_preserve(procs)})
+        else:
+            filtered.append((s, ""))
+            filtered.extend(block)
+            filtered.append(("end interface", ""))
+    return filtered, generics
 
 
 def _insert_imports(py_text: str, import_lines: list[str]) -> str:
@@ -964,7 +1021,8 @@ class basic_f2p:
         self._decl_target: set[str] = set()
         self._decl_char_len: dict[str, str] = {}
         self._save_stack: list[tuple[str, list[str]]] = []
-        self._subr_sigs: dict[str, dict[str, list[str]]] = {}
+        self._subr_sigs: dict[str, dict] = {}
+        self._func_sigs: dict[str, dict] = {}
         self._current_result_name: str | None = None
         self._derived_types: set[str] = set()
         self._select_case_stack: list[dict[str, object]] = []
@@ -1036,12 +1094,19 @@ class basic_f2p:
 
     def _parse_character_len(self, decl_line: str) -> str | None:
         s = decl_line.strip()
-        m = re.search(r"\bcharacter\s*\(\s*len\s*=\s*([^,)]+)", s, re.I)
+        m = re.search(r"\bcharacter\s*\(", s, re.I)
         if m:
-            return m.group(1).strip()
-        m = re.search(r"\bcharacter\s*\(\s*([^,)]+)\s*\)", s, re.I)
-        if m and 'kind' not in m.group(1).lower() and '=' not in m.group(1):
-            return m.group(1).strip()
+            p0 = s.find("(", m.start())
+            p1 = find_matching_paren(s, p0)
+            if p0 != -1 and p1 != -1:
+                inner = s[p0 + 1 : p1].strip()
+                for part in split_args(inner):
+                    mm = re.match(r"^len\s*=\s*(.+)$", part.strip(), re.I)
+                    if mm:
+                        return mm.group(1).strip()
+                parts = [p.strip() for p in split_args(inner) if p.strip()]
+                if parts and all(("kind" not in p.lower()) and ("=" not in p) for p in parts):
+                    return parts[0]
         m = re.search(r"\bcharacter\s*\*\s*([a-z_]\w*|\d+)", s, re.I)
         if m:
             return m.group(1).strip()
@@ -1612,6 +1677,7 @@ class basic_f2p:
                 "sinpi",
                 "tanpi",
                 "trim",
+                "len",
                 "len_trim",
                 "new_line",
                 "adjustl",
@@ -1623,6 +1689,8 @@ class basic_f2p:
             args_py = [self.translate_expr(p, arrays_1d) for p in parts]
             if lname == "trim" and len(args_py) == 1:
                 return f"str({args_py[0]}).rstrip()"
+            if lname == "len" and len(args_py) == 1:
+                return f"_f_len({args_py[0]})"
             if lname == "len_trim" and len(args_py) == 1:
                 return f"_f_len_trim({args_py[0]})"
             if lname == "new_line" and len(args_py) == 1:
@@ -3211,6 +3279,19 @@ class basic_f2p:
                             result_hint = _type_scalar_hint[ftype]
                             result_is_scalar = True
 
+        arg_specs = []
+        for a in args:
+            info = sym.get(a)
+            if info is None:
+                arg_specs.append({"ftype": None, "type_name": None, "is_array": False})
+            else:
+                arg_specs.append({
+                    "ftype": info.get("ftype"),
+                    "type_name": info.get("type_name"),
+                    "is_array": bool(info.get("is_array")),
+                })
+        self._func_sigs[fname.lower()] = {"args": list(args), "arg_specs": arg_specs}
+
         args_annot = []
         for a in args:
             hint = arg_hints.get(a, "int")
@@ -3389,6 +3470,58 @@ class basic_f2p:
             self.handle_exec_line(s, arrays_1d)
 
 
+    def _xf2p_generic_arg_cond(self, expr: str, spec: dict) -> str:
+        ftype = str(spec.get("ftype") or "").lower()
+        is_array = bool(spec.get("is_array"))
+        if ftype == "character":
+            return f"_xf2p_is_char_array({expr})" if is_array else f"_xf2p_is_char_scalar({expr})"
+        if ftype == "integer":
+            return f"_xf2p_is_integer_array({expr})" if is_array else f"_xf2p_is_integer_scalar({expr})"
+        if ftype == "real":
+            return f"_xf2p_is_real_array({expr})" if is_array else f"_xf2p_is_real_scalar({expr})"
+        if ftype == "logical":
+            return f"_xf2p_is_logical_array({expr})" if is_array else f"_xf2p_is_logical_scalar({expr})"
+        if ftype == "complex":
+            return f"_xf2p_is_complex_array({expr})" if is_array else f"_xf2p_is_complex_scalar({expr})"
+        return "True"
+
+    def _xf2p_generic_call_arg(self, expr: str, spec: dict) -> str:
+        if not bool(spec.get("is_array")):
+            return expr
+        ftype = str(spec.get("ftype") or "").lower()
+        if ftype == "character":
+            return f"np.asarray({expr}, dtype=object)"
+        if ftype in _type_dtype:
+            return f"np.asarray({expr}, dtype={_type_dtype[ftype]})"
+        return f"np.asarray({expr})"
+
+    def _emit_generic_interface_wrapper(self, generic_name: str, proc_names: list[str]) -> None:
+        candidates: list[tuple[str, dict]] = []
+        for proc in proc_names:
+            sig = self._func_sigs.get(proc.lower()) or self._subr_sigs.get(proc.lower())
+            if sig is not None:
+                candidates.append((proc, sig))
+        if not candidates:
+            return
+        self.emit(f"def {generic_name}(*args):")
+        self.indent += 1
+        for proc, sig in candidates:
+            arg_specs = list(sig.get("arg_specs", []))
+            conds = [f"len(args) == {len(arg_specs)}"]
+            for j, spec in enumerate(arg_specs):
+                cond = self._xf2p_generic_arg_cond(f"args[{j}]", spec)
+                if cond != "True":
+                    conds.append(cond)
+            call_args = [self._xf2p_generic_call_arg(f"args[{j}]", spec) for j, spec in enumerate(arg_specs)]
+            self.emit(f"if {' and '.join(conds)}:")
+            self.indent += 1
+            self.emit(f"return {proc}({', '.join(call_args)})")
+            self.indent -= 1
+        self.emit(f"raise TypeError('no matching specific procedure for generic interface {generic_name}')")
+        self.indent -= 1
+        self.emit("")
+
+
     def transpile_module(self, header: str, body_lines: list[tuple[str, str]]) -> None:
         # Flatten a Fortran module into top-level Python definitions:
         # declarative-part parameters/variables/types become module globals,
@@ -3403,6 +3536,8 @@ class basic_f2p:
         if contains_idx is not None:
             decl_lines = body_lines[:contains_idx]
             tail = body_lines[contains_idx + 1 :]
+
+        decl_lines, generic_interfaces = _extract_generic_interfaces(decl_lines)
 
         # Emit derived types from the module declarative part.
         filtered_decl: list[tuple[str, str]] = []
@@ -3504,6 +3639,9 @@ class basic_f2p:
                     self.transpile_subroutine(sub_header, sbody)
                     continue
                 i += 1
+
+        for gi in generic_interfaces:
+            self._emit_generic_interface_wrapper(gi["name"], gi["procedures"])
 
     def transpile_program(self, body_lines: list[tuple[str, str]]) -> None:
         # Handle internal procedures after "contains".
@@ -3667,7 +3805,18 @@ class basic_f2p:
                 pure_out_formals.append(a)
             else:
                 vector_formals.append(a)
-        self._subr_sigs[sname.lower()] = {"args": list(args), "out": list(out_formals)}
+        arg_specs = []
+        for a in args:
+            info = sym.get(a)
+            if info is None:
+                arg_specs.append({"ftype": None, "type_name": None, "is_array": False})
+            else:
+                arg_specs.append({
+                    "ftype": info.get("ftype"),
+                    "type_name": info.get("type_name"),
+                    "is_array": bool(info.get("is_array")),
+                })
+        self._subr_sigs[sname.lower()] = {"args": list(args), "out": list(out_formals), "arg_specs": arg_specs}
 
         save_names = self._collect_save_names(main_lines, sym, args)
         save_dict_name = f"_{sname}_save"
@@ -3786,6 +3935,134 @@ class basic_f2p:
         self.emit("return isinstance(x, (list, tuple, np.ndarray)) and not isinstance(x, (str, bytes))")
         self.indent -= 1
         self.emit("")
+        self.emit("def _f_len(x):")
+        self.indent += 1
+        self.emit('"""Fortran LEN for a scalar character value or character array."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("if x.ndim == 0:")
+        self.indent += 1
+        self.emit("return len(str(x.item()))")
+        self.indent -= 1
+        self.emit("if x.size == 0:")
+        self.indent += 1
+        self.emit("return 0")
+        self.indent -= 1
+        self.emit("return len(str(np.ravel(x, order='F')[0]))")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("if not x:")
+        self.indent += 1
+        self.emit("return 0")
+        self.indent -= 1
+        self.emit("return _f_len(x[0])")
+        self.indent -= 1
+        self.emit("return len(str(x))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_first_scalar(x):")
+        self.indent += 1
+        self.emit('"""Return the first scalar element from a scalar or arraylike value."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("if x.ndim == 0:")
+        self.indent += 1
+        self.emit("return x.item()")
+        self.indent -= 1
+        self.emit("if x.size == 0:")
+        self.indent += 1
+        self.emit("return None")
+        self.indent -= 1
+        self.emit("return np.ravel(x, order='F')[0]")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("if not x:")
+        self.indent += 1
+        self.emit("return None")
+        self.indent -= 1
+        self.emit("return _xf2p_first_scalar(x[0])")
+        self.indent -= 1
+        self.emit("return x")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_char_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (str, bytes))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_char_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_char_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_integer_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (int, np.integer)) and not isinstance(x, (bool, np.bool_))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_integer_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_integer_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_real_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (float, np.floating))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_real_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_real_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_logical_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (bool, np.bool_))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_logical_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_logical_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_complex_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (complex, np.complexfloating))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_complex_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_complex_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+
         self.emit("def _xf2p_io_items(x):")
         self.indent += 1
         self.emit('"""Flatten list-directed output items the way Fortran prints arrays."""')
