@@ -1595,7 +1595,7 @@ class basic_f2p:
         if lhs in arrays_1d:
             self.emit(f"{lhs} = _f_assign_array({lhs}, {rhs_py})")
             return
-        self.emit(f"{lhs} = {rhs_py}")
+        self.emit(f"{lhs} = _xf2p_copy_value({rhs_py})")
 
     def transpile_simple_stmt(self, stmt: str, arrays_1d: set[str]) -> None:
         s = stmt.strip()
@@ -1740,8 +1740,8 @@ class basic_f2p:
             self.indent = max(0, self.indent - 1)
             return True
 
-        # do while (...)
-        mm = re.match(r"do\s+while\s*\(\s*(.+)\s*\)$", s, re.I)
+        # [label:] do while (...)
+        mm = re.match(r"(?:[a-z_]\w*\s*:\s*)?do\s+while\s*\(\s*(.+)\s*\)$", s, re.I)
         if mm:
             cond = self.translate_expr(mm.group(1), arrays_1d)
             self.emit(f"while {cond}:")
@@ -1749,18 +1749,25 @@ class basic_f2p:
             self._block_code_start.append(self._code_emit_count)
             return True
 
-        # do i = a, b
-        mm = re.match(r"do\s+([a-z_]\w*)\s*=\s*(.+?)\s*,\s*(.+)$", s, re.I)
+        # [label:] do i = a, b[, step]
+        mm = re.match(r"(?:[a-z_]\w*\s*:\s*)?do\s+([a-z_]\w*)\s*=\s*(.+)$", s, re.I)
         if mm:
             var = mm.group(1)
-            a = self.translate_expr(mm.group(2), arrays_1d)
-            b = self.translate_expr(mm.group(3), arrays_1d)
-            self.emit(f"for {var} in range({a}, ({b}) + 1):")
-            self.indent += 1
-            self._block_code_start.append(self._code_emit_count)
-            return True
+            rhs = mm.group(2).strip()
+            parts = split_args(rhs)
+            if len(parts) in (2, 3):
+                a = self.translate_expr(parts[0], arrays_1d)
+                b = self.translate_expr(parts[1], arrays_1d)
+                if len(parts) == 2:
+                    self.emit(f"for {var} in range({a}, ({b}) + 1):")
+                else:
+                    step_py = self.translate_expr(parts[2], arrays_1d)
+                    self.emit(f"for {var} in range({a}, ({b}) + (1 if ({step_py}) > 0 else -1), {step_py}):")
+                self.indent += 1
+                self._block_code_start.append(self._code_emit_count)
+                return True
 
-        if sl.startswith("end do"):
+        if re.match(r"end\s+do(?:\s+[a-z_]\w*)?$", s, re.I):
             if self._block_code_start:
                 start = self._block_code_start.pop()
                 if self._code_emit_count == start:
@@ -2892,6 +2899,21 @@ class basic_f2p:
         self.emit("return np.asarray(out)")
         self.indent -= 1
         self.emit("")
+        self.emit("def _xf2p_copy_value(x):")
+        self.indent += 1
+        self.emit('"""Fortran-style assignment copy for arrays and derived-type values."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("return np.array(x, copy=True)")
+        self.indent -= 1
+        self.emit("if hasattr(x, '__dict__'):")
+        self.indent += 1
+        self.emit("import copy as _xf2p_copy_mod")
+        self.emit("return _xf2p_copy_mod.deepcopy(x)")
+        self.indent -= 1
+        self.emit("return x")
+        self.indent -= 1
+        self.emit("")
 
         i = 0
         n = len(raw)
@@ -3035,8 +3057,8 @@ def main() -> int:
     if args.tee_both:
         args.tee = True
 
-    show_fortran_output = bool(args.run_both or args.tee_both)
-    show_python_output = bool(args.run_both or args.tee or args.tee_both)
+    show_fortran_output = bool(args.run_both or args.time_both or args.tee_both)
+    show_python_output = bool(args.run or args.run_both or args.time or args.time_both or args.tee or args.tee_both)
 
     if args.mode_program and args.mode_each:
         print("Transpile: FAIL (choose at most one of --mode-program and --mode-each)")
