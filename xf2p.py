@@ -725,7 +725,7 @@ _type_default_scalar_value = {
     "real": "np.float64(0.0)",
     "logical": "False",
     "complex": "0j",
-    "character": """""",
+    "character": repr(""),
 }
 
 _type_dtype = {
