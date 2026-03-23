@@ -8,6 +8,7 @@ import difflib
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
+from typing import cast
 
 
 def split_fortran_comment(line: str) -> tuple[str, str]:
@@ -890,6 +891,7 @@ class basic_f2p:
         self._current_result_name: str | None = None
         self._derived_types: set[str] = set()
         self._select_case_stack: list[dict[str, object]] = []
+        self._associate_stack: list[dict[str, object]] = []
         self._seen_scipy_special = False
 
     def _kind_alias_value(self, remote: str) -> str | None:
@@ -1864,6 +1866,117 @@ class basic_f2p:
         if inline_stmt and inline_stmt.strip():
             self.transpile_simple_stmt(inline_stmt.strip(), arrays_1d)
 
+
+    def _associate_bindings(self, raw: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for item in split_args(raw):
+            part = item.strip()
+            if not part:
+                continue
+            if "=>" not in part:
+                continue
+            name, selector = part.split("=>", 1)
+            name = name.strip()
+            selector = selector.strip()
+            if name:
+                out.append((name, selector))
+        return out
+
+    def _associate_array_element_ref(self, selector: str, arrays_1d: set[str]) -> str | None:
+        mm = re.match(r"^([a-z_]\w*(?:%[a-z_]\w*)*)\s*\((.*)\)\s*$", selector, re.I)
+        if not mm:
+            return None
+        name_raw = mm.group(1).strip()
+        idx_raw = mm.group(2).strip()
+        root = name_raw.split("%", 1)[0].lower()
+        if root not in arrays_1d:
+            return None
+        if "," in idx_raw or ":" in idx_raw:
+            return None
+        name_py = name_raw.replace("%", ".")
+        idx_py = self.translate_expr(idx_raw, arrays_1d)
+        return f"{name_py}[(({idx_py}) - 1):((({idx_py}) - 1) + 1)].reshape(())"
+
+    def _associate_alias_metadata(self, selector: str, arrays_1d: set[str]) -> tuple[bool, bool, str | None]:
+        sel = selector.strip()
+        mm_name = re.fullmatch(r"[a-z_]\w*(?:%[a-z_]\w*)*", sel, re.I)
+        if mm_name:
+            root = sel.split("%", 1)[0].lower()
+            is_array = root in arrays_1d
+            return True, is_array, root
+        mm = re.match(r"^([a-z_]\w*(?:%[a-z_]\w*)*)\s*\((.*)\)\s*$", sel, re.I)
+        if mm:
+            root = mm.group(1).split("%", 1)[0].lower()
+            if root not in arrays_1d:
+                return False, False, None
+            idx = mm.group(2).strip()
+            is_array = (":" in idx) or ("," in idx)
+            return True, is_array, root
+        return False, False, None
+
+    def _start_associate_block(self, raw: str, arrays_1d: set[str]) -> None:
+        self.emit("if True:")
+        self.indent += 1
+        frame: dict[str, object] = {
+            "added_decl_pointer": set(),
+            "added_decl_types": {},
+            "added_decl_array_types": {},
+            "added_arrays_1d": set(),
+            "code_start": self._code_emit_count,
+        }
+        for assoc_name, selector in self._associate_bindings(raw):
+            assoc_l = assoc_name.lower()
+            can_alias, is_array_alias, root = self._associate_alias_metadata(selector, arrays_1d)
+            if can_alias:
+                if is_array_alias:
+                    rhs_py = self.translate_expr(selector, arrays_1d)
+                else:
+                    rhs_py = self._associate_array_element_ref(selector, arrays_1d)
+                    if rhs_py is None:
+                        selector_py = self.translate_expr(selector, arrays_1d)
+                        if re.fullmatch(r"[a-z_]\w*", selector.strip(), re.I):
+                            self.emit(f"if not isinstance({selector_py}, np.ndarray):")
+                            self.indent += 1
+                            self.emit(f"{selector_py} = np.asarray({selector_py})")
+                            self.indent -= 1
+                        rhs_py = selector_py
+                self.emit(f"{assoc_name} = {rhs_py}")
+                self._decl_pointer.add(assoc_l)
+                cast(set[str], frame["added_decl_pointer"]).add(assoc_l)
+                if is_array_alias:
+                    base_type = self._decl_array_types.get(root or "", self._decl_types.get(root or "", "real"))
+                    self._decl_array_types[assoc_l] = base_type
+                    cast(dict[str, str], frame["added_decl_array_types"])[assoc_l] = base_type
+                    arrays_1d.add(assoc_l)
+                    cast(set[str], frame["added_arrays_1d"]).add(assoc_l)
+                else:
+                    base_type = self._decl_types.get(root or "", "real")
+                    self._decl_types[assoc_l] = base_type
+                    cast(dict[str, str], frame["added_decl_types"])[assoc_l] = base_type
+            else:
+                rhs_py = self.translate_expr(selector, arrays_1d)
+                self.emit(f"{assoc_name} = _xf2p_copy_value({rhs_py})")
+                if assoc_l in arrays_1d:
+                    cast(set[str], frame["added_arrays_1d"]).add(assoc_l)
+        self._associate_stack.append(frame)
+
+    def _end_associate_block(self, arrays_1d: set[str]) -> None:
+        if not self._associate_stack:
+            return
+        frame = self._associate_stack.pop()
+        for name in cast(set[str], frame.get("added_decl_pointer", set())):
+            self._decl_pointer.discard(name)
+        for name in cast(dict[str, str], frame.get("added_decl_types", {})).keys():
+            self._decl_types.pop(name, None)
+        for name in cast(dict[str, str], frame.get("added_decl_array_types", {})).keys():
+            self._decl_array_types.pop(name, None)
+        for name in cast(set[str], frame.get("added_arrays_1d", set())):
+            arrays_1d.discard(name)
+        start = int(frame.get("code_start", self._code_emit_count))
+        if self._code_emit_count == start:
+            self.emit("pass")
+        self.indent = max(0, self.indent - 1)
+
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
 
@@ -1875,6 +1988,18 @@ class basic_f2p:
         if sl.startswith("end function") or sl.startswith("end program") or sl.startswith("end module"):
             return True
         if sl == "end":
+            return True
+
+        mm = re.match(r"associate\s*\(\s*(.*)\s*\)\s*(?:;\s*(.*))?$", s, re.I)
+        if mm:
+            self._start_associate_block(mm.group(1), arrays_1d)
+            inline_stmt = (mm.group(2) or "").strip()
+            if inline_stmt:
+                self.transpile_simple_stmt(inline_stmt, arrays_1d)
+            return True
+
+        if re.match(r"end\s+associate", s, re.I):
+            self._end_associate_block(arrays_1d)
             return True
 
         mm = re.match(r"select\s+case\s*\(\s*(.+)\s*\)\s*$", s, re.I)
@@ -2207,21 +2332,7 @@ class basic_f2p:
             if re.match(r"^null\s*\(\s*\)\s*$", rhs_raw, re.I):
                 self.emit(f"{lhs} = None")
             else:
-                # If associating to an array element (no ':' sections), create a 0-d view
-                # so that scalar pointers can update the underlying array storage.
-                rhs_py = None
-                mm_el = re.match(r"^([a-z_]\w*)\s*\(\s*(.*?)\s*\)\s*$", rhs_raw, re.I)
-                if mm_el and (":" not in mm_el.group(2)) and (mm_el.group(1).lower() in self._decl_array_types):
-                    base = mm_el.group(1)
-                    idx_txt = mm_el.group(2)
-                    idx_parts = [p.strip() for p in split_args(idx_txt)]
-                    py_slices = []
-                    for p in idx_parts:
-                        p_py = self.translate_expr(p, arrays_1d)
-                        py_slices.append(f"(int({p_py}) - 1):int({p_py})")
-                    rhs_py = f"{base}[{', '.join(py_slices)}].reshape(())"
-                if rhs_py is None:
-                    rhs_py = self.translate_expr(rhs_raw, arrays_1d)
+                rhs_py = self.translate_expr(rhs_raw, arrays_1d)
                 self.emit(f"{lhs} = {rhs_py}")
             return True
 
