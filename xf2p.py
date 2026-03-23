@@ -339,6 +339,26 @@ def _fortran_unquote(s: str) -> str:
     return s
 
 
+def _is_fortran_string_literal(s: str) -> bool:
+    s = s.strip()
+    if len(s) < 2 or s[0] not in ("'", "\""):
+        return False
+    q = s[0]
+    i = 1
+    n = len(s)
+    while i < n:
+        if s[i] == q:
+            if i + 1 < n and s[i + 1] == q:
+                i += 2
+                continue
+            i += 1
+            while i < n and s[i].isspace():
+                i += 1
+            return i == n
+        i += 1
+    return False
+
+
 def _strip_one_outer_paren(s: str) -> str:
     s = s.strip()
     if len(s) >= 2 and s[0] == "(" and s[-1] == ")" and find_matching_paren(s, 0) == len(s) - 1:
@@ -2369,7 +2389,7 @@ class basic_f2p:
                     return True
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", '"')):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
@@ -2396,7 +2416,7 @@ class basic_f2p:
             raw_args = [a.strip() for a in split_args(mm.group(3))]
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
@@ -2448,7 +2468,7 @@ class basic_f2p:
                     return True
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
@@ -2484,7 +2504,7 @@ class basic_f2p:
                     self.emit(f"print(*{implied_py}, file={unit})")
                     return True
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
@@ -2515,7 +2535,7 @@ class basic_f2p:
             raw_args = [a.strip() for a in split_args(rest)]
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
@@ -2564,7 +2584,7 @@ class basic_f2p:
             raw_args = [a.strip() for a in split_args(rest)]
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
@@ -2614,7 +2634,7 @@ class basic_f2p:
             if rest:
                 for a in split_args(rest):
                     a = a.strip()
-                    if a.startswith(("'", '"')):
+                    if _is_fortran_string_literal(a):
                         args2.append(a)
                     else:
                         # Expand array-valued args in list-directed output (Fortran prints elements).
