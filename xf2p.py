@@ -717,6 +717,7 @@ _type_scalar_hint = {
     "real": "np.float64",
     "logical": "bool",
     "complex": "complex",
+    "character": "str",
 }
 
 _type_default_scalar_value = {
@@ -724,6 +725,7 @@ _type_default_scalar_value = {
     "real": "np.float64(0.0)",
     "logical": "False",
     "complex": "0j",
+    "character": """""",
 }
 
 _type_dtype = {
@@ -731,6 +733,7 @@ _type_dtype = {
     "real": "np.float64",
     "logical": "np.bool_",
     "complex": "np.complex128",
+    "character": "object",
 }
 
 _type_ndarray_hint = {
@@ -738,6 +741,7 @@ _type_ndarray_hint = {
     "real": "npt.NDArray[np.float64]",
     "logical": "npt.NDArray[np.bool_]",
     "complex": "npt.NDArray[np.complex128]",
+    "character": "npt.NDArray[object]",
 }
 
 _LOCAL_RUNTIME_HELPERS = {
@@ -767,7 +771,7 @@ def infer_function_result_ftype(header: str) -> str | None:
         return None
     return m.group(1).lower()
 
-_decl_re = re.compile(r"^(integer|real|logical|complex)\b(.*)::(.*)$", re.I)
+_decl_re = re.compile(r"^(integer|real|logical|complex|character(?:\s*\([^)]*\))?)\b(.*)::(.*)$", re.I)
 
 
 def parse_decl(line: str):
@@ -775,6 +779,8 @@ def parse_decl(line: str):
     if not m:
         return None
     ftype = m.group(1).lower()
+    if ftype.startswith("character"):
+        ftype = "character"
     attrs = m.group(2).strip()
     rest = m.group(3).strip()
     return ftype, attrs, rest
@@ -1508,7 +1514,17 @@ class basic_f2p:
                             else:
                                 out.append(f"{name}[({inner_py}) - 1]")
                         else:
-                            out.append(f"{name}({inner_py})")
+                            if ":" in inner and "," not in inner:
+                                lo, hi = inner.split(":", 1)
+                                lo = lo.strip()
+                                hi = hi.strip()
+                                lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
+                                hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
+                                start = f"(int({lo_py}) - 1)" if lo_py else ""
+                                stop = f"int({hi_py})" if hi_py else ""
+                                out.append(f"{name}[{start}:{stop}]")
+                            else:
+                                out.append(f"{name}({inner_py})")
                         i = pclose + 1
                         continue
                 root = name.split(".", 1)[0].lower()
