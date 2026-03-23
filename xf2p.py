@@ -444,6 +444,61 @@ def split_top_level(s: str, delim: str) -> list[str]:
         parts.append(tail)
     return parts
 
+def split_top_level_concat(s: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    pdepth = 0
+    bdepth = 0
+    in_str = False
+    quote = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            buf.append(ch)
+            if ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '(':
+            pdepth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ')':
+            pdepth = max(0, pdepth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '[':
+            bdepth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ']':
+            bdepth = max(0, bdepth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if i + 1 < n and s[i:i + 2] == '//' and pdepth == 0 and bdepth == 0:
+            parts.append(''.join(buf).strip())
+            buf = []
+            i += 2
+            continue
+        buf.append(ch)
+        i += 1
+    tail = ''.join(buf).strip()
+    if tail or not parts:
+        parts.append(tail)
+    return parts
+
 def _fortran_unquote(s: str) -> str:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", "\""):
         q = s[0]
@@ -535,12 +590,17 @@ def _fortran_implied_do_expr(raw: str, translate_expr, arrays_1d: set[str]) -> s
 
 def _is_recyclable_io_iterable(raw: str, decl_array_types: dict[str, str]) -> bool:
     s = raw.strip()
-    return (
+    if (
         s.startswith('[')
         or s.startswith('(/')
         or _fortran_implied_do_expr(s, lambda x, _a: x, set()) is not None
         or (re.fullmatch(r"[a-z_]\w*", s, flags=re.I) and s.lower() in decl_array_types)
-    )
+    ):
+        return True
+    concat_parts = split_top_level_concat(s)
+    if len(concat_parts) > 1:
+        return any(_is_recyclable_io_iterable(part, decl_array_types) for part in concat_parts)
+    return False
 
 
 def _fortran_format_arg_count(fmt_literal: str) -> int | None:
@@ -1500,38 +1560,13 @@ class basic_f2p:
     def translate_expr(self, expr: str, arrays_1d: set[str]) -> str:
         s = expr.strip()
         s = s.replace("%", ".")
-        had_concat = False
-
-        # Fortran string concatenation operator.
-        if "//" in s:
-            out_concat: list[str] = []
-            i = 0
-            in_str = False
-            quote = ""
-            while i < len(s):
-                ch = s[i]
-                if in_str:
-                    out_concat.append(ch)
-                    if ch == quote:
-                        in_str = False
-                    i += 1
-                    continue
-                if ch in ("'", '"'):
-                    in_str = True
-                    quote = ch
-                    out_concat.append(ch)
-                    i += 1
-                    continue
-                if i + 1 < len(s) and s[i : i + 2] == "//":
-                    out_concat.append(" + ")
-                    had_concat = True
-                    i += 2
-                    continue
-                out_concat.append(ch)
-                i += 1
-            s = "".join(out_concat)
-            if had_concat and re.match(r"^\s*\+", s):
-                s = '"" ' + s
+        concat_parts = split_top_level_concat(s)
+        if len(concat_parts) > 1:
+            parts_py = [self.translate_expr(part, arrays_1d) for part in concat_parts]
+            expr_py = parts_py[0]
+            for part_py in parts_py[1:]:
+                expr_py = f"_xf2p_concat({expr_py}, {part_py})"
+            return expr_py
 
         # kind(...) used as a kind selector
         # basic rule: if it uses a d exponent constant, treat it as double precision -> 8
@@ -1548,6 +1583,23 @@ class basic_f2p:
         # fortran kind suffix literal -> plain python numeric literal
         # e.g. 1.0_dp, 2_ikind, 3.5_rk
         s = re.sub(r"(?i)\b((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*_[a-z_]\w*\b", r"\1", s)
+
+        def _top_level_complex_literal(txt: str) -> tuple[str, str] | None:
+            t = txt.strip()
+            if len(t) < 2 or t[0] != "(" or t[-1] != ")":
+                return None
+            if find_matching_paren(t, 0) != len(t) - 1:
+                return None
+            parts = [p.strip() for p in split_args(t[1:-1])]
+            if len(parts) != 2:
+                return None
+            return parts[0], parts[1]
+
+        complex_parts = _top_level_complex_literal(s)
+        if complex_parts is not None:
+            re_py = self.translate_expr(complex_parts[0], arrays_1d)
+            im_py = self.translate_expr(complex_parts[1], arrays_1d)
+            return f"_xf2p_cmplx({re_py}, {im_py})"
 
         s = re.sub(r"\.true\.", "True", s, flags=re.I)
         s = re.sub(r"\.false\.", "False", s, flags=re.I)
@@ -1590,6 +1642,8 @@ class basic_f2p:
         s = re.sub(r"\btiny\s*\(\s*[^)]*\)", "np.finfo(float).tiny", s, flags=re.I)
         s = re.sub(r"\bhuge\s*\(\s*[^)]*\)", "np.finfo(float).max", s, flags=re.I)
         s = s.replace("np.np.", "np.")
+        s = re.sub(r"(?i)\.re\b", ".real", s)
+        s = re.sub(r"(?i)\.im\b", ".imag", s)
 
         s = re.sub(r"\bsize\s*\(\s*([a-z_]\w*)\s*\)", r"_f_size(\1)", s, flags=re.I)
         s = re.sub(r"\bsize\s*\(\s*([^)]+)\s*\)", r"_f_size(\1)", s, flags=re.I)
@@ -1682,6 +1736,9 @@ class basic_f2p:
                 "new_line",
                 "adjustl",
                 "real",
+                "aimag",
+                "conjg",
+                "cmplx",
                 "int",
             }:
                 return None
@@ -1697,17 +1754,17 @@ class basic_f2p:
                 return repr("\n")
             if lname == "adjustl" and len(args_py) == 1:
                 return f"_f_adjustl({args_py[0]})"
-            if lname == "real":
-                if len(parts) >= 1:
-                    arg0_raw = parts[0].strip()
-                    arg0_py = args_py[0]
-                    if (
-                        arg0_raw.startswith("[")
-                        or arg0_raw.startswith("(/")
-                        or arg0_raw.lower() in arrays_1d
-                    ):
-                        return f"np.asarray({arg0_py}, dtype=np.float64)"
-                    return f"np.float64({arg0_py})"
+            if lname == "real" and len(args_py) >= 1:
+                return f"_xf2p_real({args_py[0]})"
+            if lname == "aimag" and len(args_py) == 1:
+                return f"_xf2p_aimag({args_py[0]})"
+            if lname == "conjg" and len(args_py) == 1:
+                return f"_xf2p_conjg({args_py[0]})"
+            if lname == "cmplx":
+                if len(args_py) == 1:
+                    return f"_xf2p_cmplx({args_py[0]})"
+                if len(args_py) >= 2:
+                    return f"_xf2p_cmplx({args_py[0]}, {args_py[1]})"
                 return None
             if lname == "int":
                 if len(parts) >= 1:
@@ -3935,6 +3992,40 @@ class basic_f2p:
         self.emit("return isinstance(x, (list, tuple, np.ndarray)) and not isinstance(x, (str, bytes))")
         self.indent -= 1
         self.emit("")
+        self.emit("def _xf2p_concat(a, b):")
+        self.indent += 1
+        self.emit('"""Fortran CHARACTER concatenation with scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(a):")
+        self.indent += 1
+        self.emit("aa = np.asarray(a, dtype=object)")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("aa = a")
+        self.indent -= 1
+        self.emit("if _xf2p_is_arraylike(b):")
+        self.indent += 1
+        self.emit("bb = np.asarray(b, dtype=object)")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("bb = b")
+        self.indent -= 1
+        self.emit("if isinstance(aa, np.ndarray) and isinstance(bb, np.ndarray):")
+        self.indent += 1
+        self.emit("return np.vectorize(lambda x, y: str(x) + str(y), otypes=[object])(aa, bb)")
+        self.indent -= 1
+        self.emit("if isinstance(aa, np.ndarray):")
+        self.indent += 1
+        self.emit("return np.vectorize(lambda x: str(x) + str(bb), otypes=[object])(aa)")
+        self.indent -= 1
+        self.emit("if isinstance(bb, np.ndarray):")
+        self.indent += 1
+        self.emit("return np.vectorize(lambda y: str(aa) + str(y), otypes=[object])(bb)")
+        self.indent -= 1
+        self.emit("return str(aa) + str(bb)")
+        self.indent -= 1
+        self.emit("")
         self.emit("def _f_len(x):")
         self.indent += 1
         self.emit('"""Fortran LEN for a scalar character value or character array."""')
@@ -3959,6 +4050,76 @@ class basic_f2p:
         self.emit("return _f_len(x[0])")
         self.indent -= 1
         self.emit("return len(str(x))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_cmplx(x, y=0.0):")
+        self.indent += 1
+        self.emit('"""Fortran CMPLX with scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(x) or _xf2p_is_arraylike(y):")
+        self.indent += 1
+        self.emit("if _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("xx = np.asarray(x)")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("xx = x")
+        self.indent -= 1
+        self.emit("if _xf2p_is_arraylike(y):")
+        self.indent += 1
+        self.emit("yy = np.asarray(y)")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("yy = y")
+        self.indent -= 1
+        self.emit("return np.asarray(np.real(xx), dtype=np.float64) + 1j * np.asarray(np.real(yy), dtype=np.float64)")
+        self.indent -= 1
+        self.emit("return complex(float(np.real(x)), float(np.real(y)))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_real(x):")
+        self.indent += 1
+        self.emit('"""Fortran REAL intrinsic for scalar or array input."""')
+        self.emit("if _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return np.asarray(np.real(np.asarray(x)), dtype=np.float64)")
+        self.indent -= 1
+        self.emit("return np.float64(np.real(x))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_aimag(x):")
+        self.indent += 1
+        self.emit('"""Fortran AIMAG intrinsic for scalar or array input."""')
+        self.emit("if _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return np.asarray(np.imag(np.asarray(x)), dtype=np.float64)")
+        self.indent -= 1
+        self.emit("return np.float64(np.imag(x))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_conjg(x):")
+        self.indent += 1
+        self.emit('"""Fortran CONJG intrinsic for scalar or array input."""')
+        self.emit("if _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return np.conj(np.asarray(x))")
+        self.indent -= 1
+        self.emit("return np.conj(x)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_io_scalar(x):")
+        self.indent += 1
+        self.emit('"""Format one scalar for Fortran-like list-directed output."""')
+        self.emit("if isinstance(x, np.ndarray) and x.ndim == 0:")
+        self.indent += 1
+        self.emit("return _xf2p_io_scalar(x.item())")
+        self.indent -= 1
+        self.emit("if isinstance(x, (complex, np.complexfloating)):")
+        self.indent += 1
+        self.emit("return f'({float(np.real(x)):.8f},{float(np.imag(x)):.8f})'")
+        self.indent -= 1
+        self.emit("return x")
         self.indent -= 1
         self.emit("")
         self.emit("def _xf2p_first_scalar(x):")
@@ -4068,7 +4229,7 @@ class basic_f2p:
         self.emit('"""Flatten list-directed output items the way Fortran prints arrays."""')
         self.emit("if isinstance(x, np.ndarray):")
         self.indent += 1
-        self.emit("return list(np.ravel(x, order='F'))")
+        self.emit("return [_xf2p_io_scalar(v) for v in np.ravel(x, order='F')]")
         self.indent -= 1
         self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
         self.indent += 1
@@ -4079,7 +4240,7 @@ class basic_f2p:
         self.indent -= 1
         self.emit("return out")
         self.indent -= 1
-        self.emit("return [x]")
+        self.emit("return [_xf2p_io_scalar(x)]")
         self.indent -= 1
         self.emit("")
 
