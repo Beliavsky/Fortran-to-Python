@@ -7,7 +7,7 @@ import time
 import difflib
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 def split_fortran_comment(line: str) -> tuple[str, str]:
@@ -984,18 +984,22 @@ class basic_f2p:
             for name, shape, init in items:
                 had_field = True
                 cmt = f"  # {comment.strip()}" if comment.strip() else ""
-                if shape is not None or "allocatable" in attrs_l:
-                    hint = self._type_hint(ftype, type_name, is_array=True)
-                    if shape is not None and "allocatable" not in attrs_l:
-                        shp_py = self.translate_expr(shape, set())
-                        dtype = _type_dtype.get(ftype, "object") if ftype != "type" else "object"
-                        self.emit(f"{name}: {hint} = field(default_factory=lambda: np.empty({shp_py}, dtype={dtype})){cmt}")
+                if shape is not None:
+                    if "allocatable" in attrs_l:
+                        self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} | None = None{cmt}")
+                        continue
+                    shape_py = self._shape_to_py(shape, set())
+                    if ftype == "type":
+                        self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} = field(default_factory=lambda: np.empty({shape_py}, dtype=object)){cmt}")
                     else:
-                        self.emit(f"{name}: {hint} | None = None{cmt}")
+                        dtype = _type_dtype[ftype]
+                        self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} = field(default_factory=lambda: np.empty({shape_py}, dtype={dtype})){cmt}")
+                    continue
+                if "allocatable" in attrs_l:
+                    self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=False)} | None = None{cmt}")
                     continue
                 if ftype == "type":
-                    hint = self._type_hint(ftype, type_name, is_array=False)
-                    self.emit(f"{name}: {hint} = field(default_factory={type_name}){cmt}")
+                    self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=False)} = field(default_factory={type_name}){cmt}")
                     continue
                 hint = self._type_hint(ftype, None, is_array=False)
                 if init is None:
@@ -1062,7 +1066,7 @@ class basic_f2p:
 
         text = "\n".join(lines)
         if "@dataclass" not in text:
-            _drop_line("from dataclasses import dataclass, field")
+            _drop_line("from dataclasses import dataclass")
         if "SimpleNamespace(" not in text:
             _drop_line("from types import SimpleNamespace")
         text = "\n".join(lines)
@@ -1441,7 +1445,12 @@ class basic_f2p:
                             out.append(f"{name}({inner_py})")
                         i = pclose + 1
                         continue
-                out.append(name)
+                root = name.split(".", 1)[0].lower()
+                if "." in name and root in arrays_1d and root not in {"np", "math", "random", "sps"}:
+                    root_name, path_name = name.split(".", 1)
+                    out.append(f"_xf2p_component_array({root_name}, {path_name!r})")
+                else:
+                    out.append(name)
                 i = j
             return "".join(out)
 
@@ -1450,7 +1459,7 @@ class basic_f2p:
 
     def transpile_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> None:
         lhs = lhs.replace("%", ".")
-        lhs_base = re.split(r"[.(]", lhs, maxsplit=1)[0].strip().lower()
+        lhs_base = lhs.split(".", 1)[0].strip().lower()
         if self._decl_types.get(lhs_base) == "integer":
             rhs_py = f"int({rhs_py})"
         mname = re.match(r"^\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(", lhs, re.I)
@@ -1466,7 +1475,9 @@ class basic_f2p:
                     idx = lhs[open_pos + 1 : close_pos].strip()
         if idx_name is not None and idx is not None:
             name = idx_name
-            if "." in name or name in arrays_1d:
+            root = name.split(".", 1)[0].lower()
+            dotted_array_ref = ("." in name) and (root not in {"np", "math", "random", "sps"})
+            if name in arrays_1d or dotted_array_ref:
                 if "," in idx:
                     parts = [p.strip() for p in split_args(idx)]
                     idx_parts: list[str] = []
@@ -2285,12 +2296,12 @@ class basic_f2p:
         parameter_names: set[str] = set()
         for code, _comment in main_lines:
             s = code.strip()
-            parsed = self._parse_decl_line(s)
-            if not parsed:
+            pd = parse_decl(s)
+            if not pd:
                 continue
-            ftype, _type_name, attrs_l, items = parsed
+            ftype, attrs, rest = pd
+            attrs_l = attrs.lower()
             if "parameter" in attrs_l:
-                rest = s.split("::", 1)[1].strip() if "::" in s else ""
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
         # allocate/init explicit-shape arrays and scalars
@@ -2346,7 +2357,7 @@ class basic_f2p:
             parsed = self._parse_decl_line(s)
             if not parsed:
                 continue
-            ftype, _type_name, attrs_l, items = parsed
+            ftype, type_name, attrs_l, items = parsed
             if "parameter" in attrs_l:
                 continue
             for name, shape, init in items:
@@ -2354,7 +2365,7 @@ class basic_f2p:
                 is_alloc = "allocatable" in attrs_l
                 sym[name] = {
                     "ftype": ftype,
-                    "type_name": _type_name,
+                    "type_name": type_name,
                     "is_array": is_array,
                     "shape": shape,
                     "init": init,
@@ -2370,12 +2381,12 @@ class basic_f2p:
             s = code.strip()
             if not s:
                 continue
-            parsed = self._parse_decl_line(s)
-            if not parsed:
+            pd = parse_decl(s)
+            if not pd:
                 continue
-            ftype, _type_name, attrs_l, items = parsed
+            ftype, attrs, rest = pd
+            attrs_l = attrs.lower()
             if "parameter" in attrs_l:
-                rest = s.split("::", 1)[1].strip() if "::" in s else ""
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
         # declare/init variables (explicit-shape arrays + scalars)
@@ -2389,7 +2400,7 @@ class basic_f2p:
             self.emit_comment(comment)
             if not s:
                 continue
-            if self._parse_decl_line(s):
+            if parse_decl(s):
                 continue
             self.handle_exec_line(s, arrays_1d)
 
@@ -2463,12 +2474,12 @@ class basic_f2p:
             s = code.strip()
             if not s:
                 continue
-            parsed = self._parse_decl_line(s)
-            if not parsed:
+            pd = parse_decl(s)
+            if not pd:
                 continue
-            ftype, _type_name, attrs_l, items = parsed
+            ftype, attrs, rest = pd
+            attrs_l = attrs.lower()
             if "parameter" in attrs_l:
-                rest = s.split("::", 1)[1].strip() if "::" in s else ""
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
         self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names)
@@ -2670,12 +2681,12 @@ class basic_f2p:
         parameter_names: set[str] = set()
         for code, _comment in main_lines:
             s = code.strip()
-            parsed = self._parse_decl_line(s)
-            if not parsed:
+            pd = parse_decl(s)
+            if not pd:
                 continue
-            ftype, _type_name, attrs_l, items = parsed
+            ftype, attrs, rest = pd
+            attrs_l = attrs.lower()
             if "parameter" in attrs_l:
-                rest = s.split("::", 1)[1].strip() if "::" in s else ""
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
         self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args))
@@ -2687,7 +2698,7 @@ class basic_f2p:
             self.emit_comment(comment)
             if not s:
                 continue
-            if self._parse_decl_line(s):
+            if parse_decl(s):
                 continue
             self.handle_exec_line(s, arrays_1d)
 
@@ -2753,6 +2764,23 @@ class basic_f2p:
         self.emit("out.extend(_xf2p_flatten(func(_xf2p_i)))")
         self.indent -= 1
         self.emit("return out")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_component_array(obj, path):")
+        self.indent += 1
+        self.emit('"""Project a component path over an array of derived-type values."""')
+        self.emit("attrs = path.split('.')")
+        self.emit("out = []")
+        self.emit("for _xf2p_item in obj:")
+        self.indent += 1
+        self.emit("val = _xf2p_item")
+        self.emit("for _xf2p_attr in attrs:")
+        self.indent += 1
+        self.emit("val = getattr(val, _xf2p_attr)")
+        self.indent -= 1
+        self.emit("out.append(val)")
+        self.indent -= 1
+        self.emit("return np.asarray(out)")
         self.indent -= 1
         self.emit("")
 
