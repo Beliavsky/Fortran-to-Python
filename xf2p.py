@@ -913,6 +913,7 @@ class basic_f2p:
         self._select_case_stack: list[dict[str, object]] = []
         self._associate_stack: list[dict[str, object]] = []
         self._seen_scipy_special = False
+        self._elemental_funcs: set[str] = set()
 
     def _kind_alias_value(self, remote: str) -> str | None:
         r = remote.strip().lower()
@@ -1020,10 +1021,24 @@ class basic_f2p:
 
 
     def _is_function_header(self, s: str) -> bool:
-        return bool(re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure\s+)?\w+(?:\s*\([^)]*\))?\s+)*function\b", s, re.I))
+        return bool(re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure|elemental|recursive)\s+)*(?:\w+(?:\s*\([^)]*\))?\s+)*function\b", s, re.I))
 
     def _is_subroutine_header(self, s: str) -> bool:
-        return bool(re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:pure\s+)?subroutine\b", s, re.I))
+        return bool(re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:(?:pure|elemental|recursive)\s+)*subroutine\b", s, re.I))
+
+    def _is_elemental_header(self, s: str) -> bool:
+        return bool(re.search(r"\belemental\b", s, re.I))
+
+    def _scalar_otype_expr(self, ftype: str | None, type_name: str | None = None) -> str:
+        if ftype == "integer":
+            return "np.int_"
+        if ftype == "real":
+            return "np.float64"
+        if ftype == "logical":
+            return "np.bool_"
+        if ftype == "complex":
+            return "np.complex128"
+        return "object"
 
     def _collect_subprogram_body(self, lines: list[tuple[str, str]], start_idx: int, outer_kind: str) -> tuple[list[tuple[str, str]], int]:
         body: list[tuple[str, str]] = []
@@ -2396,16 +2411,7 @@ class basic_f2p:
                     if implied_py is not None:
                         args2.append(f"*{implied_py}")
                     else:
-                        # Expand array-valued args in list-directed output (Fortran prints elements).
-                        is_iterable = _is_recyclable_io_iterable(a, self._decl_array_types)
-                        mm_sec = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", a, re.I)
-                        if (not is_iterable) and mm_sec and (mm_sec.group(1).lower() in self._decl_array_types) and (":" in mm_sec.group(2)):
-                            is_iterable = True
-                        if is_iterable:
-                            a_py = self.translate_expr(a, arrays_1d)
-                            args2.append(f"*np.ravel(np.asarray({a_py}), order='F')")
-                        else:
-                            args2.append(self.translate_expr(a, arrays_1d))
+                        args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
             self.emit(f"print({', '.join(args2)})")
             return True
 
@@ -2475,16 +2481,7 @@ class basic_f2p:
                     if implied_py is not None:
                         args2.append(f"*{implied_py}")
                     else:
-                        # Expand array-valued args in list-directed output (Fortran prints elements).
-                        is_iterable = _is_recyclable_io_iterable(a, self._decl_array_types)
-                        mm_sec = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", a, re.I)
-                        if (not is_iterable) and mm_sec and (mm_sec.group(1).lower() in self._decl_array_types) and (":" in mm_sec.group(2)):
-                            is_iterable = True
-                        if is_iterable:
-                            a_py = self.translate_expr(a, arrays_1d)
-                            args2.append(f"*np.ravel(np.asarray({a_py}), order='F')")
-                        else:
-                            args2.append(self.translate_expr(a, arrays_1d))
+                        args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
             self.emit(f"print({', '.join(args2)})")
             return True
 
@@ -2511,16 +2508,7 @@ class basic_f2p:
                     if implied_py is not None:
                         args2.append(f"*{implied_py}")
                     else:
-                        # Expand array-valued args in list-directed output (Fortran prints elements).
-                        is_iterable = _is_recyclable_io_iterable(a, self._decl_array_types)
-                        mm_sec = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", a, re.I)
-                        if (not is_iterable) and mm_sec and (mm_sec.group(1).lower() in self._decl_array_types) and (":" in mm_sec.group(2)):
-                            is_iterable = True
-                        if is_iterable:
-                            a_py = self.translate_expr(a, arrays_1d)
-                            args2.append(f"*np.ravel(np.asarray({a_py}), order='F')")
-                        else:
-                            args2.append(self.translate_expr(a, arrays_1d))
+                        args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
             self.emit(f"print({', '.join(args2)}, file={unit})")
             return True
 
@@ -2637,16 +2625,7 @@ class basic_f2p:
                     if _is_fortran_string_literal(a):
                         args2.append(a)
                     else:
-                        # Expand array-valued args in list-directed output (Fortran prints elements).
-                        is_iterable = _is_recyclable_io_iterable(a, self._decl_array_types)
-                        mm_sec = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", a, re.I)
-                        if (not is_iterable) and mm_sec and (mm_sec.group(1).lower() in self._decl_array_types) and (":" in mm_sec.group(2)):
-                            is_iterable = True
-                        if is_iterable:
-                            a_py = self.translate_expr(a, arrays_1d)
-                            args2.append(f"*np.ravel(np.asarray({a_py}), order='F')")
-                        else:
-                            args2.append(self.translate_expr(a, arrays_1d))
+                        args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
             end_txt = ', end=""' if "advance" in ctl and "'no'" in ctl else ""
             file_txt = ""
             if unit_expr != "*":
@@ -2693,6 +2672,7 @@ class basic_f2p:
 
     def transpile_function(self, header: str, body_lines: list[tuple[str, str]]) -> None:
         hdr = header.strip()
+        is_elemental = self._is_elemental_header(hdr)
         # tolerate arbitrary prefixes such as:
         # "pure real(kind=dp) function f(...)" or "real(kind=dp) pure function f(...)"
         m = re.search(r"\bfunction\s+(\w+)\s*\(\s*([^\)]*)\s*\)\s*result\s*\(\s*(\w+)\s*\)", hdr, re.I)
@@ -2719,6 +2699,7 @@ class basic_f2p:
         result_is_scalar = True
         result_is_derived = False
         result_type_name: str | None = None
+        result_ftype = header_ftype
 
         self._emit_intrinsic_use_aliases(main_lines)
 
@@ -2764,6 +2745,7 @@ class basic_f2p:
                         arg_hints[name] = self._type_hint(ftype, type_name, is_array=False)
 
                 if name == result_name:
+                    result_ftype = ftype
                     if is_array:
                         result_hint = _type_ndarray_hint.get(ftype, "npt.NDArray[np.float64]")
                         result_is_scalar = False
@@ -2810,6 +2792,14 @@ class basic_f2p:
                 for ln in lead_doc:
                     self.emit(ln)
                 self.emit('"""')
+
+        if is_elemental:
+            self._elemental_funcs.add(fname.lower())
+            _xf2p_elem_guard = " or ".join(f"_xf2p_is_arraylike({a})" for a in args) if args else "False"
+            self.emit(f"if {_xf2p_elem_guard}:")
+            self.indent += 1
+            self.emit(f"return np.vectorize({fname}, otypes=[{self._scalar_otype_expr(result_ftype, result_type_name)}])({', '.join(args)})")
+            self.indent -= 1
 
         for kind, header, ibody in internals:
             if kind == "function":
@@ -3027,7 +3017,7 @@ class basic_f2p:
                 if not line:
                     i += 1
                     continue
-                if re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure\s+)?\w+(?:\s*\([^)]*\))?\s+)*function\b", line, re.I):
+                if self._is_function_header(line):
                     func_header = line
                     fbody: list[tuple[str, str]] = []
                     i += 1
@@ -3038,7 +3028,7 @@ class basic_f2p:
                         i += 1
                     self.transpile_function(func_header, fbody)
                     continue
-                if re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:pure\s+)?subroutine\b", line, re.I):
+                if self._is_subroutine_header(line):
                     sub_header = line
                     sbody: list[tuple[str, str]] = []
                     i += 1
@@ -3095,7 +3085,7 @@ class basic_f2p:
                 if not line:
                     i += 1
                     continue
-                if re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure\s+)?\w+(?:\s*\([^)]*\))?\s+)*function\b", line, re.I):
+                if self._is_function_header(line):
                     header = line
                     fbody: list[tuple[str, str]] = []
                     i += 1
@@ -3106,7 +3096,7 @@ class basic_f2p:
                         i += 1
                     self.transpile_function(header, fbody)
                     continue
-                if re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:pure\s+)?subroutine\b", line, re.I):
+                if self._is_subroutine_header(line):
                     header = line
                     sbody: list[tuple[str, str]] = []
                     i += 1
@@ -3130,7 +3120,8 @@ class basic_f2p:
 
     def transpile_subroutine(self, header: str, body_lines: list[tuple[str, str]]) -> None:
         hdr = header.strip()
-        m = re.match(r"(?:pure\s+)?subroutine\s+(\w+)\s*\(\s*([^\)]*)\s*\)", hdr, re.I)
+        is_elemental = self._is_elemental_header(hdr)
+        m = re.match(r"(?:(?:pure|elemental|recursive)\s+)*subroutine\s+(\w+)\s*\(\s*([^\)]*)\s*\)", hdr, re.I)
         if not m:
             return
         sname = m.group(1)
@@ -3195,13 +3186,22 @@ class basic_f2p:
             else:
                 args_annot.append(f"{a}: {hint}")
         out_formals: list[str] = []
+        pure_out_formals: list[str] = []
+        vector_formals: list[str] = []
+        out_otypes: list[str] = []
         for a in args:
             info = sym.get(a)
             if not info:
+                vector_formals.append(a)
                 continue
             attrs_l = info.get("attrs_l", "")
             if "intent(out" in attrs_l or "intent(inout" in attrs_l:
                 out_formals.append(a)
+                out_otypes.append(self._scalar_otype_expr(cast(str, info.get("ftype")), cast(str | None, info.get("type_name"))))
+            if "intent(out" in attrs_l and "intent(inout" not in attrs_l:
+                pure_out_formals.append(a)
+            else:
+                vector_formals.append(a)
         self._subr_sigs[sname.lower()] = {"args": list(args), "out": list(out_formals)}
 
         self.emit(f"def {sname}({', '.join(args_annot)}):")
@@ -3212,6 +3212,23 @@ class basic_f2p:
                 self.transpile_function(header, ibody)
             else:
                 self.transpile_subroutine(header, ibody)
+
+        if is_elemental and out_formals and vector_formals:
+            _xf2p_elem_guard = " or ".join(f"_xf2p_is_arraylike({a})" for a in vector_formals)
+            _xf2p_lambda_args = [f"_xf2p_{a}" for a in vector_formals]
+            _xf2p_call_args: list[str] = []
+            for _xf2p_a in args:
+                if _xf2p_a in pure_out_formals:
+                    _xf2p_call_args.append("None")
+                elif _xf2p_a in vector_formals:
+                    _xf2p_call_args.append(f"_xf2p_{_xf2p_a}")
+                else:
+                    _xf2p_call_args.append(_xf2p_a)
+            self.emit(f"if {_xf2p_elem_guard}:")
+            self.indent += 1
+            self.emit(f"_xf2p_vec = np.vectorize(lambda {', '.join(_xf2p_lambda_args)}: {sname}({', '.join(_xf2p_call_args)}), otypes=[{', '.join(out_otypes)}])")
+            self.emit(f"return _xf2p_vec({', '.join(vector_formals)})")
+            self.indent -= 1
 
         parameter_names: set[str] = set()
         for code, _comment in main_lines:
@@ -3289,6 +3306,32 @@ class basic_f2p:
         self.indent -= 1
         self.indent -= 1
         self.emit("")
+        self.emit("def _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit('"""Return True for list/tuple/ndarray values handled elementally."""')
+        self.emit("return isinstance(x, (list, tuple, np.ndarray)) and not isinstance(x, (str, bytes))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_io_items(x):")
+        self.indent += 1
+        self.emit('"""Flatten list-directed output items the way Fortran prints arrays."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("return list(np.ravel(x, order='F'))")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("out = []")
+        self.emit("for item in x:")
+        self.indent += 1
+        self.emit("out.extend(_xf2p_io_items(item))")
+        self.indent -= 1
+        self.emit("return out")
+        self.indent -= 1
+        self.emit("return [x]")
+        self.indent -= 1
+        self.emit("")
+
         self.emit("def _xf2p_implied_do(func, lo, hi, step=1):")
         self.indent += 1
         self.emit('"""Expand a Fortran I/O implied-DO into a flat Python list."""')
@@ -3377,7 +3420,7 @@ class basic_f2p:
                 self.transpile_derived_type(header, tbody)
                 continue
 
-            if re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure\s+)?\w+(?:\s*\([^)]*\))?\s+)*function\b", line, re.I):
+            if self._is_function_header(line):
                 header = line
                 body: list[tuple[str, str]] = []
                 i += 1
@@ -3389,7 +3432,7 @@ class basic_f2p:
                 self.transpile_function(header, body)
                 continue
 
-            if re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:pure\s+)?subroutine\b", line, re.I):
+            if self._is_subroutine_header(line):
                 header = line
                 body: list[tuple[str, str]] = []
                 i += 1
