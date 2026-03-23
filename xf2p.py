@@ -1626,7 +1626,8 @@ class basic_f2p:
         s = re.sub(r"\bmin\s*\(", "np.minimum(", s, flags=re.I)
         s = re.sub(r"\breshape\s*\(", "np.reshape(", s, flags=re.I)
         s = re.sub(r"\bspread\s*\(", "_f_spread(", s, flags=re.I)
-        s = re.sub(r"\bmod\s*\(", "np.mod(", s, flags=re.I)
+        s = re.sub(r"\bmodulo\s*\(", "_xf2p_modulo(", s, flags=re.I)
+        s = re.sub(r"\bmod\s*\(", "_xf2p_mod(", s, flags=re.I)
         s = re.sub(r"\bmaxval\s*\(", "np.max(", s, flags=re.I)
         s = re.sub(r"\bminval\s*\(", "np.min(", s, flags=re.I)
         s = re.sub(r"\bcount\s*\(", "np.count_nonzero(", s, flags=re.I)
@@ -4026,6 +4027,50 @@ class basic_f2p:
         self.emit("return np.vectorize(lambda y: str(aa) + str(y), otypes=[object])(bb)")
         self.indent -= 1
         self.emit("return str(aa) + str(bb)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_mod(a, p):")
+        self.indent += 1
+        self.emit('"""Fortran MOD intrinsic with scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(a) or _xf2p_is_arraylike(p):")
+        self.indent += 1
+        self.emit("aa = np.asarray(a)")
+        self.emit("pp = np.asarray(p)")
+        self.emit("rr = aa - np.trunc(aa / pp) * pp")
+        self.emit("if np.issubdtype(aa.dtype, np.integer) and np.issubdtype(pp.dtype, np.integer):")
+        self.indent += 1
+        self.emit("return np.asarray(np.rint(rr), dtype=np.result_type(aa.dtype, pp.dtype))")
+        self.indent -= 1
+        self.emit("return rr")
+        self.indent -= 1
+        self.emit("rr = a - np.trunc(a / p) * p")
+        self.emit("if isinstance(a, (int, np.integer)) and isinstance(p, (int, np.integer)) and not isinstance(a, (bool, np.bool_)) and not isinstance(p, (bool, np.bool_)):")
+        self.indent += 1
+        self.emit("return int(np.rint(rr))")
+        self.indent -= 1
+        self.emit("return rr")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_modulo(a, p):")
+        self.indent += 1
+        self.emit('"""Fortran MODULO intrinsic with scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(a) or _xf2p_is_arraylike(p):")
+        self.indent += 1
+        self.emit("aa = np.asarray(a)")
+        self.emit("pp = np.asarray(p)")
+        self.emit("rr = aa - np.floor(aa / pp) * pp")
+        self.emit("if np.issubdtype(aa.dtype, np.integer) and np.issubdtype(pp.dtype, np.integer):")
+        self.indent += 1
+        self.emit("return np.asarray(np.rint(rr), dtype=np.result_type(aa.dtype, pp.dtype))")
+        self.indent -= 1
+        self.emit("return rr")
+        self.indent -= 1
+        self.emit("rr = a - np.floor(a / p) * p")
+        self.emit("if isinstance(a, (int, np.integer)) and isinstance(p, (int, np.integer)) and not isinstance(a, (bool, np.bool_)) and not isinstance(p, (bool, np.bool_)):")
+        self.indent += 1
+        self.emit("return int(np.rint(rr))")
+        self.indent -= 1
+        self.emit("return rr")
         self.indent -= 1
         self.emit("")
         self.emit("def _f_len(x):")
