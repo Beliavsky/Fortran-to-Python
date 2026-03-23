@@ -1355,12 +1355,15 @@ class basic_f2p:
                 "cospi",
                 "sinpi",
                 "tanpi",
+                "trim",
                 "real",
                 "int",
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
             args_py = [self.translate_expr(p, arrays_1d) for p in parts]
+            if lname == "trim" and len(args_py) == 1:
+                return f"str({args_py[0]}).rstrip()"
             if lname == "real":
                 if len(parts) >= 1:
                     arg0_raw = parts[0].strip()
@@ -1767,23 +1770,21 @@ class basic_f2p:
                 self.emit(f"{name} = np.empty({sz})")
             return True
 
-        # open(newunit=fp, file="temp.txt", status="replace", action="write", ...)
+        # open(newunit=fp, file="temp.txt", ...) or open(unit=iu, file="temp.txt", ...)
         mm = re.match(r"open\s*\(\s*(.+)\s*\)\s*$", s, re.I)
         if mm:
             spec = mm.group(1).strip()
-            parts = split_args(spec)
-            kws = {}
-            for p in parts:
-                mk = re.match(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", p, re.I)
-                if mk:
-                    kws[mk.group(1).lower()] = mk.group(2).strip()
-            newunit = kws.get("newunit", None)
-            file_expr = kws.get("file", None)
-            status = kws.get("status", None)
-            action = kws.get("action", None)
-            position = kws.get("position", None)
-            if newunit is None or file_expr is None:
-                # fallback for unsupported OPEN forms
+            unit_m = re.search(r"\b(?:newunit|unit)\s*=\s*([^,]+)", spec, re.I)
+            file_m = re.search(r"\bfile\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
+            status_m = re.search(r"\bstatus\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
+            action_m = re.search(r"\baction\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
+            position_m = re.search(r"\bposition\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
+            unit_var = unit_m.group(1).strip() if unit_m else None
+            file_expr = file_m.group(1).strip() if file_m else None
+            status = status_m.group(1).strip() if status_m else None
+            action = action_m.group(1).strip() if action_m else None
+            position = position_m.group(1).strip() if position_m else None
+            if unit_var is None or file_expr is None:
                 self.emit(f"# unsupported open form: {s}")
                 return True
             mode = "r"
@@ -1794,7 +1795,7 @@ class basic_f2p:
                 mode = "w"
             if pos == "append":
                 mode = "a"
-            self.emit(f"{newunit} = open({self.translate_expr(file_expr, arrays_1d)}, {mode!r})")
+            self.emit(f"{unit_var} = open({self.translate_expr(file_expr, arrays_1d)}, {mode!r})")
             return True
 
         # close(fp)
@@ -1814,22 +1815,21 @@ class basic_f2p:
                 self.emit(f"{name} = np.float64(np.random.random())")
             return True
 
-        # open(newunit=fp, file="temp.txt", status="replace", action="write", ...)
+        # open(newunit=fp, file="temp.txt", ...) or open(unit=iu, file="temp.txt", ...)
         mm = re.match(r"open\s*\(\s*(.+)\s*\)\s*$", s, re.I)
         if mm:
             spec = mm.group(1).strip()
-            parts = split_args(spec)
-            kws = {}
-            for p in parts:
-                mk = re.match(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", p, re.I)
-                if mk:
-                    kws[mk.group(1).lower()] = mk.group(2).strip()
-            newunit = kws.get("newunit", None)
-            file_expr = kws.get("file", None)
-            status = kws.get("status", None)
-            action = kws.get("action", None)
-            position = kws.get("position", None)
-            if newunit is None or file_expr is None:
+            unit_m = re.search(r"\b(?:newunit|unit)\s*=\s*([^,]+)", spec, re.I)
+            file_m = re.search(r"\bfile\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
+            status_m = re.search(r"\bstatus\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
+            action_m = re.search(r"\baction\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
+            position_m = re.search(r"\bposition\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
+            unit_var = unit_m.group(1).strip() if unit_m else None
+            file_expr = file_m.group(1).strip() if file_m else None
+            status = status_m.group(1).strip() if status_m else None
+            action = action_m.group(1).strip() if action_m else None
+            position = position_m.group(1).strip() if position_m else None
+            if unit_var is None or file_expr is None:
                 self.emit(f"# unsupported open form: {s}")
                 return True
             mode = "r"
@@ -1840,7 +1840,7 @@ class basic_f2p:
                 mode = "w"
             if pos == "append":
                 mode = "a"
-            self.emit(f"{newunit} = open({self.translate_expr(file_expr, arrays_1d)}, {mode!r})")
+            self.emit(f"{unit_var} = open({self.translate_expr(file_expr, arrays_1d)}, {mode!r})")
             return True
 
         # close(fp)
@@ -1850,6 +1850,33 @@ class basic_f2p:
             self.emit(f"{unit}.close()")
             return True
 
+        # read(unit, "(a)", iostat=ios) text
+        if sl.startswith("read"):
+            p0 = s.find("(")
+            if p0 != -1:
+                p1 = find_matching_paren(s, p0)
+                if p1 != -1:
+                    spec = s[p0 + 1 : p1].strip()
+                    rest = s[p1 + 1 :].strip()
+                    parts = split_args(spec)
+                    if len(parts) >= 2:
+                        unit = self.translate_expr(parts[0].strip(), arrays_1d)
+                        fmt = parts[1].strip()
+                        kws = {}
+                        for p in parts[2:]:
+                            mk = re.match(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", p, re.I)
+                            if mk:
+                                kws[mk.group(1).lower()] = mk.group(2).strip()
+                        if fmt != "*":
+                            fmt_txt = _fortran_unquote(fmt).strip().lower() if (len(fmt) >= 2 and fmt[0] in ("'", '"') and fmt[-1] == fmt[0]) else ""
+                            if fmt_txt in {"(a)", "a"} and rest:
+                                ios_var = kws.get("iostat")
+                                lhs = self.translate_expr(rest, arrays_1d)
+                                self.emit(f"__xf2p_line = {unit}.readline()")
+                                if ios_var is not None:
+                                    self.emit(f"{ios_var} = 0 if __xf2p_line != '' else -1")
+                                self.emit(f"{lhs} = __xf2p_line.rstrip('\\n')")
+                                return True
         # read(fp,*) a, b, arr(i,:), ...
         mm = re.match(r"read\s*\(\s*([a-z_]\w*)\s*,\s*\*\s*\)\s*(.+)$", s, re.I)
         if mm:
