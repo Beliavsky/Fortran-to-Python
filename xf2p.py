@@ -1706,6 +1706,10 @@ class basic_f2p:
 
         s = _rewrite_fortran_string_literals(s)
 
+        implied_py = _fortran_implied_do_expr(s, self.translate_expr, arrays_1d)
+        if implied_py is not None:
+            return implied_py
+
         if len(s) >= 2 and s[0] == "[" and s[-1] == "]":
             inner = s[1:-1].strip()
             cc = _find_top_level_double_colon(inner)
@@ -1727,8 +1731,37 @@ class basic_f2p:
                 if base_type is not None:
                     if not elems_txt:
                         return f"np.asarray([], dtype={dtype_map[base_type]})"
-                    elems_py = ", ".join(self.translate_expr(p.strip(), arrays_1d) for p in split_args(elems_txt))
-                    return f"np.asarray([{elems_py}], dtype={dtype_map[base_type]})"
+                    elems_parts = [p.strip() for p in split_args(elems_txt) if p.strip()]
+                    list_terms = []
+                    for p in elems_parts:
+                        implied_term = _fortran_implied_do_expr(p, self.translate_expr, arrays_1d)
+                        if implied_term is not None:
+                            list_terms.append(implied_term)
+                        else:
+                            list_terms.append(f"[{self.translate_expr(p, arrays_1d)}]")
+                    if not list_terms:
+                        return f"np.asarray([], dtype={dtype_map[base_type]})"
+                    list_py = list_terms[0]
+                    for term in list_terms[1:]:
+                        list_py = f"{list_py} + {term}"
+                    return f"np.asarray({list_py}, dtype={dtype_map[base_type]})"
+            elems_parts = [p.strip() for p in split_args(inner) if p.strip()]
+            list_terms = []
+            has_implied = False
+            for p in elems_parts:
+                implied_term = _fortran_implied_do_expr(p, self.translate_expr, arrays_1d)
+                if implied_term is not None:
+                    has_implied = True
+                    list_terms.append(implied_term)
+                else:
+                    list_terms.append(f"[{self.translate_expr(p, arrays_1d)}]")
+            if has_implied:
+                if not list_terms:
+                    return "np.asarray([])"
+                list_py = list_terms[0]
+                for term in list_terms[1:]:
+                    list_py = f"{list_py} + {term}"
+                return f"np.asarray({list_py})"
 
         # kind(...) used as a kind selector
         # basic rule: if it uses a d exponent constant, treat it as double precision -> 8
