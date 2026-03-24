@@ -527,6 +527,34 @@ def _is_fortran_string_literal(s: str) -> bool:
     return False
 
 
+def _rewrite_fortran_string_literals(s: str) -> str:
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch not in ("'", '"'):
+            out.append(ch)
+            i += 1
+            continue
+        q = ch
+        j = i + 1
+        while j < n:
+            if s[j] == q:
+                if j + 1 < n and s[j + 1] == q:
+                    j += 2
+                    continue
+                lit = s[i:j + 1]
+                out.append(repr(_fortran_unquote(lit)))
+                i = j + 1
+                break
+            j += 1
+        else:
+            out.append(ch)
+            i += 1
+    return ''.join(out)
+
+
 def _strip_one_outer_paren(s: str) -> str:
     s = s.strip()
     if len(s) >= 2 and s[0] == "(" and s[-1] == ")" and find_matching_paren(s, 0) == len(s) - 1:
@@ -972,18 +1000,64 @@ def infer_function_result_ftype(header: str) -> str | None:
         return None
     return m.group(1).lower()
 
-_decl_re = re.compile(r"^(integer|real|logical|complex|character(?:\s*\([^)]*\))?)\b(.*)::(.*)$", re.I)
+_decl_re = re.compile(r"^(integer|real|logical|complex|character(?:\s*\([^)]*\))?)\b(.*)$", re.I)
+
+
+def _find_top_level_double_colon(s: str) -> int:
+    in_str = False
+    quote = ""
+    pdepth = 0
+    bdepth = 0
+    i = 0
+    n = len(s)
+    while i < n - 1:
+        ch = s[i]
+        if in_str:
+            if ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            quote = ch
+            i += 1
+            continue
+        if ch == "(":
+            pdepth += 1
+            i += 1
+            continue
+        if ch == ")":
+            pdepth = max(0, pdepth - 1)
+            i += 1
+            continue
+        if ch == "[":
+            bdepth += 1
+            i += 1
+            continue
+        if ch == "]":
+            bdepth = max(0, bdepth - 1)
+            i += 1
+            continue
+        if pdepth == 0 and bdepth == 0 and s.startswith("::", i):
+            return i
+        i += 1
+    return -1
 
 
 def parse_decl(line: str):
-    m = _decl_re.match(line.strip())
+    s = line.strip()
+    pos = _find_top_level_double_colon(s)
+    if pos == -1:
+        return None
+    lhs = s[:pos].strip()
+    rest = s[pos + 2 :].strip()
+    m = _decl_re.match(lhs)
     if not m:
         return None
     ftype = m.group(1).lower()
     if ftype.startswith("character"):
         ftype = "character"
-    attrs = m.group(2).strip()
-    rest = m.group(3).strip()
+    attrs = m.group(2).strip().rstrip(",").strip()
     return ftype, attrs, rest
 
 
@@ -1626,6 +1700,35 @@ class basic_f2p:
             for part_py in parts_py[1:]:
                 expr_py = f"_xf2p_concat({expr_py}, {part_py})"
             return expr_py
+
+        if len(s) >= 2 and s[0] in ("'", '"') and s[-1] == s[0]:
+            return repr(_fortran_unquote(s))
+
+        s = _rewrite_fortran_string_literals(s)
+
+        if len(s) >= 2 and s[0] == "[" and s[-1] == "]":
+            inner = s[1:-1].strip()
+            cc = _find_top_level_double_colon(inner)
+            if cc != -1:
+                type_spec = inner[:cc].strip().lower()
+                elems_txt = inner[cc + 2 :].strip()
+                dtype_map = {
+                    "integer": "int",
+                    "logical": "bool",
+                    "real": "np.float64",
+                    "complex": "np.complex128",
+                    "character": "object",
+                }
+                base_type = None
+                for key in dtype_map:
+                    if type_spec.startswith(key):
+                        base_type = key
+                        break
+                if base_type is not None:
+                    if not elems_txt:
+                        return f"np.asarray([], dtype={dtype_map[base_type]})"
+                    elems_py = ", ".join(self.translate_expr(p.strip(), arrays_1d) for p in split_args(elems_txt))
+                    return f"np.asarray([{elems_py}], dtype={dtype_map[base_type]})"
 
         # kind(...) used as a kind selector
         # basic rule: if it uses a d exponent constant, treat it as double precision -> 8
@@ -3246,6 +3349,126 @@ class basic_f2p:
                 self.emit(f"_xf2p_print_star({', '.join(args2)})")
             return True
 
+        # robust write(...) parser
+        if re.match(r"write\b", s, re.I):
+            mkw = re.match(r"write\b", s, re.I)
+            j = mkw.end()
+            while j < len(s) and s[j].isspace():
+                j += 1
+            if j < len(s) and s[j] == "(":
+                p1 = find_matching_paren(s, j)
+                if p1 != -1:
+                    ctl = s[j + 1 : p1].strip()
+                    rest = s[p1 + 1 :].strip()
+                    ctl_parts = [p.strip() for p in split_args(ctl)]
+                    unit_raw = ctl_parts[0] if ctl_parts else "*"
+                    fmt_raw = ctl_parts[1] if len(ctl_parts) >= 2 else "*"
+                    advance_no = any(re.match(r"(?is)^advance\s*=\s*['\"]no['\"]$", p) for p in ctl_parts[2:])
+                    unit_base_m = re.match(r"([a-z_]\w*)", unit_raw, re.I)
+                    unit_base = unit_base_m.group(1).lower() if unit_base_m else ""
+                    internal_char_target = unit_raw != "*" and (
+                        self._decl_types.get(unit_base) == "character"
+                        or self._decl_array_types.get(unit_base) == "character"
+                    )
+
+                    raw_args = [a.strip() for a in split_args(rest)] if rest else []
+
+                    def _star_args(raw_list):
+                        out = []
+                        for a in raw_list:
+                            if _is_fortran_string_literal(a):
+                                out.append(self.translate_expr(a, arrays_1d))
+                            else:
+                                implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                if implied_py is not None:
+                                    out.append(f"*{implied_py}")
+                                else:
+                                    out.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+                        return out
+
+                    def _fmt_args(raw_list):
+                        out = []
+                        for a in raw_list:
+                            if _is_fortran_string_literal(a):
+                                out.append(self.translate_expr(a, arrays_1d))
+                            else:
+                                implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                if implied_py is not None:
+                                    out.append(implied_py)
+                                else:
+                                    out.append(self.translate_expr(a, arrays_1d))
+                        return out
+
+                    if fmt_raw == "*":
+                        args_star = _star_args(raw_args)
+                        if internal_char_target:
+                            target_py = self.translate_expr(unit_raw, arrays_1d)
+                            rhs = "''" if not args_star else f"_xf2p_star_text({', '.join(args_star)})"
+                            rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
+                            self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if not args_star:
+                            if file_txt:
+                                self.emit(f"print({file_txt[2:]})")
+                            else:
+                                self.emit("print()")
+                        else:
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        return True
+
+                    if _is_fortran_string_literal(fmt_raw):
+                        args_fmt = _fmt_args(raw_args)
+                        fmt_expr = None
+                        if len(raw_args) == 1:
+                            a0 = raw_args[0].strip()
+                            if _is_recyclable_io_iterable(a0, self._decl_array_types):
+                                fmt_expr = _fortran_format_recycled_expr(fmt_raw, args_fmt[0])
+                        if fmt_expr is None and len(raw_args) > 1:
+                            plan = _single_iterable_formatted_arg_plan(fmt_raw, raw_args, self._decl_array_types)
+                            if plan is not None:
+                                iter_pos, iter_need = plan
+                                iter_raw = raw_args[iter_pos].strip()
+                                iter_tmp = f"_xf2p_fmt_items_{self._code_emit_count + 1}"
+                                if re.fullmatch(r"[a-z_]\w*", iter_raw, flags=re.I) and iter_raw.lower() in self._decl_array_types:
+                                    self.emit(f"{iter_tmp} = list(np.ravel({args_fmt[iter_pos]}, order='F'))")
+                                else:
+                                    self.emit(f"{iter_tmp} = list({args_fmt[iter_pos]})")
+                                expanded_args = args_fmt[:iter_pos] + [f"{iter_tmp}[{k}]" for k in range(iter_need)] + args_fmt[iter_pos + 1:]
+                                fmt_expr = _fortran_format_expr(fmt_raw, expanded_args)
+                        if fmt_expr is None:
+                            fmt_expr = _fortran_format_expr(fmt_raw, args_fmt)
+                        if internal_char_target:
+                            target_py = self.translate_expr(unit_raw, arrays_1d)
+                            rhs_core = fmt_expr if fmt_expr is not None else ("''" if not raw_args else f"_xf2p_star_text({', '.join(_star_args(raw_args))})")
+                            rhs = f"_f_str_assign({rhs_core}, _f_len({target_py}))"
+                            self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if fmt_expr is not None:
+                            self.emit(f"print({fmt_expr}{', end=""' if advance_no else ''}{file_txt})")
+                        else:
+                            args_star = _star_args(raw_args)
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        return True
+
+                    args_star = _star_args(raw_args)
+                    if internal_char_target:
+                        target_py = self.translate_expr(unit_raw, arrays_1d)
+                        rhs = "''" if not args_star else f"_xf2p_star_text({', '.join(args_star)})"
+                        rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
+                        self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                    else:
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if args_star:
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        else:
+                            if file_txt:
+                                self.emit(f"print({file_txt[2:]})")
+                            else:
+                                self.emit("print()")
+                    return True
+
         # write(*,*)
         mm = re.match(r"write\s*\(\s*\*\s*,\s*\*\s*\)\s*$", s, re.I)
         if mm:
@@ -3403,34 +3626,136 @@ class basic_f2p:
             return True
 
         # generic write(...) ... fallback
-        mm = re.match(r"write\s*\(\s*(.*?)\s*\)\s*(.*)$", s, re.I)
-        if mm:
-            ctl = mm.group(1).strip().lower()
-            rest = mm.group(2).strip()
-            ctl_parts = split_args(ctl)
-            unit_expr = "*"
-            if ctl_parts:
-                unit_expr = ctl_parts[0].strip()
-            args2 = []
-            if rest:
-                for a in split_args(rest):
-                    a = a.strip()
-                    if _is_fortran_string_literal(a):
-                        args2.append(a)
+        if re.match(r"write\b", s, re.I):
+            mkw = re.match(r"write\b", s, re.I)
+            j = mkw.end()
+            while j < len(s) and s[j].isspace():
+                j += 1
+            if j < len(s) and s[j] == "(":
+                p1 = find_matching_paren(s, j)
+                if p1 != -1:
+                    ctl = s[j + 1 : p1].strip()
+                    rest = s[p1 + 1 :].strip()
+                    ctl_parts = [p.strip() for p in split_args(ctl)]
+                    unit_raw = ctl_parts[0] if ctl_parts else "*"
+                    fmt_raw = ctl_parts[1] if len(ctl_parts) >= 2 else "*"
+                    advance_no = any(re.match(r"(?is)^advance\s*=\s*['\"]no['\"]$", p) for p in ctl_parts[2:])
+                    unit_base_m = re.match(r"([a-z_]\w*)", unit_raw, re.I)
+                    unit_base = unit_base_m.group(1).lower() if unit_base_m else ""
+                    internal_char_target = unit_raw != "*" and (
+                        self._decl_types.get(unit_base) == "character"
+                        or self._decl_array_types.get(unit_base) == "character"
+                    )
+
+                    raw_args = [a.strip() for a in split_args(rest)] if rest else []
+
+                    if fmt_raw == "*":
+                        args_star = []
+                        for a in raw_args:
+                            if _is_fortran_string_literal(a):
+                                args_star.append(self.translate_expr(a, arrays_1d))
+                            else:
+                                implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                if implied_py is not None:
+                                    args_star.append(f"*{implied_py}")
+                                else:
+                                    args_star.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+                        if internal_char_target:
+                            target_py = self.translate_expr(unit_raw, arrays_1d)
+                            rhs = "''" if not args_star else f"_xf2p_star_text({', '.join(args_star)})"
+                            rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
+                            self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if not args_star:
+                            if file_txt:
+                                self.emit(f"print({file_txt[2:]})")
+                            else:
+                                self.emit("print()")
+                        else:
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        return True
+
+                    if _is_fortran_string_literal(fmt_raw):
+                        args_fmt = []
+                        for a in raw_args:
+                            if _is_fortran_string_literal(a):
+                                args_fmt.append(self.translate_expr(a, arrays_1d))
+                            else:
+                                implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                if implied_py is not None:
+                                    args_fmt.append(implied_py)
+                                else:
+                                    args_fmt.append(self.translate_expr(a, arrays_1d))
+                        fmt_expr = None
+                        if len(raw_args) == 1:
+                            a0 = raw_args[0].strip()
+                            if _is_recyclable_io_iterable(a0, self._decl_array_types):
+                                fmt_expr = _fortran_format_recycled_expr(fmt_raw, args_fmt[0])
+                        if fmt_expr is None and len(raw_args) > 1:
+                            plan = _single_iterable_formatted_arg_plan(fmt_raw, raw_args, self._decl_array_types)
+                            if plan is not None:
+                                iter_pos, iter_need = plan
+                                iter_raw = raw_args[iter_pos].strip()
+                                iter_tmp = f"_xf2p_fmt_items_{self._code_emit_count + 1}"
+                                if re.fullmatch(r"[a-z_]\w*", iter_raw, flags=re.I) and iter_raw.lower() in self._decl_array_types:
+                                    self.emit(f"{iter_tmp} = list(np.ravel({args_fmt[iter_pos]}, order='F'))")
+                                else:
+                                    self.emit(f"{iter_tmp} = list({args_fmt[iter_pos]})")
+                                expanded_args = args_fmt[:iter_pos] + [f"{iter_tmp}[{k}]" for k in range(iter_need)] + args_fmt[iter_pos + 1:]
+                                fmt_expr = _fortran_format_expr(fmt_raw, expanded_args)
+                        if fmt_expr is None:
+                            fmt_expr = _fortran_format_expr(fmt_raw, args_fmt)
+                        if internal_char_target:
+                            target_py = self.translate_expr(unit_raw, arrays_1d)
+                            rhs_core = fmt_expr if fmt_expr is not None else ("''" if not raw_args else f"_xf2p_star_text({', '.join(f'*_xf2p_io_items({self.translate_expr(a, arrays_1d)})' if not _is_fortran_string_literal(a) else self.translate_expr(a, arrays_1d) for a in raw_args)})")
+                            rhs = f"_f_str_assign({rhs_core}, _f_len({target_py}))"
+                            self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if fmt_expr is not None:
+                            self.emit(f"print({fmt_expr}{', end=""' if advance_no else ''}{file_txt})")
+                        else:
+                            args_star = []
+                            for a in raw_args:
+                                if _is_fortran_string_literal(a):
+                                    args_star.append(self.translate_expr(a, arrays_1d))
+                                else:
+                                    implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                    if implied_py is not None:
+                                        args_star.append(f"*{implied_py}")
+                                    else:
+                                        args_star.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        return True
+
+                    # dynamic format expression: keep output valid even when we cannot fully
+                    # compile the runtime format string.
+                    args_star = []
+                    for a in raw_args:
+                        if _is_fortran_string_literal(a):
+                            args_star.append(self.translate_expr(a, arrays_1d))
+                        else:
+                            implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                            if implied_py is not None:
+                                args_star.append(f"*{implied_py}")
+                            else:
+                                args_star.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+                    if internal_char_target:
+                        target_py = self.translate_expr(unit_raw, arrays_1d)
+                        rhs = "''" if not args_star else f"_xf2p_star_text({', '.join(args_star)})"
+                        rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
+                        self.transpile_assignment(unit_raw, rhs, arrays_1d)
                     else:
-                        args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
-            end_txt = ', end=""' if "advance" in ctl and "'no'" in ctl else ""
-            file_txt = ""
-            if unit_expr != "*":
-                file_txt = f", file={unit_expr}"
-            if args2:
-                self.emit(f"print({', '.join(args2)}{end_txt}{file_txt})")
-            else:
-                if file_txt:
-                    self.emit(f"print({file_txt[2:]})")
-                else:
-                    self.emit("print()")
-            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if args_star:
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        else:
+                            if file_txt:
+                                self.emit(f"print({file_txt[2:]})")
+                            else:
+                                self.emit("print()")
+                    return True
 
         # single-line if: if (cond) stmt
         if sl.startswith("if") and not sl.endswith("then"):
@@ -4651,6 +4976,36 @@ class basic_f2p:
         self.emit("return")
         self.indent -= 1
         self.emit("print(*items, file=file)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_star_text(*args):")
+        self.indent += 1
+        self.emit('"""Return list-directed text for internal WRITE fallbacks."""')
+        self.emit("items = []")
+        self.emit("for arg in args:")
+        self.indent += 1
+        self.emit("if isinstance(arg, np.ndarray):")
+        self.indent += 1
+        self.emit("items.extend(list(np.ravel(arg, order='F')))")
+        self.indent -= 1
+        self.emit("elif isinstance(arg, (list, tuple)) and not isinstance(arg, (str, bytes)):")
+        self.indent += 1
+        self.emit("items.extend(_xf2p_io_items(arg))")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("items.append(arg)")
+        self.indent -= 1
+        self.indent -= 1
+        self.emit("if not items:")
+        self.indent += 1
+        self.emit("return ''")
+        self.indent -= 1
+        self.emit("if all(isinstance(x, str) for x in items):")
+        self.indent += 1
+        self.emit("return ''.join(str(x) for x in items)")
+        self.indent -= 1
+        self.emit("return ' '.join(str(x) for x in items)")
         self.indent -= 1
         self.emit("")
 
