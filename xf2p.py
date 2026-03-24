@@ -2112,7 +2112,8 @@ class basic_f2p:
                             else:
                                 out.append(f"{name}[{self._index_expr_from_decl_bounds(name, inner, 0, arrays_1d)}]")
                         else:
-                            if ":" in inner and "," not in inner:
+                            is_char_substring = self._decl_types.get(name.lower()) == "character"
+                            if is_char_substring and ":" in inner and "," not in inner:
                                 lo, hi = inner.split(":", 1)
                                 lo = lo.strip()
                                 hi = hi.strip()
@@ -3128,16 +3129,62 @@ class basic_f2p:
                             mk = re.match(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", p, re.I)
                             if mk:
                                 kws[mk.group(1).lower()] = mk.group(2).strip()
+                        unit_raw = parts[0].strip()
+                        unit_base_m = re.match(r"([a-z_]\w*)", unit_raw, re.I)
+                        unit_base = unit_base_m.group(1).lower() if unit_base_m else ""
+                        internal_char_source = (
+                            self._decl_types.get(unit_base) == "character"
+                            or self._decl_array_types.get(unit_base) == "character"
+                        )
+                        unit_py = self.translate_expr(unit_raw, arrays_1d)
+                        if fmt == "*" and internal_char_source and rest:
+                            ios_var = kws.get("iostat")
+                            items = [a.strip() for a in split_args(rest) if a.strip()]
+                            self.emit(f"__xf2p_read_parts = str({unit_py}).split()")
+                            self.emit("try:")
+                            self.indent += 1
+                            for i, tgt in enumerate(items):
+                                lhs = self.translate_expr(tgt, arrays_1d)
+                                base = re.match(r"^([a-z_]\w*)", tgt, re.I)
+                                bnm = base.group(1).lower() if base else ""
+                                ftype = self._decl_types.get(bnm, self._decl_array_types.get(bnm, ""))
+                                if ftype == "integer":
+                                    rhs = f"int(__xf2p_read_parts[{i}])"
+                                elif ftype == "logical":
+                                    rhs = f"(str(__xf2p_read_parts[{i}]).strip().lower() in ('t', 'true', '.true.'))"
+                                elif ftype == "character":
+                                    rhs = f"_f_str_assign(str(__xf2p_read_parts[{i}]), _f_len({lhs}))"
+                                else:
+                                    rhs = f"float(__xf2p_read_parts[{i}])"
+                                self.emit(f"{lhs} = {rhs}")
+                            if ios_var is not None:
+                                self.emit(f"{ios_var} = 0")
+                            self.indent -= 1
+                            self.emit("except Exception:")
+                            self.indent += 1
+                            if ios_var is not None:
+                                self.emit(f"{ios_var} = 1")
+                            else:
+                                self.emit("raise")
+                            self.indent -= 1
+                            return True
                         if fmt != "*":
                             fmt_txt = _fortran_unquote(fmt).strip().lower() if (len(fmt) >= 2 and fmt[0] in ("'", '"') and fmt[-1] == fmt[0]) else ""
                             if fmt_txt in {"(a)", "a"} and rest:
                                 ios_var = kws.get("iostat")
                                 lhs = self.translate_expr(rest, arrays_1d)
+                                if internal_char_source:
+                                    self.emit(f"__xf2p_line = str({unit_py})")
+                                    if ios_var is not None:
+                                        self.emit(f"{ios_var} = 0")
+                                    self.emit(f"{lhs} = __xf2p_line.rstrip('\\n')")
+                                    return True
                                 self.emit(f"__xf2p_line = {unit}.readline()")
                                 if ios_var is not None:
                                     self.emit(f"{ios_var} = 0 if __xf2p_line != '' else -1")
                                 self.emit(f"{lhs} = __xf2p_line.rstrip('\\n')")
                                 return True
+
         # read(fp,*) a, b, arr(i,:), ...
         mm = re.match(r"read\s*\(\s*([a-z_]\w*)\s*,\s*\*\s*\)\s*(.+)$", s, re.I)
         if mm:
