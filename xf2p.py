@@ -1796,6 +1796,8 @@ class basic_f2p:
                 "len",
                 "len_trim",
                 "new_line",
+                "achar",
+                "char",
                 "adjustl",
                 "real",
                 "aimag",
@@ -1821,6 +1823,8 @@ class basic_f2p:
                 return f"_f_len_trim({args_py[0]})"
             if lname == "new_line" and len(args_py) == 1:
                 return repr("\n")
+            if lname in {"achar", "char"} and len(args_py) >= 1:
+                return f"chr(int({args_py[0]}))"
             if lname == "adjustl" and len(args_py) == 1:
                 return f"_f_adjustl({args_py[0]})"
             if lname == "real" and len(args_py) >= 1:
@@ -3180,10 +3184,10 @@ class basic_f2p:
                 a0 = raw_args[0].strip()
                 implied_py = _fortran_implied_do_expr(a0, self.translate_expr, arrays_1d)
                 if implied_py is not None:
-                    self.emit(f"print(*{implied_py})")
+                    self.emit(f"_xf2p_print_star(*{implied_py})")
                     return True
                 if re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types:
-                    self.emit(f"print(*np.ravel({a0}, order='F'))")
+                    self.emit(f"_xf2p_print_star(*np.ravel({a0}, order='F'))")
                     return True
             args2 = []
             for a in raw_args:
@@ -3195,7 +3199,7 @@ class basic_f2p:
                         args2.append(f"*{implied_py}")
                     else:
                         args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
-            self.emit(f"print({', '.join(args2)})")
+            self.emit(f"_xf2p_print_star({', '.join(args2)})")
             return True
 
         # print "fmt", ...
@@ -3239,7 +3243,7 @@ class basic_f2p:
             if fmt_expr is not None:
                 self.emit(f"print({fmt_expr})")
             else:
-                self.emit(f"print({', '.join(args2)})")
+                self.emit(f"_xf2p_print_star({', '.join(args2)})")
             return True
 
         # write(*,*)
@@ -3256,10 +3260,10 @@ class basic_f2p:
                 a0 = raw_args[0].strip()
                 implied_py = _fortran_implied_do_expr(a0, self.translate_expr, arrays_1d)
                 if implied_py is not None:
-                    self.emit(f"print(*{implied_py})")
+                    self.emit(f"_xf2p_print_star(*{implied_py})")
                     return True
                 if re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types:
-                    self.emit(f"print(*np.ravel({a0}, order='F'))")
+                    self.emit(f"_xf2p_print_star(*np.ravel({a0}, order='F'))")
                     return True
             args2 = []
             for a in raw_args:
@@ -3271,7 +3275,7 @@ class basic_f2p:
                         args2.append(f"*{implied_py}")
                     else:
                         args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
-            self.emit(f"print({', '.join(args2)})")
+            self.emit(f"_xf2p_print_star({', '.join(args2)})")
             return True
 
         # write(unit,*) ...
@@ -3287,7 +3291,7 @@ class basic_f2p:
             if len(raw_args) == 1:
                 implied_py = _fortran_implied_do_expr(raw_args[0], self.translate_expr, arrays_1d)
                 if implied_py is not None:
-                    self.emit(f"print(*{implied_py}, file={unit})")
+                    self.emit(f"_xf2p_print_star(*{implied_py}, file={unit})")
                     return True
             for a in raw_args:
                 if _is_fortran_string_literal(a):
@@ -3298,7 +3302,7 @@ class basic_f2p:
                         args2.append(f"*{implied_py}")
                     else:
                         args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
-            self.emit(f"print({', '.join(args2)}, file={unit})")
+            self.emit(f"_xf2p_print_star({', '.join(args2)}, file={unit})")
             return True
 
         # write(*,"fmt") ...
@@ -3346,7 +3350,7 @@ class basic_f2p:
             if fmt_expr is not None:
                 self.emit(f"print({fmt_expr})")
             else:
-                self.emit(f"print({', '.join(args2)})")
+                self.emit(f"_xf2p_print_star({', '.join(args2)})")
             return True
 
         # write(unit,"fmt") ...
@@ -3395,7 +3399,7 @@ class basic_f2p:
             if fmt_expr is not None:
                 self.emit(f"print({fmt_expr}, file={unit})")
             else:
-                self.emit(f"print({', '.join(args2)}, file={unit})")
+                self.emit(f"_xf2p_print_star({', '.join(args2)}, file={unit})")
             return True
 
         # generic write(...) ... fallback
@@ -4614,6 +4618,39 @@ class basic_f2p:
         self.emit("return out")
         self.indent -= 1
         self.emit("return [_xf2p_io_scalar(x)]")
+        self.indent -= 1
+        self.emit("")
+
+        self.emit("def _xf2p_print_star(*args, file=None):")
+        self.indent += 1
+        self.emit('"""Approximate Fortran list-directed PRINT/WRITE to stdout or a file."""')
+        self.emit("items = []")
+        self.emit("for arg in args:")
+        self.indent += 1
+        self.emit("if isinstance(arg, np.ndarray):")
+        self.indent += 1
+        self.emit("items.extend(list(np.ravel(arg, order='F')))")
+        self.indent -= 1
+        self.emit("elif isinstance(arg, (list, tuple)) and not isinstance(arg, (str, bytes)):")
+        self.indent += 1
+        self.emit("items.extend(_xf2p_io_items(arg))")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("items.append(arg)")
+        self.indent -= 1
+        self.indent -= 1
+        self.emit("if not items:")
+        self.indent += 1
+        self.emit("print(file=file)")
+        self.emit("return")
+        self.indent -= 1
+        self.emit("if all(isinstance(x, str) for x in items):")
+        self.indent += 1
+        self.emit("print(''.join(str(x) for x in items), file=file)")
+        self.emit("return")
+        self.indent -= 1
+        self.emit("print(*items, file=file)")
         self.indent -= 1
         self.emit("")
 
