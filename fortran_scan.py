@@ -5348,4 +5348,71 @@ def compact_repeated_edit_descriptors(lines: List[str]) -> List[str]:
         out.append(f"{code}{comment}{eol}")
     return out
 
+def compact_format_descriptor_string(fmt_body: str) -> str:
+    """Compact repeated edit descriptors in a format list.
 
+    Example:
+    `a, a, f0.6, a, f0.6, a` -> `2a, 2(f0.6, a)`
+    """
+    items = _split_format_items(fmt_body)
+    if len(items) <= 1:
+        return fmt_body.strip()
+    compacted = _compact_format_items(items)
+    return ", ".join(compacted)
+
+def _compact_format_items(items: List[str]) -> List[str]:
+    """Compact consecutive identical format items conservatively."""
+    out: List[str] = []
+    i = 0
+    n = len(items)
+    while i < n:
+        item = items[i].strip()
+        j = i + 1
+        while j < n and items[j].strip().lower() == item.lower():
+            j += 1
+        count = j - i
+        if count > 1:
+            out.append(f"{count}{item}")
+        else:
+            out.append(item)
+        i = j
+    return out
+
+def _split_format_items(fmt_body: str) -> List[str]:
+    items: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(fmt_body)
+    while i < n:
+        ch = fmt_body[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            cur.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                t = "".join(cur).strip()
+                if t:
+                    items.append(t)
+                cur = []
+                i += 1
+                continue
+        cur.append(ch)
+        i += 1
+    t = "".join(cur).strip()
+    if t:
+        items.append(t)
+    return items
