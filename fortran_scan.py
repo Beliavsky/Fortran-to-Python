@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 PROC_START_RE = re.compile(
-    r"^\s*(?P<prefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
+    r"^\s*(?P<preprefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
+    r"(?P<lead>(?:(?:double\s+precision|integer|real|logical|complex|character\b(?:\s*\([^)]*\))?"
+    r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s*(?:\([^)]*\))?\s*,?\s*)?)"
+    r"(?P<prefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
     r"(?P<kind>function|subroutine)\s+"
     r"(?P<name>[a-z][a-z0-9_]*)\s*(?P<arglist>\([^)]*\))?",
     re.IGNORECASE,
@@ -3789,7 +3792,8 @@ def parse_procedures(lines: List[str]) -> List[Procedure]:
 
         m_start = PROC_START_RE.match(low)
         if m_start:
-            attrs = set(m_start.group("prefix").split()) if m_start.group("prefix") else set()
+            attrs = set((m_start.group("preprefix") or "").split())
+            attrs.update((m_start.group("prefix") or "").split())
             parent = stack[-1].name if stack else None
             dummy_names = parse_arglist(m_start.group("arglist"))
             m_result = re.search(r"\bresult\s*\(\s*([a-z][a-z0-9_]*)\s*\)", low, re.IGNORECASE)
