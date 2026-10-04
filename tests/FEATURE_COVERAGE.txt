@@ -268,3 +268,24 @@ different output without comparing it.
 
 Focused comparison/batch tests: 30 passed. Full suite: 166 passed, 6 strict
 expected failures in 343.94 seconds.
+
+BLOCK lexical-scope follow-up (2026-10-04)
+-----------------------------------------
+BLOCK declarations no longer overwrite enclosing symbol bindings. Locals use
+collision-free generated names; nested/sibling shadowing preserves outer values.
+Automatic storage is initialized on entry rather than hoisted, so loop-dependent
+explicit array bounds are evaluated at the right time. Block parameters, strings,
+components, keyword arguments, operator spelling, and exponent literals are
+covered by focused tests. Program, subroutine, and module-function contexts pass.
+SAVE/initialized nonparameter locals, local imports, and local derived-type
+definitions are rejected explicitly pending support for their storage/scope rules.
+
+The unchanged tests\cases\more\test25_block_scope.f90 now reports MATCH (the
+outer x remains 10). Named-loop EXIT/CYCLE is still a separate open bug.
+Additional probing exposed a separate issue with assignments to USE-associated
+module variables in main creating Python-local bindings; not changed here.
+
+Verification: 131 non-execution tests passed in 71.12 seconds; existing execution
+corpus plus the new block_scope case: 46 passed, 6 expected failures in 325.85
+seconds. The 60 exploratory cases in tests\cases\more were excluded from that
+execution run because their known unsupported features are still under review.

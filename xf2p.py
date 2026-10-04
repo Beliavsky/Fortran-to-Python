@@ -1273,6 +1273,8 @@ class basic_f2p:
         save_names: set[str] = set()
         arg_set = {a.lower() for a in args}
         for name, info in sym.items():
+            if name in getattr(self, "_block_local_names", set()):
+                continue
             attrs_l = str(info.get("attrs_l", "")).lower()
             if name.lower() in arg_set:
                 continue
@@ -1282,7 +1284,7 @@ class basic_f2p:
             s = code.strip()
             if re.fullmatch(r"save", s, re.I):
                 for name in sym:
-                    if name.lower() not in arg_set:
+                    if name.lower() not in arg_set and name not in getattr(self, "_block_local_names", set()):
                         save_names.add(name)
                 continue
             m = re.match(r"save\s*(?:::)?\s*(.+)$", s, re.I)
@@ -2689,13 +2691,15 @@ class basic_f2p:
             self.emit("# unsupported inline statement")
             self.emit("pass")
 
-    def emit_parameters_from_decl(self, ftype: str, attrs_l: str, rest: str, arrays_1d: set[str]) -> set[str]:
+    def emit_parameters_from_decl(self, ftype: str, attrs_l: str, rest: str, arrays_1d: set[str], *, block_entry: bool = False) -> set[str]:
         names: set[str] = set()
         if "parameter" not in attrs_l:
             return names
         if ftype == "type":
             return names
         for name, shape, init in parse_decl_items(rest):
+            if not block_entry and name in getattr(self, "_block_local_names", set()):
+                continue
             if init is None:
                 continue
             # parameters are named constants: method (2) -> Final
@@ -2711,6 +2715,7 @@ class basic_f2p:
         arrays_1d: set[str],
         parameter_names: set[str],
         skip_names: set[str] | None = None,
+        *, block_entry: bool = False,
     ) -> None:
         # Allocate explicit-shape arrays and initialize scalars so Python is always valid.
         # Special handling:
@@ -2719,6 +2724,8 @@ class basic_f2p:
         if skip_names is None:
             skip_names = set()
         for name, info in sym.items():
+            if not block_entry and name in getattr(self, "_block_local_names", set()):
+                continue
             if name in parameter_names:
                 continue
             if name in skip_names:
@@ -3147,6 +3154,20 @@ class basic_f2p:
 
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
+        if s in getattr(self, "_lexical_block_entries", {}):
+            declarations = self._lexical_block_entries[s]
+            parameters: set[str] = set()
+            for declaration, _ in declarations:
+                parsed = parse_decl(declaration)
+                if parsed:
+                    ftype, attrs, rest = parsed
+                    parameters |= self.emit_parameters_from_decl(
+                        ftype, attrs.lower(), rest, arrays_1d, block_entry=True)
+            symbols = self._host_symbol_table(declarations)
+            for info in symbols.values():
+                info["alloc"] = "allocatable" in info["attrs_l"]
+            self.emit_var_inits_from_sym(symbols, arrays_1d, parameters, block_entry=True)
+            return True
 
         pwhere = None
         if sl.startswith("where"):
@@ -5042,10 +5063,95 @@ class basic_f2p:
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
+    def _lower_lexical_blocks(self, lines: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Alpha-rename BLOCK locals without creating a Python function boundary.
+
+        Retaining the surrounding control flow makes RETURN/CYCLE/EXIT work as
+        before. Declaration metadata remains visible to the existing passes,
+        but storage is initialized at the executable block-entry marker.
+        """
+        self._block_local_names: set[str] = set()
+        self._lexical_block_entries: dict[str, list[tuple[str, str]]] = {}
+        scopes: list[dict[str, str]] = []
+        starts: dict[int, tuple[dict[str, str], str]] = {}
+        owners: dict[int, int] = {}
+        stack: list[int] = []
+        used = set(re.findall(r"\b[a-z_]\w*\b", "\n".join(code for code, _ in lines), re.I))
+        used = {name.lower() for name in used}
+        for index, (code, _) in enumerate(lines):
+            if re.fullmatch(r"\s*(?:[a-z_]\w*\s*:\s*)?block\s*", code, re.I):
+                marker = f"__xf2p_block_entry_{index}"
+                starts[index] = ({}, marker)
+                stack.append(index)
+                self._lexical_block_entries[marker] = []
+                continue
+            if re.fullmatch(r"\s*end\s*block(?:\s+[a-z_]\w*)?\s*", code, re.I):
+                if not stack:
+                    raise ValueError("END BLOCK without BLOCK")
+                stack.pop()
+                continue
+            if not stack:
+                continue
+            parsed = self._parse_decl_line(code.strip())
+            if parsed:
+                _, _, attrs, items = parsed
+                if "save" in attrs or (any(init is not None for _, _, init in items) and "parameter" not in attrs):
+                    raise ValueError("BLOCK SAVE/initialized local variables are not yet supported")
+                mapping = starts[stack[-1]][0]
+                for name, _, _ in items:
+                    key = name.lower()
+                    if key in mapping:
+                        raise ValueError(f"BLOCK: duplicate declaration for '{name}'")
+                    new = f"xf2p_block_{stack[-1]}_{key}"
+                    while new.lower() in used:
+                        new += "_"
+                    used.add(new.lower())
+                    mapping[key] = new
+                    self._block_local_names.add(new)
+                owners[index] = stack[-1]
+            elif re.match(r"\s*(?:use|save|type\b(?!\s*\())", code, re.I):
+                raise ValueError("BLOCK-local USE, SAVE, or derived-type definitions are not yet supported")
+        if stack:
+            raise ValueError("BLOCK without END BLOCK")
+
+        result = []
+        token = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|\.[a-z_]\w*\.|\b[a-z_]\w*\b", re.I)
+        for index, (code, comment) in enumerate(lines):
+            if index in starts:
+                mapping, marker = starts[index]
+                scopes.append(mapping)
+                result.append((marker, comment))
+                continue
+            if re.fullmatch(r"\s*end\s*block(?:\s+[a-z_]\w*)?\s*", code, re.I):
+                scopes.pop()
+                result.append(("", comment))
+                continue
+            visible = {key: value for scope in scopes for key, value in scope.items()}
+            def rename(match):
+                name = match.group()
+                # Components are not variables in the containing BLOCK scope.
+                if code[:match.start()].rstrip().endswith("%"):
+                    return name
+                # Keep keyword argument names (f(x=x)), while renaming the
+                # actual variable. Declaration/control bindings are different.
+                if (re.match(r"\s*=(?!=)", code[match.end():])
+                        and not re.match(r"\s*(?:do|forall|associate)\b", code, re.I)):
+                    prefix = re.sub(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"", "", code[:match.start()])
+                    if prefix.count("(") > prefix.count(")"):
+                        return name
+                return visible.get(name.lower(), name)
+            rewritten = token.sub(rename, code)
+            result.append((rewritten, comment))
+            if index in owners:
+                marker = starts[owners[index]][1]
+                self._lexical_block_entries[marker].append((rewritten, comment))
+        return result
+
     def transpile(self, src: str) -> str:
         self._host_scopes = []
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
+        raw = self._lower_lexical_blocks(raw)
         self._type_bindings = {}
         self._type_components = {}
         self._component_specs = {}

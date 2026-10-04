@@ -248,3 +248,15 @@ References:
   https://gcc.gnu.org/onlinedocs/gfortran/SPACING.html
   https://gcc.gnu.org/onlinedocs/gfortran/RRSPACING.html
   https://numpy.org/doc/stable/reference/generated/numpy.finfo.html
+
+BLOCK lexical scope
+-------------------
+BLOCK locals use distinct generated names; nested and sibling blocks do not
+overwrite enclosing variables. Automatic scalar/array storage and block
+parameters are initialized at block entry, including inside loops with changing
+array bounds. Strings, derived-type component names, and keyword argument names
+are preserved. Tests cover program, subroutine, and module-function contexts,
+host updates, and collisions with generated names.
+BLOCK-local USE, SAVE/initialized nonparameter locals, and derived-type
+definitions currently fail explicitly instead of being flattened incorrectly.
+Named EXIT/CYCLE control flow is a separate, still-open issue.
