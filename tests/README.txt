@@ -217,6 +217,23 @@ The original xintrinsics_all.f90 needs no counter-argument workaround anymore.
 LOG10 maps to NumPy for scalars and arrays and does not add a SciPy dependency;
 mathematical names inside printed string labels are preserved.
 
+CLI and batch output comparison
+-------------------------------
+xf2p.py --run-diff and xf2p_batch.py --run-diff share fortran_output_compare.py.
+Defaults are --rtol 1e-9 --atol 1e-11 for standalone real numeric tokens;
+integers and labels compare exactly. Fortran D exponents, whitespace/line
+wrapping, and matching NaN/infinity spellings are handled. --diff-exact implies
+--run-diff and uses exact normalized lines (the CLI's previous behavior), not
+byte-for-byte whitespace equality. Mismatches return nonzero and identify the
+first genuine mismatch, skipping preceding numerically equivalent tokens.
+Only stdout is compared; stderr remains visible and process failures fail.
+--time-both also implies --run-diff. Use --run-both --time to time intentionally
+different output (for example unreplayed random draws) without comparing it.
+Invalid tolerances are rejected. tests/test_output_compare.py and
+tests/test_xf2p_run_diff.py cover the shared comparator and all CLI execution
+modes, options, exit codes, and batch forwarding. ULP-sensitive regression
+checks remain exact rather than relying on this default tolerant comparison.
+
 Floating-point decomposition and model inquiries
 ------------------------------------------------
 FRACTION/EXPONENT and SCALE/SET_EXPONENT use binary decomposition and scaling.

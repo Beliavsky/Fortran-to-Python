@@ -249,3 +249,22 @@ Fresh batch comparisons both match:
   reports\xf2p_batch_20261004_155648_fx3omssi\results.txt
 Focused tests: 7 passed. Full suite: 148 passed, 6 strict expected failures
 in 241.10 seconds.
+
+Numerical output comparison follow-up (2026-10-04)
+-------------------------------------------------
+CLI and batch share a stdout comparator. Real tokens use relative tolerance
+1e-9 and absolute tolerance 1e-11 by default; --rtol and --atol override them.
+Integer tokens and nonnumeric text remain exact. Fortran D exponents, matching
+NaNs, same-sign infinities, and signed zero are covered. Default comparison
+ignores whitespace and line wrapping. Diagnostics identify the first genuine
+mismatch, skipping earlier numerically close lines. A mismatch exits nonzero.
+
+--diff-exact implies --run-diff and restores normalized-line text comparison,
+not byte-for-byte comparison. Tests cover single-file, per-file, and grouped
+CLI modes, batch integration, tolerance validation, large integer differences,
+and missing output. The unchanged xintrinsics.f90 now reports Run diff: MATCH.
+--time-both inherits comparison; use --run-both --time for timing intentionally
+different output without comparing it.
+
+Focused comparison/batch tests: 30 passed. Full suite: 166 passed, 6 strict
+expected failures in 343.94 seconds.

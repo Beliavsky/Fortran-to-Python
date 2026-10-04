@@ -46,7 +46,7 @@ def test_invalid_inputs(tmp_path):
         batch.main(["--timeout", "nan"])
 
 
-def test_module_only_report(tmp_path):
+def test_module_only_report(tmp_path, capsys):
     source = tmp_path / "library.f90"
     source.write_text("module m\nend module m\n")
     destination = tmp_path / "reports"
@@ -55,9 +55,31 @@ def test_module_only_report(tmp_path):
     report = json.loads(next(destination.glob("*/results.json")).read_text())
     assert report["complete"]
     assert report["summary"] == {"skipped_library": 1}
+    last_line = capsys.readouterr().out.splitlines()[-1]
+    assert last_line.startswith("Time: total ")
+    assert "Fortran compile 0.000s" in last_line
+    assert "Python run 0.000s" in last_line
 
 
-def test_successful_group_and_data_isolation(tmp_path, monkeypatch):
+def test_timing_summary_totals_all_cases():
+    stages = {name: {"elapsed_seconds": value} for name, value in
+              zip(("compile", "fortran_run", "translate", "python_run", "comparison"), (1, 2, 3, 4, 0.5))}
+    summary = batch.timing_summary([{"stages": stages}, {"stages": stages}], 25)
+    assert summary == ("Time: total 25.000s | Fortran compile 2.000s | Fortran run 4.000s | "
+                       "transpile 6.000s | Python run 8.000s | compare 1.000s | other 4.000s")
+
+
+def test_blank_line_between_cases(tmp_path, capsys):
+    for name in ("a", "b"):
+        (tmp_path / f"{name}.f90").write_text(f"module {name}\nend module {name}\n")
+    assert batch.main([str(tmp_path / "*.f90"), "--out-dir", str(tmp_path / "reports")]) == 0
+    output = capsys.readouterr().out
+    assert output.startswith("[1/2]")
+    assert "\n\n[2/2]" in output
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_successful_group_and_data_isolation(tmp_path, monkeypatch, capsys, verbose):
     import argparse
     sources = [tmp_path / "module.f90", tmp_path / "main.f90"]
     sources[0].write_text("module m\nend module m\n")
@@ -74,7 +96,8 @@ def test_successful_group_and_data_isolation(tmp_path, monkeypatch):
 
     monkeypatch.setattr(batch, "stage", fake_stage)
     args = argparse.Namespace(data=[data], timeout=10, run=False, run_both=False,
-                              run_diff=True, compile=False, compiler="gfortran -O0", rtol=1e-9, atol=1e-11)
+                              run_diff=True, compile=False, compiler="gfortran -O0", rtol=1e-9, atol=1e-11,
+                              verbose=verbose)
     directory = tmp_path / "work"
     result = batch.evaluate(sources, directory, args)
     assert result["outcome"] == "pass"
@@ -83,6 +106,15 @@ def test_successful_group_and_data_isolation(tmp_path, monkeypatch):
     assert (directory / "fortran" / "input.txt").read_text() == "data"
     assert (directory / "python" / "input.txt").read_text() == "data"
     assert not (tmp_path / "main_f.py").exists()
+    printed = capsys.readouterr().out
+    if verbose:
+        for label in ("Translation", "Fortran compilation", "Fortran", "Python"):
+            assert f"{label} command:" in printed
+            assert f"{label} output:" in printed
+            assert f"{label}: pass (0.000s)" in printed
+        assert "Comparison: match" in printed
+    else:
+        assert printed == ""
 
 
 def test_real_multifile_group(tmp_path):

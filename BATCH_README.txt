@@ -24,6 +24,9 @@ into a temporary combined.f90 because xf2p --out requires a single input.
 The Fortran compiler receives the original source files in that same order.
 
 Additional options:
+  --verbose      Print each stage's command, working directory, duration, stdout,
+                 and nonempty stderr after that stage completes. Works with
+                 --run-both and --run-diff; does not change comparisons.
   --compile      Compile original Fortran without running it.
   --run          Run translated Python only.
   --run-both     Run both versions without asserting output equivalence.
@@ -31,6 +34,32 @@ Additional options:
   --data         File to copy into both execution directories; repeatable.
   --out-dir      Report/work parent directory, default reports.
   --rtol, --atol Floating-point comparison tolerances, defaults 1e-9 and 1e-11.
+  --diff-exact   Compare normalized stdout text exactly (implies --run-diff).
+
+The CLI and batch runner share fortran_output_compare.py. Default comparisons
+ignore whitespace/line wrapping and compare standalone real tokens numerically,
+including Fortran D exponents. Integer tokens and other text compare exactly.
+Matching NaNs and same-sign infinities compare equal. Only stdout is compared;
+stderr is displayed/saved separately and process failures remain failures.
+--diff-exact retains xf2p.py's former normalized-line comparison: whitespace
+runs and trailing blank lines are normalized, but number spelling and line
+structure must agree. It is not a byte-for-byte file comparison.
+Both commands return nonzero on a genuine output mismatch.
+
+Equivalent single-program CLI commands:
+
+    python xf2p.py xintrinsics.f90 --run-diff
+    python xf2p.py xintrinsics.f90 --run-diff --rtol 1e-12 --atol 0
+    python xf2p.py xintrinsics.f90 --diff-exact
+
+Numerical tolerances can hide ULP-level differences such as NEAREST results;
+keep exact value/boundary regression checks for those operations. Zero
+tolerances compare parsed numeric values, not their printed spelling; use
+--diff-exact when spelling matters.
+
+For example, to inspect both programs' output:
+
+    python xf2p_batch.py "tests\cases\**\*.f90" --run-both --verbose
 
 This initial version uses GNU-style '-o executable' compiler syntax. Compiler
 commands are split into arguments without invoking a shell. On Windows quote
@@ -69,6 +98,11 @@ layout differences can still cause mismatches and need human review.
 Exit code: 0 if all cases pass or are skipped libraries; 1 for any case failure,
 timeout, execution error, or mismatch; 2 for invalid command-line inputs.
 No pytest expected-failure suppression applies to batch results.
+
+The final console line shows overall elapsed time, cumulative Fortran compile,
+Fortran run, translation, Python run, comparison, and other overhead times.
+Stages not requested contribute zero; failed/timed-out stages still contribute
+their elapsed time. Execution timings include process startup and imports.
 
 Security: this is a local diagnostic tool, not a sandbox. --run and --run-both
 execute source programs; use trusted programs. A subprocess timeout is not a

@@ -16,26 +16,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from fortran_output_compare import compare_outputs as compare, validate_tolerances
 
 ROOT = Path(__file__).resolve().parent
-NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?$")
-
-
-def compare(reference: str, actual: str, rtol: float, atol: float) -> dict:
-    expected, observed = reference.split(), actual.split()
-    if len(expected) != len(observed):
-        return {"status": "mismatch", "detail": f"Token counts differ: {len(expected)} vs {len(observed)}"}
-    for index, (a, b) in enumerate(zip(expected, observed), 1):
-        equal = a == b
-        if NUMBER.fullmatch(a) and NUMBER.fullmatch(b):
-            if re.fullmatch(r"[+-]?\d+", a) and re.fullmatch(r"[+-]?\d+", b):
-                equal = int(a) == int(b)
-            else:
-                equal = math.isclose(float(a.lower().replace("d", "e")),
-                                     float(b.lower().replace("d", "e")), rel_tol=rtol, abs_tol=atol)
-        if not equal:
-            return {"status": "mismatch", "detail": f"Token {index}: Fortran {a!r}, Python {b!r}"}
-    return {"status": "match"}
 
 
 def stage(command: list[str], cwd: Path, timeout: float) -> dict:
@@ -71,6 +54,22 @@ def evaluate(sources: list[Path], directory: Path, args) -> dict:
               "classification": "program", "stages": {name: {"status": "not_requested"}
               for name in ("compile", "fortran_run", "translate", "python_run", "comparison")}}
     stages = result["stages"]
+    def run_stage(name: str, command: list[str], cwd: Path) -> dict:
+        value = stage(command, cwd, args.timeout)
+        if getattr(args, "verbose", False):
+            label = {"translate": "Translation", "compile": "Fortran compilation",
+                     "fortran_run": "Fortran", "python_run": "Python"}[name]
+            rendered = subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
+            print(f"  {label} command: {rendered}", flush=True)
+            print(f"  Working directory: {cwd}", flush=True)
+            print(f"  {label}: {value['status']} ({value['elapsed_seconds']:.3f}s)", flush=True)
+            for key, heading in (("stdout", "output"), ("stderr", "stderr")):
+                content = value.get(key, "")
+                if content or key == "stdout":
+                    print(f"  {label} {heading}:", flush=True)
+                    print(content if content else "    (empty)",
+                          end="" if content.endswith("\n") else "\n", flush=True)
+        return value
     if library_only(sources):
         result.update(classification="library_only", outcome="skipped_library")
         return result
@@ -88,36 +87,53 @@ def evaluate(sources: list[Path], directory: Path, args) -> dict:
         combined = py_dir / "combined.f90"
         combined.write_text("\n".join(p.read_text(encoding="utf-8-sig") for p in sources), encoding="utf-8")
         translation_sources = [combined]
-    stages["translate"] = stage([sys.executable, str(ROOT / "xf2p.py"),
-                                  *map(str, translation_sources), "--out", str(output)], py_dir, args.timeout)
+    stages["translate"] = run_stage("translate", [sys.executable, str(ROOT / "xf2p.py"),
+                                  *map(str, translation_sources), "--out", str(output)], py_dir)
     if stages["translate"]["status"] == "pass" and not output.exists():
         stages["translate"].update(status="fail", stderr="Translator did not create output")
     if args.run or args.run_both or args.run_diff:
         stages["python_run"] = {"status": "blocked"}
         if stages["translate"]["status"] == "pass":
-            stages["python_run"] = stage([sys.executable, str(output)], py_dir, args.timeout)
+            stages["python_run"] = run_stage("python_run", [sys.executable, str(output)], py_dir)
     if args.compile or args.run_both or args.run_diff:
         command = shlex.split(args.compiler, posix=os.name != "nt")
         command = [word[1:-1] if word.startswith('"') and word.endswith('"') else word for word in command]
         exe = ft_dir / ("original.exe" if os.name == "nt" else "original")
-        stages["compile"] = stage([*command, *map(str, sources), "-o", str(exe)], ft_dir, args.timeout)
+        stages["compile"] = run_stage("compile", [*command, *map(str, sources), "-o", str(exe)], ft_dir)
         if "cannot open module file" in stages["compile"].get("stderr", "").lower():
             result["classification"] = "missing_module_dependency"
         if args.run_both or args.run_diff:
             stages["fortran_run"] = {"status": "blocked"}
             if stages["compile"]["status"] == "pass":
-                stages["fortran_run"] = stage([str(exe)], ft_dir, args.timeout)
+                stages["fortran_run"] = run_stage("fortran_run", [str(exe)], ft_dir)
     if args.run_diff:
         stages["comparison"] = {"status": "not_compared"}
         if stages["fortran_run"]["status"] == stages["python_run"]["status"] == "pass":
+            comparison_start = time.perf_counter()
             stages["comparison"] = compare(stages["fortran_run"]["stdout"], stages["python_run"]["stdout"],
-                                            args.rtol, args.atol)
+                                            args.rtol, args.atol, exact=getattr(args, "diff_exact", False))
+            stages["comparison"]["elapsed_seconds"] = time.perf_counter() - comparison_start
+        if getattr(args, "verbose", False):
+            print(f"  Comparison: {stages['comparison']['status']}", flush=True)
+            if stages["comparison"].get("detail"):
+                print("  " + stages["comparison"]["detail"], flush=True)
     result["outcome"] = "pass"
     for name, value in stages.items():
         if value["status"] in ("fail", "error", "timeout", "mismatch"):
             result["outcome"] = f"{name}_{value['status']}"
             break
     return result
+
+
+def timing_summary(cases: list[dict], elapsed: float) -> str:
+    names = ("compile", "fortran_run", "translate", "python_run", "comparison")
+    totals = {name: sum(case["stages"][name].get("elapsed_seconds", 0.0) for case in cases)
+              for name in names}
+    other = max(0.0, elapsed - sum(totals.values()))
+    return (f"Time: total {elapsed:.3f}s | Fortran compile {totals['compile']:.3f}s | "
+            f"Fortran run {totals['fortran_run']:.3f}s | transpile {totals['translate']:.3f}s | "
+            f"Python run {totals['python_run']:.3f}s | compare {totals['comparison']:.3f}s | "
+            f"other {other:.3f}s")
 
 
 def report_text(report: dict) -> str:
@@ -152,6 +168,9 @@ def main(argv=None) -> int:
     parser.add_argument("--run", action="store_true", help="Run translated Python")
     parser.add_argument("--run-both", action="store_true", help="Compile/run Fortran and run Python")
     parser.add_argument("--run-diff", action="store_true", help="Run both and compare output tokens")
+    parser.add_argument("--diff-exact", action="store_true", help="Compare normalized stdout text exactly (implies --run-diff)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print commands, timings, and labeled output after each stage")
     parser.add_argument("--compiler", default="gfortran -O0 -g -fcheck=all -fbacktrace")
     parser.add_argument("--timeout", type=float, default=90, help="Seconds allowed per subprocess")
     parser.add_argument("--limit", type=int, help="Maximum number of cases")
@@ -160,12 +179,16 @@ def main(argv=None) -> int:
     parser.add_argument("--data", type=Path, action="append", default=[], help="Data file copied into both run directories")
     parser.add_argument("--out-dir", type=Path, default=Path("reports"), help="Report and retained work directory parent")
     args = parser.parse_args(argv)
+    if args.diff_exact:
+        args.run_diff = True
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be finite and positive")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
-    if any(not math.isfinite(v) or v < 0 for v in (args.rtol, args.atol)):
-        parser.error("tolerances must be finite and nonnegative")
+    try:
+        validate_tolerances(args.rtol, args.atol)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not shlex.split(args.compiler, posix=os.name != "nt"):
         parser.error("--compiler must not be empty")
     cases, seen = [], set()
@@ -196,6 +219,8 @@ def main(argv=None) -> int:
     started, start = datetime.now(timezone.utc).isoformat(), time.perf_counter()
     results = []
     for index, sources in enumerate(cases, 1):
+        if index > 1:
+            print(flush=True)
         print(f"[{index}/{len(cases)}] {' + '.join(map(str, sources))}", flush=True)
         result = evaluate(sources, directory / f"case_{index:04d}", args)
         results.append(result)
@@ -213,6 +238,7 @@ def main(argv=None) -> int:
         (directory / "results.txt").write_text(report_text(report), encoding="utf-8")
     print(f"Reports: {directory}")
     print(json.dumps(report["summary"], sort_keys=True))
+    print(timing_summary(results, time.perf_counter() - start), flush=True)
     return int(any(r["outcome"] not in ("pass", "skipped_library") for r in results))
 
 

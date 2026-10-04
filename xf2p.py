@@ -6,6 +6,7 @@ import subprocess
 import shlex
 import time
 import difflib
+from fortran_output_compare import compare_outputs, normalized_lines, validate_tolerances
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -5751,6 +5752,26 @@ class basic_f2p:
         return "\n".join(out_lines).rstrip() + "\n"
 
 
+def _report_run_diff(reference: str, actual: str, rtol: float = 1e-9,
+                     atol: float = 1e-11, exact: bool = False) -> bool:
+    result = compare_outputs(reference, actual, rtol, atol, exact=exact)
+    if result["status"] == "match":
+        print("Run diff: MATCH")
+        return True
+    print("Run diff: DIFF")
+    print(f"  first mismatch line: {result['reference_line']}")
+    if result["actual_line"] != result["reference_line"]:
+        print(f"  python mismatch line: {result['actual_line']}")
+    print(f"  fortran: {result['reference_text'] if result['reference_text'] is not None else '<no line>'}")
+    print(f"  python : {result['actual_text'] if result['actual_text'] is not None else '<no line>'}")
+    print("  " + result["detail"])
+    if exact:
+        for line in difflib.unified_diff(normalized_lines(reference), normalized_lines(actual),
+                                         fromfile="fortran", tofile="python", n=1):
+            print(line)
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Partial Fortran-to-Python transpiler")
     ap.add_argument("input_f90", nargs="+", help="input .f90 source file(s)")
@@ -5761,7 +5782,10 @@ def main() -> int:
     ap.add_argument("--run", action="store_true", help="run translated Python script after writing it")
     ap.add_argument("--compile", action="store_true", help="compile original Fortran source")
     ap.add_argument("--run-both", action="store_true", help="run original Fortran and translated Python (no timing)")
-    ap.add_argument("--run-diff", action="store_true", help="run Fortran and Python and compare outputs")
+    ap.add_argument("--run-diff", action="store_true", help="run Fortran and Python and compare stdout numerically")
+    ap.add_argument("--rtol", type=float, default=1e-9, help="relative tolerance for real output tokens (default: 1e-9)")
+    ap.add_argument("--atol", type=float, default=1e-11, help="absolute tolerance for real output tokens (default: 1e-11)")
+    ap.add_argument("--diff-exact", action="store_true", help="compare normalized stdout text exactly (implies --run-diff)")
     ap.add_argument("--tee", action="store_true", help="print transformed output (run output, or transpiled source when not running)")
     ap.add_argument("--tee-both", action="store_true", help="print both original and transformed outputs (run output, or source when not running)")
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run stages (implies --run)")
@@ -5772,6 +5796,12 @@ def main() -> int:
         help='compiler command, e.g. "gfortran -O2 -Wall"',
     )
     args = ap.parse_args()
+    try:
+        validate_tolerances(args.rtol, args.atol)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if args.diff_exact:
+        args.run_diff = True
 
     if args.time_both:
         args.run_diff = True
@@ -5807,13 +5837,6 @@ def main() -> int:
         print("Transpile: FAIL (--out is allowed only for a single input in --mode-program)")
         return 1
 
-    def _norm(s: str):
-        lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        lines = [" ".join(ln.split()) for ln in lines]
-        while lines and lines[-1] == "":
-            lines.pop()
-        return lines
-
     def _ensure_runtime_file(dst_dir: Path) -> None:
         rt = Path(__file__).with_name("fortran_py_runtime.py")
         if rt.exists():
@@ -5823,6 +5846,7 @@ def main() -> int:
 
     def process_one(src_paths: list[Path], out_path: Path) -> int:
         timings = {}
+        diff_failed = False
         ft_run = None
         ft_exe = out_path.with_suffix(".orig.exe")
         compiler_parts = shlex.split(args.compiler)
@@ -5927,33 +5951,8 @@ def main() -> int:
                 print(rp.stderr.rstrip())
 
             if args.run_diff and ft_run is not None:
-                ft_lines = _norm((ft_run.stdout or "") + (("\n" + ft_run.stderr) if ft_run.stderr else ""))
-                py_lines = _norm((rp.stdout or "") + (("\n" + rp.stderr) if rp.stderr else ""))
-                if ft_lines == py_lines:
-                    print("Run diff: MATCH")
-                else:
-                    print("Run diff: DIFF")
-                    first = None
-                    nmin = min(len(ft_lines), len(py_lines))
-                    for i in range(nmin):
-                        if ft_lines[i] != py_lines[i]:
-                            first = i
-                            break
-                    if first is None:
-                        first = nmin
-                    print(f"  first mismatch line: {first + 1}")
-                    if first < len(ft_lines):
-                        print(f"  fortran: {ft_lines[first]}")
-                    else:
-                        print("  fortran: <no line>")
-                    if first < len(py_lines):
-                        print(f"  python : {py_lines[first]}")
-                    else:
-                        print("  python : <no line>")
-                    for dl in difflib.unified_diff(ft_lines, py_lines, fromfile="fortran", tofile="python", n=1):
-                        print(dl)
-                        if dl.startswith("@@"):
-                            break
+                diff_failed = not _report_run_diff(ft_run.stdout or "", rp.stdout or "",
+                                                   args.rtol, args.atol, args.diff_exact)
 
         if args.time:
             fortran_total = timings.get("compile", 0.0) + timings.get("fortran_run", 0.0)
@@ -5980,7 +5979,7 @@ def main() -> int:
             print("  stage            seconds    ratio(vs python run)")
             for name, val in rows:
                 print(f"  {name:<14} {val:>8.6f}    {_ratio(val)}")
-        return 0
+        return int(diff_failed)
 
     if not mode_each:
         if len(in_paths) == 1:
@@ -6147,33 +6146,8 @@ def main() -> int:
                 print(rp.stderr.rstrip())
 
             if args.run_diff and ft_run is not None:
-                ft_lines = _norm((ft_run.stdout or "") + (("\n" + ft_run.stderr) if ft_run.stderr else ""))
-                py_lines = _norm((rp.stdout or "") + (("\n" + rp.stderr) if rp.stderr else ""))
-                if ft_lines == py_lines:
-                    print("Run diff: MATCH")
-                else:
-                    print("Run diff: DIFF")
-                    first = None
-                    nmin = min(len(ft_lines), len(py_lines))
-                    for i in range(nmin):
-                        if ft_lines[i] != py_lines[i]:
-                            first = i
-                            break
-                    if first is None:
-                        first = nmin
-                    print(f"  first mismatch line: {first + 1}")
-                    if first < len(ft_lines):
-                        print(f"  fortran: {ft_lines[first]}")
-                    else:
-                        print("  fortran: <no line>")
-                    if first < len(py_lines):
-                        print(f"  python : {py_lines[first]}")
-                    else:
-                        print("  python : <no line>")
-                    for dl in difflib.unified_diff(ft_lines, py_lines, fromfile="fortran", tofile="python", n=1):
-                        print(dl)
-                        if dl.startswith("@@"):
-                            break
+                rc = int(not _report_run_diff(ft_run.stdout or "", rp.stdout or "",
+                                              args.rtol, args.atol, args.diff_exact))
 
         if args.time:
             fortran_total = timings.get("compile", 0.0) + timings.get("fortran_run", 0.0)
