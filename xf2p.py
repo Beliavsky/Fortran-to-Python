@@ -1347,7 +1347,9 @@ class basic_f2p:
                 else:
                     shape_py = self._shape_to_py(str(shape), arrays_1d)
                     if ftype == "type":
-                        init_py = f"np.empty({shape_py}, dtype=object)"
+                        cls = info.get("type_name") or "SimpleNamespace"
+                        rhs = self.translate_expr(str(init), arrays_1d) if init is not None else f"{cls}()"
+                        init_py = f"_f_init_component_array({shape_py}, {rhs}, object)"
                     else:
                         dtype = _type_dtype.get(ftype, "object")
                         if init is None:
@@ -2578,7 +2580,12 @@ class basic_f2p:
                 root = name.split(".", 1)[0].lower()
                 if "." in name and root in arrays_1d and root not in {"np", "math", "random", "sps"}:
                     root_name, path_name = name.split(".", 1)
-                    out.append(f"_xf2p_component_array({root_name}, {path_name!r})")
+                    spec = self._component_spec(name)
+                    if spec and spec.get('shape'):
+                        raise ValueError('array components of an array parent require explicit subscripts')
+                    dtype = _type_dtype.get(spec['ftype']) if spec else None
+                    argument = f', dtype={dtype}' if dtype else ''
+                    out.append(f"_xf2p_component_array({root_name}, {path_name!r}{argument})")
                 else:
                     out.append(name)
                 i = j
@@ -2736,6 +2743,8 @@ class basic_f2p:
         if self._where_masked_assignment(lhs, rhs_py, arrays_1d):
             return
         lhs = lhs.replace("%", ".")
+        if self._assign_projected_component(lhs, rhs_py, arrays_1d):
+            return
         if self._is_chained_subscript(lhs):
             target = self.translate_expr(lhs, arrays_1d)
             spec = self._component_spec(lhs)
@@ -2909,7 +2918,8 @@ class basic_f2p:
 
                 shape_py = self._shape_to_py(str(shape), arrays_1d)
                 if ftype == "type":
-                    self.emit(f"{name} = np.empty({shape_py}, dtype=object)")
+                    initializer = self.translate_expr(str(init), arrays_1d) if init is not None else f"{ftype_name or 'SimpleNamespace'}()"
+                    self.emit(f"{name} = _f_init_component_array({shape_py}, {initializer}, object)")
                     continue
 
                 dtype = _type_dtype[ftype]
@@ -3183,11 +3193,30 @@ class basic_f2p:
         if self._where_stack:
             self._where_stack.pop()
 
+    def _assign_projected_component(self, lhs, rhs_py, arrays_1d, mask=None):
+        match = re.fullmatch(r'([a-z_]\w*)\.([a-z_]\w*(?:\.[a-z_]\w*)*)', lhs, re.I)
+        if not match or match.group(1) not in arrays_1d or self._decl_types.get(match.group(1).lower()) != 'type':
+            return False
+        spec = self._component_spec(lhs)
+        if spec:
+            if spec.get('shape'):
+                raise ValueError('array components of an array parent require explicit subscripts')
+            dtype = _type_dtype.get(spec['ftype'])
+            if dtype and spec['ftype'] != 'character':
+                rhs_py = f'np.asarray({rhs_py}, dtype={dtype})'
+            if spec.get('char_len') is not None:
+                rhs_py = f"_f_str_assign({rhs_py}, {self.translate_expr(spec['char_len'], arrays_1d)})"
+        mask_argument = f', mask={mask}' if mask is not None else ''
+        self.emit(f"_f_assign_component_array({match.group(1)}, {match.group(2)!r}, {rhs_py}{mask_argument})")
+        return True
+
     def _where_masked_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> bool:
         mask_expr = self._where_current_mask_expr()
         if mask_expr is None:
             return False
         lhs = lhs.replace("%", ".")
+        if self._assign_projected_component(lhs, rhs_py, arrays_1d, mask=mask_expr):
+            return True
         if self._is_chained_subscript(lhs):
             target = self.translate_expr(lhs, arrays_1d)
             spec = self._component_spec(lhs)
@@ -5945,7 +5974,12 @@ class basic_f2p:
         self.emit('"""Flatten list-directed output items the way Fortran prints arrays."""')
         self.emit("if isinstance(x, np.ndarray):")
         self.indent += 1
-        self.emit("return [_xf2p_io_scalar(v) for v in np.ravel(x, order='F')]")
+        self.emit("out = []")
+        self.emit("for item in np.ravel(x, order='F'):")
+        self.indent += 1
+        self.emit("out.extend(_xf2p_io_items(item))")
+        self.indent -= 1
+        self.emit("return out")
         self.indent -= 1
         self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
         self.indent += 1
@@ -5953,6 +5987,15 @@ class basic_f2p:
         self.emit("for item in x:")
         self.indent += 1
         self.emit("out.extend(_xf2p_io_items(item))")
+        self.indent -= 1
+        self.emit("return out")
+        self.indent -= 1
+        self.emit("if hasattr(x, '__dataclass_fields__') and not isinstance(x, type):")
+        self.indent += 1
+        self.emit("out = []")
+        self.emit("for name in x.__dataclass_fields__:")
+        self.indent += 1
+        self.emit("out.extend(_xf2p_io_items(getattr(x, name)))")
         self.indent -= 1
         self.emit("return out")
         self.indent -= 1
@@ -5966,18 +6009,7 @@ class basic_f2p:
         self.emit("items = []")
         self.emit("for arg in args:")
         self.indent += 1
-        self.emit("if isinstance(arg, np.ndarray):")
-        self.indent += 1
-        self.emit("items.extend(list(np.ravel(arg, order='F')))")
-        self.indent -= 1
-        self.emit("elif isinstance(arg, (list, tuple)) and not isinstance(arg, (str, bytes)):")
-        self.indent += 1
         self.emit("items.extend(_xf2p_io_items(arg))")
-        self.indent -= 1
-        self.emit("else:")
-        self.indent += 1
-        self.emit("items.append(arg)")
-        self.indent -= 1
         self.indent -= 1
         self.emit("if not items:")
         self.indent += 1
@@ -5998,18 +6030,7 @@ class basic_f2p:
         self.emit("items = []")
         self.emit("for arg in args:")
         self.indent += 1
-        self.emit("if isinstance(arg, np.ndarray):")
-        self.indent += 1
-        self.emit("items.extend(list(np.ravel(arg, order='F')))")
-        self.indent -= 1
-        self.emit("elif isinstance(arg, (list, tuple)) and not isinstance(arg, (str, bytes)):")
-        self.indent += 1
         self.emit("items.extend(_xf2p_io_items(arg))")
-        self.indent -= 1
-        self.emit("else:")
-        self.indent += 1
-        self.emit("items.append(arg)")
-        self.indent -= 1
         self.indent -= 1
         self.emit("if not items:")
         self.indent += 1
@@ -6038,21 +6059,10 @@ class basic_f2p:
         self.emit("return out")
         self.indent -= 1
         self.emit("")
-        self.emit("def _xf2p_component_array(obj, path):")
+        self.emit("def _xf2p_component_array(obj, path, dtype=None):")
         self.indent += 1
         self.emit('"""Project a component path over an array of derived-type values."""')
-        self.emit("attrs = path.split('.')")
-        self.emit("out = []")
-        self.emit("for _xf2p_item in obj:")
-        self.indent += 1
-        self.emit("val = _xf2p_item")
-        self.emit("for _xf2p_attr in attrs:")
-        self.indent += 1
-        self.emit("val = getattr(val, _xf2p_attr)")
-        self.indent -= 1
-        self.emit("out.append(val)")
-        self.indent -= 1
-        self.emit("return np.asarray(out)")
+        self.emit("return _f_component_array(obj, path, dtype=dtype)")
         self.indent -= 1
         self.emit("")
         self.emit("def _xf2p_copy_value(x):")
@@ -6060,6 +6070,11 @@ class basic_f2p:
         self.emit('"""Fortran-style assignment copy for arrays and derived-type values."""')
         self.emit("if isinstance(x, np.ndarray):")
         self.indent += 1
+        self.emit("if x.dtype == object:")
+        self.indent += 1
+        self.emit("import copy as _xf2p_copy_mod")
+        self.emit("return _xf2p_copy_mod.deepcopy(x)")
+        self.indent -= 1
         self.emit("return np.array(x, copy=True)")
         self.indent -= 1
         self.emit("if hasattr(x, '__dict__'):")

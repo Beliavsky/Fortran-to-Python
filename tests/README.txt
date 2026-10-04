@@ -343,3 +343,16 @@ COMMAND_ARGUMENT_COUNT and GET_COMMAND_ARGUMENT use sys.argv, including optional
 VALUE/LENGTH/STATUS, fixed-length padding, truncation, and missing arguments.
 Argument zero denotes the Python script rather than the original executable;
 do not expect --run-diff to equate those program names.
+
+Derived-type array components
+----------------------------
+tests/test_derived_type_arrays.py and features/derived_type_array_components.f90
+cover independent object initialization, whole-array scalar-component assignment
+and projection (including nested paths and WHERE masks), matrix shape and
+Fortran element order, intrinsic assignment copies, saved arrays, and recursive
+list-directed derived-type output. PACK accepts scalar masks and an optional
+VECTOR and selects elements in Fortran order. These checks do not imply full
+support for pointer components, defined I/O, or component projections through
+arbitrary parent array sections. An array component of an unindexed array parent
+is rejected; use explicit subscripts rather than creating two ranked parts.
+Existing generated programs need a refreshed adjacent fortran_py_runtime.py.

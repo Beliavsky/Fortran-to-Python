@@ -407,3 +407,19 @@ https://gcc.gnu.org/onlinedocs/gfortran/PRODUCT.html
 https://gcc.gnu.org/onlinedocs/gfortran/UNPACK.html
 https://gcc.gnu.org/onlinedocs/gfortran/CSHIFT.html
 https://gcc.gnu.org/onlinedocs/gfortran/GET_005fCOMMAND_005fARGUMENT.html
+
+Derived-type array component assignments (2026-10-04)
+---------------------------------------------------
+xsum_dt.f90 now reports Run diff: MATCH: full derived-type output, component
+projections, PACK, and SUM agree with the original Fortran. The tracked
+derived_type_array_components fixture also matches, including matrix parents,
+WHERE updates, and Fortran-order PACK selection. Objects are initialized
+independently and intrinsic assignment copies their component storage.
+Unit checks cover nested paths, saved arrays, empty projections, scalar
+broadcasting, integer conversion, character padding, and optional PACK VECTOR.
+Arbitrary parent sections and pointer-component/defined-I/O semantics remain
+outside these checks; an unindexed array component of an array parent is rejected.
+Established-suite run: 304 passed, six expected failures, 60 exploratory cases
+excluded, and one batch translation subprocess exited without output or a Python
+traceback (Windows return code 3221227274). A fresh rerun of all 12 batch tests
+passed, including that case. All eight new derived-array unit checks passed.

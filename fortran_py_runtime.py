@@ -33,6 +33,7 @@ def _reshape_with_pad(a, newshape, order="C", pad=None):
 np.reshape = _reshape_with_pad
 
 __all__ = [
+    "_f_component_array", "_f_assign_component_array",
     "_f_product", "_f_unpack", "_f_cshift", "_f_eoshift", "_f_is_contiguous",
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
@@ -470,8 +471,18 @@ def _f_assign_array(lhs, rhs):
         else:
             raise
     if lhs is None:
+        if arr.dtype == object:
+            import copy
+            return copy.deepcopy(arr)
         return arr
     lhs_arr = np.asarray(lhs)
+    if arr.dtype == object:
+        import copy
+        if arr.ndim == 0 and lhs_arr.ndim > 0:
+            for index in np.ndindex(lhs_arr.shape):
+                lhs_arr[index] = copy.deepcopy(arr.item())
+            return lhs
+        arr = copy.deepcopy(arr)
     if arr.ndim == 0 and lhs_arr.ndim > 0:
         lhs_arr[...] = arr.item()
         return lhs
@@ -489,11 +500,62 @@ def merge(tsource, fsource, mask):
     return np.where(m, tsource, fsource)
 
 
-def pack(x, mask):
+def pack(array, mask, vector=None):
     """Fortran PACK equivalent."""
-    a = np.asarray(x)
+    a = np.asarray(array)
     m = np.asarray(mask, dtype=bool)
-    return a[m]
+    if m.ndim and m.shape != a.shape:
+        raise ValueError('PACK MASK must be scalar or conformable')
+    selected = a.ravel(order='F')[np.broadcast_to(m, a.shape).ravel(order='F')]
+    if vector is not None:
+        vector = np.asarray(vector)
+        if vector.ndim != 1 or vector.size < selected.size:
+            raise ValueError('PACK VECTOR must be rank one and large enough')
+        result = vector.copy()
+        result[:selected.size] = selected
+        selected = result
+    if selected.dtype == object:
+        import copy
+        selected = copy.deepcopy(selected)
+    return selected
+
+
+def _f_component_array(obj, path, dtype=None):
+    """Project scalar components while retaining the parent array's shape."""
+    array = np.asarray(obj, dtype=object)
+    values = []
+    for item in array.flat:
+        for attr in path.split('.'):
+            item = getattr(item, attr)
+        if np.ndim(item) != 0:
+            raise ValueError('array components of an array parent require explicit subscripts')
+        values.append(item)
+    return np.asarray(values, dtype=dtype).reshape(array.shape)
+
+
+def _f_assign_component_array(obj, path, value, mask=None):
+    """Scatter a scalar or conformable RHS into derived-type components."""
+    import copy
+    array = np.asarray(obj, dtype=object)
+    rhs = np.asarray(value)
+    if rhs.ndim and rhs.shape != array.shape:
+        raise ValueError('component assignment requires scalar or conformable RHS')
+    rhs = np.broadcast_to(rhs, array.shape)
+    if mask is None:
+        selected = np.ones(array.shape, dtype=bool)
+    else:
+        selected = np.asarray(mask, dtype=bool)
+        if selected.ndim and selected.shape != array.shape:
+            raise ValueError('component assignment MASK must be scalar or conformable')
+        selected = np.broadcast_to(selected, array.shape)
+    attrs = path.split('.')
+    # Snapshot every value before mutation, preserving Fortran RHS evaluation.
+    values = [copy.deepcopy(value) for value in rhs.flat]
+    for item, value, active in zip(array.flat, values, selected.flat):
+        if active:
+            for attr in attrs[:-1]:
+                item = getattr(item, attr)
+            setattr(item, attrs[-1], value)
 
 
 def count(x):
