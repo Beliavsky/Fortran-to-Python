@@ -330,3 +330,30 @@ excluded, in 401.97 seconds. A subsequent non-execution run including two additi
 guard/accessibility regressions passed all 150 tests in 81.62 seconds. The unchanged
 six expected failures remain; there were no unexpected failures. The standalone
 use_module_state.f90 --run-diff also reports MATCH.
+
+SHAPE/RANK inquiry follow-up (2026-10-04)
+---------------------------------------
+SHAPE emits a one-dimensional integer extent vector, with empty scalar shapes,
+zero extents, SOURCE/KIND keywords, and integer kinds 1/2/4/8 (default 4).
+RANK returns the declared rank for named fixed-rank entities without evaluating
+their storage; this supports unallocated objects and specification expressions
+before initialization. Assumed-rank arguments and section/expression ranks use
+runtime inquiries. Module declaration metadata is available before parameter
+initialization. Scalar CHARACTER, sections, non-one-based bounds, and assumed-
+shape/rank calls are covered by runtime, translation, and execution tests.
+
+Fresh-directory retries of tests\cases\more\test03_matrix.f90,
+test21_assumed_shape.f90, and test58_reshape_order.f90 all report MATCH.
+RESHAPE ORDER did not require another fix. test22_assumed_rank_select_rank.f90
+exposed a separate unsafe behavior: the translator previously ignored SELECT
+RANK and ran every branch. It now rejects SELECT RANK explicitly, pending proper
+dispatch support. The rank intrinsic is supported independently of SELECT RANK.
+
+The initial retries reused an older copied fortran_py_runtime.py beside the
+exploratory sources, causing missing-helper errors. Fresh output directories
+verified the current runtime; the pre-existing stale-runtime-copy limitation is
+unchanged. Existing copied runtimes must be refreshed when using new helpers.
+
+Focused shape/rank/module-state checks: 33 passed. Established suite: 218 passed,
+6 expected failures, 60 exploratory cases excluded, in 260.59 seconds. No
+unexpected failures. The extended shape_rank execution fixture also passes.

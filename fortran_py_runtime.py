@@ -32,6 +32,8 @@ np.reshape = _reshape_with_pad
 __all__ = [
     "_reshape_with_pad",
     "_f_size",
+    "_f_shape",
+    "_f_rank",
     "_f_spread",
     "_f_assign_array",
     "_f_init_component_array",
@@ -142,6 +144,23 @@ def _f_section_slice(a, dim, lower_bound, lower=None, upper=None, stride=1):
     if stride < 0 and stop < 0:
         stop = None
     return slice(first - base, stop, stride)
+
+
+def _f_shape(source, kind=None):
+    """Fortran SHAPE: integer extent vector, including an empty scalar shape."""
+    if source is None:
+        raise ValueError("SHAPE requires an allocated/associated source")
+    kind = 4 if kind is None else int(kind)
+    if kind not in (1, 2, 4, 8):
+        raise ValueError("SHAPE KIND must be a supported integer kind (1, 2, 4, 8)")
+    return np.asarray(np.asarray(source).shape, dtype=f"int{8 * kind}")
+
+
+def _f_rank(a):
+    """Fortran RANK returns zero for a scalar, including CHARACTER scalars."""
+    if a is None:
+        raise ValueError("RANK of an unallocated/disassociated object is not yet supported")
+    return int(np.asarray(a).ndim)
 
 
 def _f_size(a, dim=None):

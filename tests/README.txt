@@ -287,3 +287,17 @@ bindings by value; combine the module and program into one Fortran source for
 this workflow. Renamed USE variables and duplicate mutable-variable names in
 different flattened Fortran modules also fail explicitly pending namespace
 support. These restrictions do not apply to ordinary procedure-only imports.
+
+SHAPE and RANK inquiries
+------------------------
+SHAPE returns an integer extent vector in Fortran dimension order, including
+an empty vector for a scalar and zero extents for empty arrays. SOURCE/KIND
+keywords and positional KIND are supported. Default SHAPE uses integer kind 4;
+explicit supported kinds are 1, 2, 4, and 8. RANK accepts A and returns zero for
+scalars. Declared ranks are folded without evaluating storage, allowing RANK of
+unallocated objects and rank-based specification expressions. Assumed-rank
+arguments and array-section expressions use runtime rank inquiries.
+The shape_rank fixture checks non-one-based bounds, sections, assumed-shape/rank
+arguments, scalar/empty inquiries, allocation-independent ranks, and RESHAPE
+ORDER. SELECT RANK is not yet supported and is rejected rather than executing
+all branches. This inquiry support does not imply SELECT RANK support.

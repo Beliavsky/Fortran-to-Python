@@ -2151,6 +2151,8 @@ class basic_f2p:
                 "floor",
                 "lbound",
                 "ubound",
+                "shape",
+                "rank",
                 "transpose",
                 "matmul",
                 "dot_product",
@@ -2159,6 +2161,39 @@ class basic_f2p:
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
+            if lname in {"shape", "rank"}:
+                parameters = ("source", "kind") if lname == "shape" else ("a",)
+                bound = {}
+                raw_arguments = {}
+                for part in parts:
+                    keyword = re.match(r"^([a-z_]\w*)\s*=\s*(.+)$", part, re.I)
+                    if keyword:
+                        key, value = keyword.group(1).lower(), keyword.group(2)
+                    else:
+                        key = next((parameter for parameter in parameters if parameter not in bound), "")
+                        value = part
+                    if not value or key not in parameters or key in bound:
+                        raise ValueError(f"Invalid arguments to {lname}")
+                    bound[key] = self.translate_expr(value, arrays_1d)
+                    raw_arguments[key] = value.strip().lower()
+                if parameters[0] not in bound:
+                    raise ValueError(f"Invalid arguments to {lname}")
+                if lname == "rank":
+                    name = raw_arguments["a"]
+                    symbol = next((info for symbols, _ in reversed(self._host_scopes)
+                                   for key, info in symbols.items() if key.lower() == name), None)
+                    if symbol is not None:
+                        if not symbol.get("is_array"):
+                            return "0"
+                        shape = str(symbol.get("shape") or "").strip()
+                        if shape and shape != "..":
+                            # RANK does not require allocation/association when
+                            # the object's rank is known from its declaration.
+                            return str(len(self._shape_bounds(shape)))
+                arguments = [bound[parameters[0]]]
+                if "kind" in bound:
+                    arguments.append(f"kind={bound['kind']}")
+                return f"_f_{lname}({', '.join(arguments)})"
             if lname in {"transpose", "matmul", "dot_product", "reshape", "index"}:
                 parameters = {"transpose": ("matrix",),
                               "matmul": ("matrix_a", "matrix_b"),
@@ -3187,6 +3222,8 @@ class basic_f2p:
 
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
+        if re.match(r"(?:[a-z_]\w*\s*:\s*)?select\s+rank\s*\(", s, re.I):
+            raise ValueError("SELECT RANK is not yet supported; branch selection cannot be ignored safely")
         if s in getattr(self, "_lexical_block_entries", {}):
             declarations = self._lexical_block_entries[s]
             parameters: set[str] = set()
@@ -4786,6 +4823,9 @@ class basic_f2p:
                 if is_array:
                     arrays_1d.add(name)
 
+        # Specification inquiries such as PARAMETER r=RANK(a) must see array
+        # declarations even before their storage has been initialized.
+        self._host_scopes.append(({**self._use_variable_symbols(decl_lines), **sym}, "global"))
         parameter_names: set[str] = set()
         for code, _comment in decl_lines:
             s = code.strip()
@@ -4827,7 +4867,6 @@ class basic_f2p:
                  or (name in local_names and "public" in info["attrs_l"]))
         }
 
-        self._host_scopes.append((sym, "global"))
         if contains_idx is not None:
             i = 0
             n = len(tail)
