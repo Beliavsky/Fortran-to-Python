@@ -3,21 +3,24 @@ Fortran-to-Python execution tests
 
 Run from the repository root:
 
-    python -m pip install numpy pytest
+    python -m pip install numpy scipy pytest
     pytest -q -rx
 
 Requirements: Python, NumPy, pytest, and gfortran on PATH. Execution tests
 skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
+SciPy is optional for the translator/runtime and ordinary translated programs;
+special-function programs require it. The math_intrinsics execution comparison
+and SciPy-specific unit test skip explicitly when SciPy is unavailable.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (42 programs)
+Corpus (43 programs)
 --------------------
 handwritten/: 18 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
-features/: 20 focused programs covering OPTIONAL/PRESENT, keyword calls,
+features/: 21 focused programs covering OPTIONAL/PRESENT, keyword calls,
 explicit SAVE, EXIT, EQV/NEQV, elemental and impure elemental procedures,
 DO CONCURRENT, derived-type assignment/arguments/results, type extension,
 type-bound procedures, labeled FORMAT, selected-kind intrinsics, and a
@@ -26,6 +29,13 @@ array_component_initializers also verifies default component values and
 independent storage between objects and between derived-type array elements.
 location_intrinsics verifies MINLOC/MAXLOC/FINDLOC, DIM, MASK, BACK, KIND,
 Fortran array-element order, empty arrays, and character/logical searches.
+math_intrinsics is based on the user's xintrinsics_all.f90, with the checker
+counters passed explicitly (unmodified host-scope counter updates remain a
+separate translator limitation). It exercises all 73 original checks. Its
+Fortran reference uses -O3: the local MinGW compiler/library combination lacks
+the runtime sinpi symbol used at -O0 for the constant elemental test vector.
+All other reference programs continue to use -O0. The generated Python still
+evaluates its array expressions at runtime.
 
 stash/: manual probes retained for reference; excluded from automated discovery.
 
@@ -171,3 +181,18 @@ when an already-allocated object fails allocation with STAT.
 Type-spec ALLOCATE, deferred-length CHARACTER, and non-default bounds for
 allocated components remain unsupported with explicit diagnostics. General
 cross-procedure preservation of allocatable-dummy bounds is not guaranteed.
+
+Mathematical intrinsic dependencies
+----------------------------------
+Gamma, LOG_GAMMA, ERF, ERFC, ERFC_SCALED, and Bessel functions use scipy.special.
+ERFC_SCALED maps to erfcx rather than exp(x*x)*erfc(x), avoiding intermediate
+overflow for large positive x. Reference:
+  https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.erfcx.html
+Only special-function programs import SciPy, and missing installations receive
+an explicit 'python -m pip install scipy' message. NumPy/runtime helpers handle
+hyperbolic functions, HYPOT, NORM2, degree/PI-scaled trigonometric functions,
+and EPSILON. NORM2 supports DIM and scaled accumulation. PI-scaled helpers
+reduce their arguments before multiplication and preserve exact cardinal values.
+EPSILON reflects the translated value's dtype; the translator's existing
+promotion of Fortran REAL declarations/literals to float64 remains a kind-
+fidelity limitation outside the real64 regression used here.

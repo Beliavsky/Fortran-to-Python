@@ -51,6 +51,11 @@ __all__ = [
     "_f_minloc",
     "_f_maxloc",
     "_f_findloc",
+    "_f_epsilon",
+    "_f_norm2",
+    "_f_sinpi",
+    "_f_cospi",
+    "_f_tanpi",
     "spread",
     "huge",
     "tiny",
@@ -274,6 +279,43 @@ def minval(x, dim=None):
     if dim is None:
         return np.min(a)
     return np.min(a, axis=int(dim) - 1)
+
+
+def _f_epsilon(x):
+    a = np.asarray(x)
+    return np.finfo(a.dtype).eps
+
+
+def _f_norm2(array, dim=None):
+    a = np.asarray(array)
+    if a.dtype.kind != "f":
+        raise TypeError("NORM2 requires a real array")
+    if dim is None and a.ndim != 1:
+        raise ValueError("NORM2 without DIM requires a rank-one array")
+    axis = 0 if dim is None else int(dim) - 1
+    if not 0 <= axis < a.ndim:
+        raise ValueError("NORM2 DIM is outside ARRAY rank")
+    return np.hypot.reduce(np.abs(a), axis=axis, initial=0)
+
+
+def _f_sinpi(x):
+    r = np.fmod(np.asarray(x), 2.0)
+    r = np.where(r > 1, r - 2, np.where(r < -1, r + 2, r))
+    return np.where((r == 0) | (np.abs(r) == 1), np.copysign(0.0, r),
+                    np.where(r == 0.5, 1.0, np.where(r == -0.5, -1.0, np.sin(np.pi * r))))
+
+
+def _f_cospi(x):
+    r = np.fmod(np.asarray(x), 2.0)
+    r = np.where(r > 1, r - 2, np.where(r < -1, r + 2, r))
+    return np.where(np.abs(r) == 0.5, 0.0,
+                    np.where(r == 0, 1.0, np.where(np.abs(r) == 1, -1.0, np.cos(np.pi * r))))
+
+
+def _f_tanpi(x):
+    r = np.fmod(np.asarray(x), 1.0)
+    r = np.where(r > 0.5, r - 1.0, np.where(r < -0.5, r + 1.0, r))
+    return np.where(r == 0, np.copysign(0.0, r), np.tan(np.pi * r))
 
 
 def _f_location(array, dim=None, mask=None, kind=None, back=False, *, mode, value=None):

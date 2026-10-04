@@ -57,12 +57,17 @@ def test_fortran_and_translated_python_agree(source: Path, tmp_path: Path, reque
     if compiler is None:
         pytest.skip("gfortran is required for execution comparisons")
     pytest.importorskip("numpy")
+    if source.stem == "math_intrinsics":
+        pytest.importorskip("scipy", reason="special-function translations require SciPy")
     reference_dir = tmp_path / "fortran"
     translated_dir = tmp_path / "python"
     reference_dir.mkdir()
     translated_dir.mkdir()
     exe = tmp_path / ("reference.exe" if os.name == "nt" else "reference")
-    require_success(run([compiler, "-O0", "-g", "-fcheck=all", "-fbacktrace",
+    # This MinGW toolchain lowers array SINPI to an unavailable libm symbol
+    # at -O0; -O3 constant-folds the fixed Fortran 2023 reference vectors.
+    optimization = "-O3" if source.stem == "math_intrinsics" else "-O0"
+    require_success(run([compiler, optimization, "-g", "-fcheck=all", "-fbacktrace",
                          str(source), "-o", str(exe)], tmp_path))
     original = run([str(exe)], reference_dir)
     require_success(original)

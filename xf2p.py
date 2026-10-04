@@ -2093,8 +2093,11 @@ class basic_f2p:
                 "log_gamma",
                 "erf",
                 "erfc",
+                "erfc_scaled",
                 "bessel_j0",
                 "bessel_j1",
+                "bessel_y0",
+                "bessel_y1",
                 "bessel_jn",
                 "bessel_yn",
                 "asinh",
@@ -2102,15 +2105,21 @@ class basic_f2p:
                 "atanh",
                 "hypot",
                 "norm2",
+                "epsilon",
+                "sinh",
+                "cosh",
+                "tanh",
                 "acosd",
                 "asind",
                 "atand",
+                "atan2d",
                 "cosd",
                 "sind",
                 "tand",
                 "acospi",
                 "asinpi",
                 "atanpi",
+                "atan2pi",
                 "cospi",
                 "sinpi",
                 "tanpi",
@@ -2265,6 +2274,14 @@ class basic_f2p:
                 return f"sps.erf({args_py[0]})"
             if lname == "erfc" and len(args_py) == 1:
                 return f"sps.erfc({args_py[0]})"
+            if lname == "erfc_scaled" and len(args_py) == 1:
+                return f"sps.erfcx({args_py[0]})"
+            if lname in {"bessel_y0", "bessel_y1"} and len(args_py) == 1:
+                return f"sps.{lname[-2:]}({args_py[0]})"
+            if lname in {"sinh", "cosh", "tanh"} and len(args_py) == 1:
+                return f"np.{lname}({args_py[0]})"
+            if lname == "epsilon" and len(args_py) == 1:
+                return f"_f_epsilon({args_py[0]})"
             if lname == "bessel_j0" and len(args_py) == 1:
                 return f"sps.j0({args_py[0]})"
             if lname == "bessel_j1" and len(args_py) == 1:
@@ -2287,14 +2304,18 @@ class basic_f2p:
                 return f"np.atanh({args_py[0]})"
             if lname == "hypot" and len(args_py) == 2:
                 return f"np.hypot({args_py[0]}, {args_py[1]})"
-            if lname == "norm2" and len(args_py) == 1:
-                return f"np.linalg.norm({args_py[0]})"
+            if lname == "norm2" and len(args_py) in {1, 2}:
+                return f"_f_norm2({', '.join(args_py)})"
             if lname == "acosd" and len(args_py) == 1:
                 return f"np.degrees(np.arccos({args_py[0]}))"
             if lname == "asind" and len(args_py) == 1:
                 return f"np.degrees(np.arcsin({args_py[0]}))"
             if lname == "atand" and len(args_py) == 1:
                 return f"np.degrees(np.arctan({args_py[0]}))"
+            if lname in {"atand", "atan2d"} and len(args_py) == 2:
+                return f"np.degrees(np.arctan2({', '.join(args_py)}))"
+            if lname in {"atanpi", "atan2pi"} and len(args_py) == 2:
+                return f"(np.arctan2({', '.join(args_py)}) / np.pi)"
             if lname == "cosd" and len(args_py) == 1:
                 return f"np.cos(np.radians({args_py[0]}))"
             if lname == "sind" and len(args_py) == 1:
@@ -2308,11 +2329,11 @@ class basic_f2p:
             if lname == "atanpi" and len(args_py) == 1:
                 return f"(np.arctan({args_py[0]}) / np.pi)"
             if lname == "cospi" and len(args_py) == 1:
-                return f"np.cos(np.pi * ({args_py[0]}))"
+                return f"_f_cospi({args_py[0]})"
             if lname == "sinpi" and len(args_py) == 1:
-                return f"np.sin(np.pi * ({args_py[0]}))"
+                return f"_f_sinpi({args_py[0]})"
             if lname == "tanpi" and len(args_py) == 1:
-                return f"np.tan(np.pi * ({args_py[0]}))"
+                return f"_f_tanpi({args_py[0]})"
             return None
 
         # 1d array element: a(i) -> a[(i)-1] (assume 1-based Fortran indexing)
@@ -4989,7 +5010,8 @@ class basic_f2p:
                 "out": [a for a in args if a in outputs], "optional": optional}
         self.seen_parameter = any(re.search(r"\bparameter\b", code, re.I) for code, _c in raw)
         self._seen_scipy_special = any(
-            re.search(r"\b(?:gamma|log_gamma|erf|erfc|bessel_j0|bessel_j1|bessel_jn|bessel_yn)\s*\(", code, re.I)
+            re.search(r"\b(?:gamma|log_gamma|erf|erfc|erfc_scaled|bessel_j0|bessel_j1|bessel_y0|bessel_y1|bessel_jn|bessel_yn)\s*\(",
+                      re.sub(r"'([^']|'')*'|\"([^\"]|\"\")*\"", "", code), re.I)
             for code, _c in raw
         )
 
@@ -5005,7 +5027,14 @@ class basic_f2p:
         self.emit("from types import SimpleNamespace")
         self.emit("from fortran_py_runtime import *")
         if self._seen_scipy_special:
+            self.emit("try:")
+            self.indent += 1
             self.emit("import scipy.special as sps")
+            self.indent -= 1
+            self.emit("except ImportError as _xf2p_scipy_error:")
+            self.indent += 1
+            self.emit("raise ImportError('This translated program requires SciPy special functions; install with: python -m pip install scipy') from _xf2p_scipy_error")
+            self.indent -= 1
         if self.seen_parameter:
             self.emit("from typing import Final")
         self.emit("")

@@ -11,6 +11,8 @@ The ALLOCATE regression raises the current feature corpus to 19 programs,
 with 13 matching and six known failures.
 The location-intrinsic regression brings this to 20 programs, with 14 matching
 and six known failures.
+The mathematical-intrinsic regression brings this to 21 programs, with 15
+matching and six known failures.
 
 Matching cases
 --------------
@@ -28,6 +30,7 @@ type_bound_procedure     explicit bindings, PASS/NOPASS, functions, OUT argument
 array_component_initializers  defaults, scalar/array values, independent storage
 allocate_models          SOURCE/MOLD, explicit bounds, independent storage, STAT
 location_intrinsics      MINLOC/MAXLOC/FINDLOC, DIM/MASK/BACK/KIND, empty arrays
+math_intrinsics          73 mathematical checks, including SciPy special functions
 
 Confirmed failures (strict xfail in test_xf2p_execution.py)
 --------------------------------------------------------
@@ -167,3 +170,28 @@ The original xloc.f90 passes --run-both; the expanded comparison matches:
   reports\xf2p_batch_20261004_145628_1_52fg9u\results.txt
 tests/cases/stash is excluded from automatic execution-test discovery.
 Full suite: 128 passed, 7 strict expected failures in 188.79 seconds.
+
+Mathematical-intrinsic follow-up (2026-10-04)
+-------------------------------------------
+Added ERFC_SCALED (SciPy erfcx), Bessel Y0/Y1, SINH/COSH/TANH, EPSILON,
+ATAN2D/ATAN2PI, and two-argument ATAND/ATANPI mappings. NORM2 now uses scaled
+accumulation and supports DIM. PI-scaled trig reduces arguments before
+multiplication, handles cardinal values exactly, and retains tiny negatives.
+Special-function programs import SciPy conditionally and report installation
+instructions if unavailable; mathematical names inside string labels do not
+trigger the dependency. Scalar and array special functions are tested.
+
+The unchanged xintrinsics_all.f90 still fails on its internal check procedure
+updating the host's ntest/nfail variables. The regression copy passes those
+counters explicitly, without changing the user's source. All 73 original
+checks pass in Fortran and Python, and the execution test compares their
+output. Reference compilation uses -O3 because this MinGW toolchain has an
+unavailable runtime sinpi symbol at -O0. The default-O0 batch attempt is saved
+in reports\xf2p_batch_20261004_151350_h_rqze1v and is a compiler/library failure,
+not a successful translation comparison.
+
+A fresh-directory CLI --run-both succeeds; a reused temporary output directory
+with an old fortran_py_runtime.py can still load stale helpers (a separate
+pre-existing runtime-copy limitation). General Fortran REAL kind fidelity is
+also unchanged; the regression uses real64.
+Full suite: 134 passed, 7 strict expected failures in 231.77 seconds.
