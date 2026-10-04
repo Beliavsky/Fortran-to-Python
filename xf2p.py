@@ -1186,17 +1186,27 @@ class basic_f2p:
     def _emit_intrinsic_use_aliases(self, lines: list[tuple[str, str]]) -> None:
         for code, _comment in lines:
             s = code.strip()
-            mu = re.match(r"^use\s*,\s*intrinsic\s*::\s*([a-z_]\w*)\s*(.*)$", s, re.I)
+            mu = re.match(r"^use\b\s*(?:,\s*(intrinsic|non_intrinsic)\s*)?(?:::)?\s*([a-z_]\w*)\s*(.*)$", s, re.I)
             if not mu:
                 continue
-            mod = mu.group(1).strip().lower()
-            tail = mu.group(2).strip()
+            if (mu.group(1) or "").lower() == "non_intrinsic":
+                continue
+            mod = mu.group(2).strip().lower()
+            tail = mu.group(3).strip()
             if mod != "iso_fortran_env":
                 continue
             mo = re.search(r"\bonly\s*:\s*(.+)$", tail, re.I)
+            items = split_args(mo.group(1).strip()) if mo else [
+                "int8", "int16", "int32", "int64", "real32", "real64"]
             if not mo:
-                continue
-            for it in split_args(mo.group(1).strip()):
+                renames = split_args(tail.lstrip(",").strip()) if tail.strip() else []
+                # Without ONLY, a renamed remote is not imported under its old name.
+                for item in renames:
+                    if "=>" in item:
+                        remote = item.split("=>", 1)[1].strip().lower()
+                        items = [p for p in items if p.lower() != remote]
+                        items.append(item)
+            for it in items:
                 nm = it.strip()
                 if not nm:
                     continue

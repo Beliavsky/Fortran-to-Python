@@ -11,9 +11,9 @@ skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (21 programs)
+Corpus (22 programs)
 --------------------
-handwritten/: 17 small deterministic programs exercising scalars, loops,
+handwritten/: 18 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
@@ -44,10 +44,9 @@ I/O cannot accidentally reuse files produced by the reference execution.
 
 Known failures (2026-10-04)
 --------------------------
-xsum_dim_int: ISO_FORTRAN_ENV INT32 becomes undefined Python name int32.
 formatted_file_io: numeric file units produce invalid Python 20.close().
 
-These two cases are strict expected failures, not skipped. Their Fortran
+This case is a strict expected failure, not skipped. Its Fortran
 references must still compile and execute successfully. Unexpected success
 fails the suite so that obsolete expectations are removed after a fix.
 Other assertion failures inside a known-failing translation may also count
@@ -99,3 +98,12 @@ broadcasting. The string_assignment program verifies scalar/array assignment,
 initializers, zero length, padding, truncation, and search; strings now passes.
 Substring reads are covered by strings; substring writes and deferred-length
 allocatable strings are not yet covered by these regressions.
+
+Also fixed on 2026-10-04: ISO_FORTRAN_ENV kind imports with or without
+INTRINSIC/ONLY and with renamed imports. NON_INTRINSIC modules are not treated
+as the built-in module. The existing xsum_dim_int case and new iso_kind_imports
+case both pass, including module and procedure-local aliases.
+Kind-number values use the existing GNU-style convention (1/2/4/8 for integer
+storage sizes). They are not portable processor-independent kind identifiers.
+Resolving these constants does not yet guarantee exact kind-sized integer
+storage or overflow semantics throughout translated Python/NumPy operations.
