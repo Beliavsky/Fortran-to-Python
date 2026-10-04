@@ -15,7 +15,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CASES = Path(__file__).parent / "cases"
 NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?$")
 KNOWN_FAILURES = {
-    "matrix_operations": "transpose intrinsic emitted as an undefined Python name",
     "strings": "generated string initialization calls undefined _f_str_assign",
     "xsum_dim_int": "iso_fortran_env int32 emitted as an undefined Python name",
     "formatted_file_io": "numeric file unit produces invalid Python 20.close()",

@@ -1835,7 +1835,6 @@ class basic_f2p:
         s = re.sub(r"\bexp\s*\(", "np.exp(", s, flags=re.I)
         s = re.sub(r"\bmax\s*\(", "np.maximum(", s, flags=re.I)
         s = re.sub(r"\bmin\s*\(", "np.minimum(", s, flags=re.I)
-        s = re.sub(r"\breshape\s*\(", "np.reshape(", s, flags=re.I)
         s = re.sub(r"\bspread\s*\(", "_f_spread(", s, flags=re.I)
         s = re.sub(r"\bmodulo\s*\(", "_xf2p_modulo(", s, flags=re.I)
         s = re.sub(r"\bmod\s*\(", "_xf2p_mod(", s, flags=re.I)
@@ -1963,9 +1962,39 @@ class basic_f2p:
                 "floor",
                 "lbound",
                 "ubound",
+                "transpose",
+                "matmul",
+                "dot_product",
+                "reshape",
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
+            if lname in {"transpose", "matmul", "dot_product", "reshape"}:
+                parameters = {"transpose": ("matrix",),
+                              "matmul": ("matrix_a", "matrix_b"),
+                              "dot_product": ("vector_a", "vector_b"),
+                              "reshape": ("source", "shape", "pad", "order")}[lname]
+                bound = {}
+                for part in parts:
+                    keyword = re.match(r"^([a-z_]\w*)\s*=\s*(.*)$", part, re.I)
+                    if keyword:
+                        key, value = keyword.group(1).lower(), keyword.group(2)
+                    else:
+                        key = next((p for p in parameters if p not in bound), "")
+                        value = part
+                    if key not in parameters or key in bound:
+                        raise ValueError(f"Invalid arguments to {lname}")
+                    bound[key] = self.translate_expr(value, arrays_1d)
+                required = parameters[:2] if lname == "reshape" else parameters
+                if not set(required).issubset(bound):
+                    raise ValueError(f"Invalid arguments to {lname}")
+                callee = {"transpose": "np.transpose", "matmul": "matmul",
+                          "dot_product": "_f_dot_product", "reshape": "_f_reshape"}[lname]
+                if lname == "reshape":
+                    arguments = [bound["source"], bound["shape"]]
+                    arguments.extend(f"{p}={bound[p]}" for p in ("pad", "order") if p in bound)
+                    return f"{callee}({', '.join(arguments)})"
+                return f"{callee}({', '.join(bound[p] for p in parameters)})"
             args_py = [self.translate_expr(p, arrays_1d) for p in parts]
             if lname == "trim" and len(args_py) == 1:
                 return f"str({args_py[0]}).rstrip()"

@@ -11,9 +11,9 @@ skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (17 programs)
+Corpus (20 programs)
 --------------------
-handwritten/: 13 small deterministic programs exercising scalars, loops,
+handwritten/: 16 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
@@ -44,12 +44,11 @@ I/O cannot accidentally reuse files produced by the reference execution.
 
 Known failures (2026-10-04)
 --------------------------
-matrix_operations: TRANSPOSE becomes undefined Python name transpose.
 strings: string initialization calls undefined helper _f_str_assign.
 xsum_dim_int: ISO_FORTRAN_ENV INT32 becomes undefined Python name int32.
 formatted_file_io: numeric file units produce invalid Python 20.close().
 
-These four cases are strict expected failures, not skipped. Their Fortran
+These three cases are strict expected failures, not skipped. Their Fortran
 references must still compile and execute successfully. Unexpected success
 fails the suite so that obsolete expectations are removed after a fix.
 Other assertion failures inside a known-failing translation may also count
@@ -81,3 +80,14 @@ declared lower bounds, multiple dimensions, nested bounds, and overlapping
 assignment. Unlike Python, Fortran's omitted bounds do not reverse with a
 negative stride. Runtime triplet conversion rejects zero strides and selected
 out-of-bounds elements. The original array_sections case now passes.
+
+Also fixed on 2026-10-04: TRANSPOSE and DOT_PRODUCT translation, and intrinsic
+keyword arguments for TRANSPOSE, MATMUL, DOT_PRODUCT, and RESHAPE. Complex
+DOT_PRODUCT conjugates its first vector; logical DOT_PRODUCT uses ANY of AND,
+and logical MATMUL uses AND/OR rather than numeric sums. Three new programs
+check integer, complex, and logical matrix/vector operations.
+
+Fixing TRANSPOSE exposed a wrong-result RESHAPE bug in matrix_operations:
+Fortran source elements must fill in column-major order. Translation now uses
+a dedicated helper implementing Fortran ordering, PAD, and ORDER, without
+changing ordinary NumPy reshape defaults. The original matrix case now passes.
