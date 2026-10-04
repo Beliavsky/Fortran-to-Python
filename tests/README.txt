@@ -139,6 +139,16 @@ construct default elements or copy explicit initializers independently, so
 mutating one element/object does not modify siblings, other instances, or the
 initializer. Uninitialized intrinsic arrays remain np.empty; allocatable and
 pointer components keep their existing unallocated/disassociated behavior.
-Complex scalar initialization is tested; complex-pair literals nested inside
-array constructors and chained component-array indexing remain separate
-expression-translation limitations, recorded in FEATURE_COVERAGE.txt.
+Complex scalar and vector initialization are tested. Complex-pair literals
+nested inside array constructors and chained component-array indexing were
+fixed in the follow-up described below.
+
+Also fixed on 2026-10-04: complex literals within untyped/typed array
+constructors, complex arithmetic and nested calls, and keyword constructor
+arguments. Parenthesized argument lists and strings are not complex literals.
+Chained component-array reads and writes now retain every subscript, including
+matrix indices, sections/strides, integer conversion, and masked assignments.
+Component bounds are taken from the component declaration, not its root
+object's array bounds. The expanded array_component_initializers regression
+checks non-default bounds for both components and arrays of derived objects.
+Indexed-object bound CALLs and general inheritance remain outside this fix.

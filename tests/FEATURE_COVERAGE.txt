@@ -105,9 +105,24 @@ Unit tests also check integer conversion and preservation of the initializer.
 The fresh execution comparison passes:
   reports\xf2p_batch_20261004_134052_rg79j4pk\results.txt
 
-Separate expression limitations discovered while expanding the regression:
+Expression limitations discovered while expanding the regression (now fixed):
   [(1d0,2d0),(-3d0,4d0)] becomes a list of Python tuples, not complex numbers.
   a%copies(1)%values(1) leaves the final array access as a function call.
-These are not initializer-factory defects. The execution regression uses a
-complex scalar initializer and ordinary procedure calls to read nested array
-components, isolating initialization from these still-unfixed expression paths.
+These were separate from the initializer factory and are now fixed. The
+regression uses the original complex vector initializer and direct chained
+component-array reads and writes instead of the earlier workarounds.
+
+Component-expression follow-up (2026-10-04)
+------------------------------------------
+Each array-constructor element is translated recursively. Complex pairs become
+complex values even in arithmetic expressions and nested/keyword arguments;
+function argument lists and quoted strings retain their original meaning.
+The reference scanner preserves the chain after subscripting a component or
+derived object. Component declarations supply bounds and assignment conversion
+metadata. Tests exercise vectors, matrices, non-default lower bounds, reverse
+sections, scalar expansion, fractional-to-integer conversion, masked writes,
+and arrays of derived objects whose own bounds differ from their components.
+Indexed-object bound CALLs and general inheritance are still not supported.
+Fresh execution comparison:
+  reports\xf2p_batch_20261004_140115_gz11_r5u\results.txt
+Full suite after both expression fixes: 113 passed, 7 strict expected failures.

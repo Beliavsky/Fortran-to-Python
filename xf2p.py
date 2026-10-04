@@ -1164,6 +1164,7 @@ class basic_f2p:
         self._derived_types: set[str] = set()
         self._type_bindings: dict[str, dict[str, dict]] = {}
         self._type_components: dict[str, dict[str, str]] = {}
+        self._component_specs: dict[str, dict[str, dict]] = {}
         self._decl_type_names: dict[str, str] = {}
         self._binding_targets: dict[str, dict] = {}
         self._select_case_stack: list[dict[str, object]] = []
@@ -1503,6 +1504,32 @@ class basic_f2p:
             type_name = self._type_components.get(type_name, {}).get(component, "")
         return self._type_bindings.get(type_name, {}).get(parts[-1])
 
+    def _component_spec(self, reference: str) -> dict | None:
+        path = reference.replace("%", ".")
+        # Remove subscripts from the type path, including nested index calls.
+        while True:
+            stripped = re.sub(r"\([^()]*\)", "", path)
+            if stripped == path:
+                break
+            path = stripped
+        parts = [p.strip().lower() for p in path.split(".")]
+        type_name = self._decl_type_names.get(parts[0], "")
+        spec = None
+        for field_name in parts[1:]:
+            spec = self._component_specs.get(type_name, {}).get(field_name)
+            if spec is None:
+                return None
+            type_name = spec.get("type_name") or ""
+        return spec
+
+    @staticmethod
+    def _is_chained_subscript(reference: str) -> bool:
+        opening = reference.find("(")
+        if opening < 0:
+            return False
+        closing = find_matching_paren(reference, opening)
+        return closing >= 0 and reference[closing + 1:].lstrip().startswith(("%", "."))
+
     def transpile_derived_type(self, header: str, body_lines: list[tuple[str, str]]) -> None:
         h = header.strip()
         m = re.match(r"^type\b(?:\s*,[^:]*)?(?:\s*::\s*|\s+)([a-z_]\w*)\s*$", h, re.I)
@@ -1512,6 +1539,7 @@ class basic_f2p:
         self._derived_types.add(tname)
         bindings = self._type_bindings.setdefault(tname.lower(), {})
         components = self._type_components.setdefault(tname.lower(), {})
+        component_specs = self._component_specs.setdefault(tname.lower(), {})
 
         self.emit("@dataclass")
         self.emit(f"class {tname}:")
@@ -1582,6 +1610,9 @@ class basic_f2p:
                 items = parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(td.group(2).strip()))
                 type_name = td.group(1)
             for name, shape, init in items:
+                component_specs[name.lower()] = {"ftype": ftype, "shape": shape,
+                    "type_name": type_name.lower() if type_name else None,
+                    "char_len": self._parse_character_len(s) if ftype == "character" else None}
                 if type_name:
                     components[name.lower()] = type_name.lower()
                 had_field = True
@@ -1740,6 +1771,10 @@ class basic_f2p:
         key = name.split(".", 1)[0].lower()
         src = self._decl_lbounds if which == "lo" else self._decl_ubounds
         vals = src.get(key)
+        if "." in name:
+            spec = self._component_spec(name)
+            bounds = self._shape_bounds(spec["shape"]) if spec and spec.get("shape") else []
+            vals = [bound[0 if which == "lo" else 1] for bound in bounds]
         if not vals or dim0 < 0 or dim0 >= len(vals):
             return None
         raw = str(vals[dim0]).strip()
@@ -1780,7 +1815,8 @@ class basic_f2p:
             lo_py = self.translate_expr(lo_txt.strip(), arrays_1d) if lo_txt.strip() else "None"
             hi_py = self.translate_expr(hi_txt.strip(), arrays_1d) if hi_txt.strip() else "None"
             step_py = self.translate_expr(step_txt.strip(), arrays_1d)
-            return f"_f_section_slice({name}, {dim0}, {base_lo_py or '1'}, {lo_py}, {hi_py}, {step_py})"
+            array_py = self.translate_expr(name, arrays_1d)
+            return f"_f_section_slice({array_py}, {dim0}, {base_lo_py or '1'}, {lo_py}, {hi_py}, {step_py})"
         lo_txt = lo_txt.strip()
         hi_txt = hi_txt.strip()
         if lo_txt:
@@ -1797,6 +1833,9 @@ class basic_f2p:
 
     def translate_expr(self, expr: str, arrays_1d: set[str]) -> str:
         s = expr.strip()
+        keyword = re.match(r"^([a-z_]\w*)\s*=(?!=)\s*(.+)$", s, re.I)
+        if keyword:
+            return f"{keyword.group(1)}={self.translate_expr(keyword.group(2), arrays_1d)}"
         s = s.replace("%", ".")
         concat_parts = split_top_level_concat(s)
         if len(concat_parts) > 1:
@@ -1867,6 +1906,9 @@ class basic_f2p:
                 for term in list_terms[1:]:
                     list_py = f"{list_py} + {term}"
                 return f"np.asarray({list_py})"
+            # Translate every constructor element, not just implied-DO terms:
+            # a complex literal is a Fortran value, not a Python tuple.
+            s = "[" + ", ".join(self.translate_expr(p, arrays_1d) for p in elems_parts) + "]"
 
         # kind(...) used as a kind selector
         # basic rule: if it uses a d exponent constant, treat it as double precision -> 8
@@ -1895,11 +1937,46 @@ class basic_f2p:
                 return None
             return parts[0], parts[1]
 
+        def _rewrite_complex_groups(text: str) -> str:
+            result = []
+            i = 0
+            while i < len(text):
+                if text[i] in "\"'":
+                    end = i + 1
+                    while end < len(text):
+                        if text[end] == "\\":
+                            end += 2
+                            continue
+                        if text[end] == text[i]:
+                            end += 1
+                            break
+                        end += 1
+                    result.append(text[i:end])
+                    i = end
+                    continue
+                if text[i] == "(":
+                    end = find_matching_paren(text, i)
+                    if end >= 0:
+                        inner = text[i + 1:end]
+                        prefix = text[:i].rstrip()
+                        is_call = bool(prefix and (prefix[-1].isalnum() or prefix[-1] in "_)]"))
+                        pair = _top_level_complex_literal(text[i:end + 1]) if not is_call else None
+                        if pair:
+                            result.append(f"_xf2p_cmplx({self.translate_expr(pair[0], arrays_1d)}, {self.translate_expr(pair[1], arrays_1d)})")
+                        else:
+                            result.append("(" + _rewrite_complex_groups(inner) + ")")
+                        i = end + 1
+                        continue
+                result.append(text[i])
+                i += 1
+            return "".join(result)
+
         complex_parts = _top_level_complex_literal(s)
         if complex_parts is not None:
             re_py = self.translate_expr(complex_parts[0], arrays_1d)
             im_py = self.translate_expr(complex_parts[1], arrays_1d)
             return f"_xf2p_cmplx({re_py}, {im_py})"
+        s = _rewrite_complex_groups(s)
 
         s = re.sub(r"\.true\.", "True", s, flags=re.I)
         s = re.sub(r"\.false\.", "False", s, flags=re.I)
@@ -2239,13 +2316,32 @@ class basic_f2p:
             out: list[str] = []
             i = 0
             n = len(txt)
+            chain_name = None
             while i < n:
+                if txt[i] in "\"'":
+                    end = i + 1
+                    while end < n:
+                        if txt[end] == "\\":
+                            end += 2
+                            continue
+                        if txt[end] == txt[i]:
+                            end += 1
+                            break
+                        end += 1
+                    out.append(txt[i:end])
+                    i = end
+                    chain_name = None
+                    continue
                 m = re.match(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", txt[i:])
                 if not m:
                     out.append(txt[i])
+                    if not txt[i].isspace() and txt[i] != ".":
+                        chain_name = None
                     i += 1
                     continue
                 name = m.group(0)
+                continuation = chain_name is not None and txt[:i].rstrip().endswith(".")
+                full_name = f"{chain_name}.{name}" if continuation else name
                 j = i + len(name)
                 k = j
                 while k < n and txt[k].isspace():
@@ -2255,8 +2351,9 @@ class basic_f2p:
                     if pclose != -1:
                         inner = txt[k + 1 : pclose]
                         inner_py = self.translate_expr(inner, arrays_1d)
-                        root = name.split(".", 1)[0].lower()
-                        dotted_array_ref = ("." in name) and (root not in {"np", "math", "random", "sps"}) and self._bound_signature(name) is None
+                        root = full_name.split(".", 1)[0].lower()
+                        dotted_array_ref = ("." in full_name) and (root not in {"np", "math", "random", "sps"}) and self._bound_signature(full_name) is None
+                        chain_name = f"{full_name}({inner})"
                         special_call = None if "." in name else _translate_special_call(name, inner)
                         if special_call is not None:
                             out.append(special_call)
@@ -2273,9 +2370,9 @@ class basic_f2p:
                                         lo, hi = self._split_section(ptxt)
                                         lo = lo.strip()
                                         hi = hi.strip()
-                                        idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
+                                        idx_parts.append(self._slice_expr_from_decl_bounds(full_name, lo, hi, len(idx_parts), arrays_1d))
                                     else:
-                                        idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
+                                        idx_parts.append(self._index_expr_from_decl_bounds(full_name, ptxt, len(idx_parts), arrays_1d))
                                 out.append(f"{name}[{', '.join(idx_parts)}]")
                                 i = pclose + 1
                                 continue
@@ -2283,9 +2380,9 @@ class basic_f2p:
                                 lo, hi = self._split_section(inner)
                                 lo = lo.strip()
                                 hi = hi.strip()
-                                out.append(f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}]")
+                                out.append(f"{name}[{self._slice_expr_from_decl_bounds(full_name, lo, hi, 0, arrays_1d)}]")
                             else:
-                                out.append(f"{name}[{self._index_expr_from_decl_bounds(name, inner, 0, arrays_1d)}]")
+                                out.append(f"{name}[{self._index_expr_from_decl_bounds(full_name, inner, 0, arrays_1d)}]")
                         else:
                             is_char_substring = self._decl_types.get(name.lower()) == "character"
                             if is_char_substring and ":" in inner and "," not in inner:
@@ -2313,6 +2410,7 @@ class basic_f2p:
                 else:
                     out.append(name)
                 i = j
+                chain_name = full_name
             return "".join(out)
 
         s = _convert_refs(s)
@@ -2445,6 +2543,17 @@ class basic_f2p:
         if self._where_masked_assignment(lhs, rhs_py, arrays_1d):
             return
         lhs = lhs.replace("%", ".")
+        if self._is_chained_subscript(lhs):
+            target = self.translate_expr(lhs, arrays_1d)
+            spec = self._component_spec(lhs)
+            whole_array = bool(spec and spec.get("shape") and not lhs.rstrip().endswith(")"))
+            if spec and spec["ftype"] == "integer":
+                rhs_py = f"np.asarray({rhs_py}, dtype=int)" if whole_array or ":" in lhs else f"int({rhs_py})"
+            if spec and spec.get("char_len") is not None:
+                rhs_py = f"_f_str_assign({rhs_py}, {self.translate_expr(spec['char_len'], arrays_1d)})"
+            value = f"_f_assign_array({target}, {rhs_py})" if whole_array else f"_xf2p_copy_value({rhs_py})"
+            self.emit(f"{target} = {value}")
+            return
         mb = re.match(r"\s*([A-Za-z_]\w*)", lhs)
         lhs_base = mb.group(1).lower() if mb else lhs.split(".", 1)[0].strip().lower()
         rhs_py = self._integer_assignment_rhs(lhs, rhs_py, arrays_1d)
@@ -2878,6 +2987,18 @@ class basic_f2p:
         if mask_expr is None:
             return False
         lhs = lhs.replace("%", ".")
+        if self._is_chained_subscript(lhs):
+            target = self.translate_expr(lhs, arrays_1d)
+            spec = self._component_spec(lhs)
+            if spec and spec["ftype"] == "integer":
+                rhs_py = f"np.asarray({rhs_py}, dtype=int)"
+            if spec and spec.get("char_len") is not None:
+                rhs_py = f"_f_str_assign({rhs_py}, {self.translate_expr(spec['char_len'], arrays_1d)})"
+            value = f"np.where({mask_expr}, {rhs_py}, {target})"
+            if spec and spec.get("shape") and not lhs.rstrip().endswith(")"):
+                value = f"_f_assign_array({target}, {value})"
+            self.emit(f"{target} = {value}")
+            return True
         lhs_base = lhs.split(".", 1)[0].strip().lower()
         rhs_py = self._integer_assignment_rhs(lhs, rhs_py, arrays_1d)
         mname = re.match(r"^\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(", lhs, re.I)
@@ -4738,6 +4859,7 @@ class basic_f2p:
         raw = collapse_fortran_continuations(raw)
         self._type_bindings = {}
         self._type_components = {}
+        self._component_specs = {}
         self._decl_type_names = {}
         # Bindings precede their implementations; collect signatures before
         # emitting dataclass forwarding methods and resolving bound CALLs.
