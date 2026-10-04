@@ -16,6 +16,13 @@ CASES = Path(__file__).parent / "cases"
 NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?$")
 KNOWN_FAILURES = {
     "formatted_file_io": "numeric file unit produces invalid Python 20.close()",
+    "execute_command_line": "EXECUTE_COMMAND_LINE has no translated helper",
+    "impure_elemental": "updating module state lacks a Python global declaration",
+    "selected_integer_kind": "SELECTED_INT_KIND has no translated helper",
+    "selected_logical_kind": "SELECTED_LOGICAL_KIND has no translated helper",
+    "selected_real_kind": "SELECTED_REAL_KIND has no translated helper",
+    "type_bound_procedure": "type-bound call silently fails to update the object",
+    "type_extension": "parent component of an extended type is missing",
 }
 
 

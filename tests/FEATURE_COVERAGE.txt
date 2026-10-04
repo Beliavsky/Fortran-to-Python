@@ -1,0 +1,71 @@
+Language-feature execution survey (2026-10-04)
+=============================================
+
+All 17 new reference programs compile and run with the local gfortran.
+Ten translations match the Fortran output; seven expose translator defects.
+No translator or runtime changes were made for this survey.
+
+Matching cases
+--------------
+optional_arguments       OPTIONAL/PRESENT; omitted and keyword optional arguments
+keyword_arguments        positional and reordered keyword procedure calls
+explicit_save            persistent procedure-local counter across scalar calls
+exit_loops               loop EXIT and the final loop-variable value
+logical_equivalence      scalar/array EQV and NEQV truth tables
+elemental_functions      scalar calls and array calls with scalar broadcasting
+do_concurrent            independent single-index array updates
+derived_type_assignment  copying array components without aliasing the original
+derived_type_arguments   derived-type argument and function result
+labeled_format           WRITE with a labeled FORMAT statement
+
+Confirmed failures (strict xfail in test_xf2p_execution.py)
+--------------------------------------------------------
+type_bound_procedure: WRONG RESULT. Fortran prints 3; Python prints 0.
+  The call to value%increment(3) is omitted from the generated Python;
+  value%value consequently remains zero.
+  Investigate this first: execution succeeds while the answer is wrong.
+
+impure_elemental: UnboundLocalError for module variable calls.
+  The translated procedure updates module state without declaring it global.
+  This scalar-only test avoids array elemental evaluation-order assumptions;
+  it isolates module-state mutation rather than proving general impure
+  elemental support or lack of support.
+
+type_extension: AttributeError: 'child' object has no attribute 'base'.
+  Explicit parent-component access value%base%id is not represented correctly.
+
+selected_integer_kind: NameError for selected_int_kind.
+selected_real_kind: NameError for selected_real_kind.
+selected_logical_kind: NameError for selected_logical_kind.
+  Missing helpers prevent initialization of kind parameters.
+  Tests compare numeric values and positive-kind checks, not processor-specific
+  kind numbers. The integer case also exercises a large kind-suffixed literal.
+
+execute_command_line: NameError for execute_command_line.
+  The test only runs 'echo command_ok' synchronously and checks exitstat/cmdstat.
+  It does not launch arbitrary commands or perform destructive operations.
+
+Evidence
+--------
+Initial full survey:
+  reports\xf2p_batch_20261004_123844_tgt8uj37\results.txt
+Corrected kind-selection fixtures and rerun:
+  reports\xf2p_batch_20261004_124342_h583ujct\results.txt
+The first survey's two reference compilation errors were fixture mistakes:
+program names collided with SELECTED_REAL_KIND and SELECTED_LOGICAL_KIND.
+Renaming those programs resolved both errors; neither is a compiler limitation.
+The batch reports are local ignored artifacts. The fixtures and this summary
+retain the reproducers and findings independently of those report directories.
+
+Run the feature tests, exposing failures instead of applying xfail:
+  pytest -q --runxfail tests\test_xf2p_execution.py -k "selected or elemental or type_bound or type_extension or execute_command_line"
+
+Run a fresh full feature survey:
+  python xf2p_batch.py "tests\cases\features\*.f90" --run-diff
+
+Scope
+-----
+Passing these small cases is not a complete language-support guarantee.
+Additional tests should cover multiple concurrent indices, locality clauses,
+absent optional arguments forwarded to other procedures, polymorphism,
+overridden bindings, and impure elemental array calls with well-defined results.

@@ -11,11 +11,17 @@ skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (22 programs)
+Corpus (39 programs)
 --------------------
 handwritten/: 18 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
+
+features/: 17 focused programs covering OPTIONAL/PRESENT, keyword calls,
+explicit SAVE, EXIT, EQV/NEQV, elemental and impure elemental procedures,
+DO CONCURRENT, derived-type assignment/arguments/results, type extension,
+type-bound procedures, labeled FORMAT, selected-kind intrinsics, and a
+controlled EXECUTE_COMMAND_LINE call. See FEATURE_COVERAGE.txt for results.
 
 existing/xsum_dim_int.f90: copied from C:\python\fortran\xsum_dim_int.f90
 on 2026-10-04; only line-ending differences. Tests integer kinds and axis sums.
@@ -45,8 +51,14 @@ I/O cannot accidentally reuse files produced by the reference execution.
 Known failures (2026-10-04)
 --------------------------
 formatted_file_io: numeric file units produce invalid Python 20.close().
+execute_command_line: missing EXECUTE_COMMAND_LINE helper.
+impure_elemental: updating module state lacks a Python global declaration.
+selected_integer_kind, selected_logical_kind, selected_real_kind: missing
+kind-selection intrinsic helpers.
+type_bound_procedure: silently fails to update the object (wrong result).
+type_extension: missing parent component of an extended type.
 
-This case is a strict expected failure, not skipped. Its Fortran
+These cases are strict expected failures, not skipped. Their Fortran
 references must still compile and execute successfully. Unexpected success
 fails the suite so that obsolete expectations are removed after a fix.
 Other assertion failures inside a known-failing translation may also count
@@ -62,7 +74,7 @@ To save machine-readable test results:
 
 The suite is a starting corpus, not a complete support guarantee. Larger
 integration programs, helper-dependent p2f output, random-number algorithms,
-complex numbers, derived types, and additional unsupported syntax need
+more complex-number and derived-type cases, and additional unsupported syntax need
 dedicated tests in subsequent expansions.
 
 Fixed on 2026-10-04: integer whole-array, section, and WHERE assignments
