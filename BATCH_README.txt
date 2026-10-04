@@ -38,7 +38,11 @@ Additional options:
 
 The CLI and batch runner share fortran_output_compare.py. Default comparisons
 ignore whitespace/line wrapping and compare standalone real tokens numerically,
-including Fortran D exponents. Integer tokens and other text compare exactly.
+including Fortran D exponents. Standalone T/True and F/False tokens compare
+as equivalent logical values. Integer tokens and other text compare exactly.
+Stdout has no type information: character output consisting of those same
+standalone words is also treated as logical. Use --diff-exact when their
+spelling matters. Embedded text such as flag=T is not normalized.
 Matching NaNs and same-sign infinities compare equal. Only stdout is compared;
 stderr is displayed/saved separately and process failures remain failures.
 --diff-exact retains xf2p.py's former normalized-line comparison: whitespace

@@ -227,6 +227,10 @@ wrapping, and matching NaN/infinity spellings are handled. --diff-exact implies
 byte-for-byte whitespace equality. Mismatches return nonzero and identify the
 first genuine mismatch, skipping preceding numerically equivalent tokens.
 Only stdout is compared; stderr remains visible and process failures fail.
+Standalone T/True and F/False tokens are equivalent in default comparisons;
+generated Python keeps its idiomatic True/False output. Character output with
+these standalone words is indistinguishable from logical output; --diff-exact
+preserves spelling differences. Embedded labels such as flag=T remain exact.
 --time-both also implies --run-diff. Use --run-both --time to time intentionally
 different output (for example unreplayed random draws) without comparing it.
 Invalid tolerances are rejected. tests/test_output_compare.py and

@@ -18,6 +18,34 @@ def test_integers_and_labels_are_exact():
     assert compare_outputs('a 1.0', 'b 1.0')['status'] == 'mismatch'
 
 
+@pytest.mark.parametrize('reference, actual', [
+    ('T', 'True'), ('F', 'False'),
+    ('T F T\nF', 'True False\nTrue False'),
+    ('1 F F\n1 F T\n3', '1 False False\n1 False True\n3'),
+])
+def test_logical_spellings(reference, actual):
+    assert compare_outputs(reference, actual)['status'] == 'match'
+    assert compare_outputs(actual, reference)['status'] == 'match'
+    assert compare_outputs(reference, actual, exact=True)['status'] == 'mismatch'
+
+
+@pytest.mark.parametrize('reference, actual', [
+    ('T', 'False'), ('F', 'True'), ('True', 'False'),
+    ('T', '1'), ('F', '0'), ('flag=T', 'flag=True'),
+    ('"T"', '"True"'), ('TRUE', 'True'), ('t', 'True'),
+])
+def test_logical_mismatches_and_nonstandalone_text(reference, actual):
+    assert compare_outputs(reference, actual, rtol=1, atol=1)['status'] == 'mismatch'
+
+
+def test_logical_first_mismatch_diagnostics(capsys):
+    assert not _report_run_diff('T\nF\n', 'True\nTrue\n')
+    output = capsys.readouterr().out
+    assert 'first mismatch line: 2' in output
+    assert 'fortran: F' in output
+    assert 'python : True' in output
+
+
 def test_tolerances_and_exact_mode():
     assert compare_outputs('v 1.0', 'v 1.001')['status'] == 'mismatch'
     assert compare_outputs('v 1.0', 'v 1.001', rtol=.01)['status'] == 'match'

@@ -7,6 +7,7 @@ import re
 NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?$")
 INTEGER = re.compile(r"^[+-]?\d+$")
 SPECIAL = re.compile(r"^[+-]?(?:inf(?:inity)?|nan)$", re.I)
+LOGICAL = {"T": True, "True": True, "F": False, "False": False}
 
 
 def validate_tolerances(rtol: float, atol: float) -> None:
@@ -25,6 +26,8 @@ def normalized_lines(output: str) -> list[str]:
 def _equal_token(a: str, b: str, rtol: float, atol: float) -> bool:
     if a == b:
         return True
+    if a in LOGICAL and b in LOGICAL:
+        return LOGICAL[a] == LOGICAL[b]
     if INTEGER.fullmatch(a) and INTEGER.fullmatch(b):
         return int(a) == int(b)
     if (NUMBER.fullmatch(a) or SPECIAL.fullmatch(a)) and (NUMBER.fullmatch(b) or SPECIAL.fullmatch(b)):
@@ -37,11 +40,13 @@ def _equal_token(a: str, b: str, rtol: float, atol: float) -> bool:
 
 def compare_outputs(reference: str, actual: str, rtol: float = 1e-9,
                     atol: float = 1e-11, *, exact: bool = False) -> dict:
-    """Integers/text are exact; real tokens are tolerant unless exact=True.
+    """Real tokens are tolerant; standalone T/True and F/False are equivalent.
 
     Default mode ignores whitespace, including line wrapping. Exact mode uses
     normalized lines (the CLI's former behavior), not byte-for-byte equality.
     Matching NaNs and same-sign infinities compare equal.
+    Other integers/text are exact. Logical-looking character output cannot be
+    distinguished from logical values; use exact=True when spelling matters.
     """
     validate_tolerances(rtol, atol)
     reference = reference.replace("\r\n", "\n").replace("\r", "\n")
