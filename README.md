@@ -148,10 +148,9 @@ against independently compiled Fortran. Execution tests skip when their required
 compiler or dependencies are unavailable. Known failures are marked explicitly;
 strict expected-failure checks expose unexpected passes.
 
-On October 4, 2026, the established suite completed with **261 passed and six
-expected failures**, excluding 60 local exploratory cases under `tests/cases/more/`.
-Those exploratory cases are not part of the published tracked corpus. Locally
-adding Fortran files beneath `tests/cases/` can add execution cases to pytest;
+Local exploratory cases may live under `tests/cases/more/` without being part
+of the tracked test corpus. Adding Fortran files beneath `tests/cases/` can
+add execution cases to pytest;
 `tests/cases/stash/` is excluded from discovery.
 
 ## Related tools
