@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+reports/pytest.xml
+reports/xf2p_batch_*/
