@@ -11,19 +11,23 @@ skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (40 programs)
+Corpus (42 programs)
 --------------------
 handwritten/: 18 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
-features/: 18 focused programs covering OPTIONAL/PRESENT, keyword calls,
+features/: 20 focused programs covering OPTIONAL/PRESENT, keyword calls,
 explicit SAVE, EXIT, EQV/NEQV, elemental and impure elemental procedures,
 DO CONCURRENT, derived-type assignment/arguments/results, type extension,
 type-bound procedures, labeled FORMAT, selected-kind intrinsics, and a
 controlled EXECUTE_COMMAND_LINE call. See FEATURE_COVERAGE.txt for results.
 array_component_initializers also verifies default component values and
 independent storage between objects and between derived-type array elements.
+location_intrinsics verifies MINLOC/MAXLOC/FINDLOC, DIM, MASK, BACK, KIND,
+Fortran array-element order, empty arrays, and character/logical searches.
+
+stash/: manual probes retained for reference; excluded from automated discovery.
 
 existing/xsum_dim_int.f90: copied from C:\python\fortran\xsum_dim_int.f90
 on 2026-10-04; only line-ending differences. Tests integer kinds and axis sums.
@@ -152,3 +156,18 @@ Component bounds are taken from the component declaration, not its root
 object's array bounds. The expanded array_component_initializers regression
 checks non-default bounds for both components and arrays of derived objects.
 Indexed-object bound CALLs and general inheritance remain outside this fix.
+
+Also fixed on 2026-10-04: ALLOCATE with SOURCE= and MOLD=. SOURCE copies
+values into independent storage; MOLD supplies shape without copying values.
+Explicit bounds, scalar SOURCE expansion, scalar allocation, multiple objects,
+intrinsic element types, fixed-length CHARACTER, derived-type defaults/copies,
+and default-bound allocatable components are covered by allocate_models.
+Whole-array model bounds and explicit bounds are captured within the current
+unit, so later changes to extent variables do not change allocated bounds.
+Zero extents return LBOUND=1/UBOUND=0. STAT is zero on success and nonzero on
+allocation errors; its numeric error codes and ERRMSG text are not intended
+to duplicate a particular Fortran compiler. Existing allocation is retained
+when an already-allocated object fails allocation with STAT.
+Type-spec ALLOCATE, deferred-length CHARACTER, and non-default bounds for
+allocated components remain unsupported with explicit diagnostics. General
+cross-procedure preservation of allocatable-dummy bounds is not guaranteed.

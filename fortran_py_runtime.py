@@ -35,6 +35,7 @@ __all__ = [
     "_f_spread",
     "_f_assign_array",
     "_f_init_component_array",
+    "_f_allocate",
     "_f_section_slice",
     "_f_dot_product",
     "_f_reshape",
@@ -47,6 +48,9 @@ __all__ = [
     "count",
     "maxval",
     "minval",
+    "_f_minloc",
+    "_f_maxloc",
+    "_f_findloc",
     "spread",
     "huge",
     "tiny",
@@ -182,6 +186,38 @@ def _f_init_component_array(shape, initializer, dtype):
     return result
 
 
+def _f_allocate(model=None, shape=None, dtype=float, source=False, rank=1,
+                factory=None, char_len=None):
+    """Allocate typed storage; SOURCE copies values, MOLD supplies only shape."""
+    if shape is None:
+        if model is None:
+            raise ValueError("allocation requires bounds or a model with known shape")
+        shape = np.shape(model)
+    shape = tuple(int(n) for n in shape)
+    if len(shape) != rank:
+        raise ValueError("allocation shape does not match declared rank")
+    if source:
+        if model is None:
+            raise ValueError("SOURCE is unallocated or disassociated")
+        model_shape = np.shape(model)
+        if model_shape and model_shape != shape:
+            raise ValueError("SOURCE array shape does not match allocation bounds")
+        if factory is not None and not shape:
+            import copy
+            return copy.deepcopy(model)
+        if char_len is not None:
+            model = _f_str_assign(model, char_len)
+        return _f_init_component_array(shape, model, dtype)
+    # Do not read the model's values, even when it is uninitialized.
+    if factory is not None:
+        if not shape:
+            return factory()
+        return _f_init_component_array(shape, factory(), object)
+    if char_len is not None:
+        return np.full(shape, " " * max(0, int(char_len)), dtype=object)
+    return np.empty(shape, dtype=dtype)
+
+
 def _f_assign_array(lhs, rhs):
     """Assign with array-shape-aware replacement semantics used by transpiled code."""
     try:
@@ -238,6 +274,81 @@ def minval(x, dim=None):
     if dim is None:
         return np.min(a)
     return np.min(a, axis=int(dim) - 1)
+
+
+def _f_location(array, dim=None, mask=None, kind=None, back=False, *, mode, value=None):
+    """Location in array-element order, independent of declared lower bounds."""
+    a = np.asarray(array)
+    if a.ndim == 0:
+        raise ValueError("location intrinsic requires an array")
+    dtype = np.dtype("int64" if kind is None else f"int{8 * int(kind)}")
+    if dtype.kind != "i":
+        raise ValueError("location KIND must specify an integer kind")
+    if mask is None:
+        eligible = np.ones(a.shape, dtype=bool)
+    else:
+        m = np.asarray(mask, dtype=bool)
+        if m.ndim and m.shape != a.shape:
+            raise ValueError("location MASK must conform to ARRAY")
+        eligible = np.broadcast_to(m, a.shape)
+    # Fortran CHARACTER comparisons blank-pad shorter operands.
+    if a.dtype.kind in "US" or (a.dtype.kind == "O" and all(isinstance(x, str) for x in a.flat)):
+        width = max([len(str(x)) for x in a.flat] + ([len(str(value))] if mode == "find" else [0]))
+        a = np.asarray([str(x).ljust(width) for x in a.flat]).reshape(a.shape)
+        if mode == "find":
+            value = str(value).ljust(width)
+
+    def locate(items, allowed):
+        indices = np.flatnonzero(allowed)
+        if not indices.size:
+            return 0
+        if mode == "find":
+            hits = indices[items[indices] == value]
+        else:
+            selected = items[indices]
+            if selected.dtype.kind in "US":
+                target = min(selected.tolist()) if mode == "min" else max(selected.tolist())
+            else:
+                target = np.min(selected) if mode == "min" else np.max(selected)
+            hits = indices[selected == target]
+        return int(hits[-1] if back else hits[0]) + 1 if hits.size else 0
+
+    if dim is None:
+        position = locate(a.ravel(order="F"), eligible.ravel(order="F"))
+        if not position:
+            return np.zeros(a.ndim, dtype=dtype)
+        return np.asarray(np.unravel_index(position - 1, a.shape, order="F"), dtype=dtype) + 1
+    axis = int(dim) - 1
+    if not 0 <= axis < a.ndim:
+        raise ValueError("location DIM is outside ARRAY rank")
+    moved, allowed = np.moveaxis(a, axis, -1), np.moveaxis(eligible, axis, -1)
+    result = np.zeros(moved.shape[:-1], dtype=dtype)
+    for index in np.ndindex(result.shape):
+        result[index] = locate(moved[index], allowed[index])
+    return result[()] if result.ndim == 0 else result
+
+
+def _f_location_options(args, options):
+    names = ("mask", "kind", "back") if args and np.asarray(args[0]).dtype.kind == "b" else ("dim", "mask", "kind", "back")
+    if len(args) > len(names):
+        raise TypeError("too many location intrinsic arguments")
+    for name, value in zip(names, args):
+        if name in options:
+            raise TypeError(f"duplicate location argument: {name}")
+        options[name] = value
+    return options
+
+
+def _f_minloc(array, *args, **options):
+    return _f_location(array, mode="min", **_f_location_options(args, options))
+
+
+def _f_maxloc(array, *args, **options):
+    return _f_location(array, mode="max", **_f_location_options(args, options))
+
+
+def _f_findloc(array, value, *args, **options):
+    return _f_location(array, mode="find", value=value, **_f_location_options(args, options))
 
 
 def spread(a, dim=1, ncopies=1):

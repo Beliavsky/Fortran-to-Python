@@ -7,6 +7,10 @@ No translator or runtime changes were made for the initial survey.
 After the type-bound-call fix, eleven match and six remain failing.
 The added array-component regression also passes: the current feature corpus
 has 18 programs, with 12 matching and six known failures.
+The ALLOCATE regression raises the current feature corpus to 19 programs,
+with 13 matching and six known failures.
+The location-intrinsic regression brings this to 20 programs, with 14 matching
+and six known failures.
 
 Matching cases
 --------------
@@ -22,6 +26,8 @@ derived_type_arguments   derived-type argument and function result
 labeled_format           WRITE with a labeled FORMAT statement
 type_bound_procedure     explicit bindings, PASS/NOPASS, functions, OUT arguments
 array_component_initializers  defaults, scalar/array values, independent storage
+allocate_models          SOURCE/MOLD, explicit bounds, independent storage, STAT
+location_intrinsics      MINLOC/MAXLOC/FINDLOC, DIM/MASK/BACK/KIND, empty arrays
 
 Confirmed failures (strict xfail in test_xf2p_execution.py)
 --------------------------------------------------------
@@ -126,3 +132,38 @@ Indexed-object bound CALLs and general inheritance are still not supported.
 Fresh execution comparison:
   reports\xf2p_batch_20261004_140115_gz11_r5u\results.txt
 Full suite after both expression fixes: 113 passed, 7 strict expected failures.
+
+ALLOCATE SOURCE/MOLD follow-up (2026-10-04)
+-----------------------------------------
+The user's xmold.f90 allocated y with SOURCE=x and z with MOLD=x. Only
+ALLOCATE(a(n)) had been recognized, so the option forms fell into assignment
+translation and emitted calls to a nonexistent Python allocate function.
+The new parser separates objects from options. SOURCE values are copied;
+MOLD values are never copied/read for intrinsic allocation. Derived-type
+MOLD allocation applies declared component defaults, not the model's values.
+Models are evaluated once, including allocations of multiple objects.
+Explicit dimensions and whole-variable model bounds are captured in the
+current unit; sections/expressions use one-based bounds. Tests check empty
+extents, scalars, matrices, integer/logical/complex/character arrays, derived
+element independence, allocatable components, and STAT/ERRMSG behavior.
+Unsupported type-spec allocation, deferred-length CHARACTER, and non-default
+allocated-component bounds receive explicit diagnostics. Bound propagation
+through allocatable procedure dummies remains a separate limitation.
+The regression uses numeric logical indicators to isolate allocation from
+the pre-existing list-directed logical-output discrepancy (T versus True).
+Fresh execution comparison:
+  reports\xf2p_batch_20261004_142418_idr78dcs\results.txt
+The user's xmold.f90 also passes --run-both.
+Full suite: 123 passed, 7 strict expected failures in 150.02 seconds.
+
+Location-intrinsic follow-up (2026-10-04)
+---------------------------------------
+MINLOC, MAXLOC, and FINDLOC now use runtime helpers instead of undefined
+Python calls. Results are one-based positions, not declared array subscripts.
+DIM removes the searched dimension; absent DIM returns a rank-one coordinate
+vector in Fortran array-element order. MASK, BACK, integer KIND, empty arrays,
+all-false masks, no matches, and blank-padded CHARACTER comparisons are tested.
+The original xloc.f90 passes --run-both; the expanded comparison matches:
+  reports\xf2p_batch_20261004_145628_1_52fg9u\results.txt
+tests/cases/stash is excluded from automatic execution-test discovery.
+Full suite: 128 passed, 7 strict expected failures in 188.79 seconds.

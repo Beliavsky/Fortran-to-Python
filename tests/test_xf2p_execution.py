@@ -49,7 +49,9 @@ def compare_output(reference: str, actual: str) -> None:
             assert expected == observed, (index, expected, observed)
 
 
-@pytest.mark.parametrize("source", sorted(CASES.rglob("*.f90")), ids=lambda p: p.stem)
+@pytest.mark.parametrize("source", sorted(p for p in CASES.rglob("*.f90")
+                                         if "stash" not in p.relative_to(CASES).parts),
+                         ids=lambda p: p.stem)
 def test_fortran_and_translated_python_agree(source: Path, tmp_path: Path, request: pytest.FixtureRequest) -> None:
     compiler = shutil.which("gfortran")
     if compiler is None:

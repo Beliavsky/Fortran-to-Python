@@ -1165,6 +1165,9 @@ class basic_f2p:
         self._type_bindings: dict[str, dict[str, dict]] = {}
         self._type_components: dict[str, dict[str, str]] = {}
         self._component_specs: dict[str, dict[str, dict]] = {}
+        self._allocation_counter = 0
+        self._allocation_bound_names: dict[str, str] = {}
+        self._allocation_source = ""
         self._decl_type_names: dict[str, str] = {}
         self._binding_targets: dict[str, dict] = {}
         self._select_case_stack: list[dict[str, object]] = []
@@ -2006,6 +2009,8 @@ class basic_f2p:
         s = re.sub(r"\bmod\s*\(", "_xf2p_mod(", s, flags=re.I)
         s = re.sub(r"\bmaxval\s*\(", "np.max(", s, flags=re.I)
         s = re.sub(r"\bminval\s*\(", "np.min(", s, flags=re.I)
+        for intrinsic in ("minloc", "maxloc", "findloc"):
+            s = re.sub(rf"\b{intrinsic}\s*\(", f"_f_{intrinsic}(", s, flags=re.I)
         s = re.sub(r"\bcount\s*\(", "np.count_nonzero(", s, flags=re.I)
         s = re.sub(r"\bsum\s*\(", "np.sum(", s, flags=re.I)
         s = re.sub(
@@ -2727,6 +2732,9 @@ class basic_f2p:
                 continue
 
             # Scalars
+            if alloc:
+                self.emit(f"{name} = None")
+                continue
             if ftype == "type":
                 # Derived-type scalars.
                 cls = ftype_name if ftype_name else "SimpleNamespace"
@@ -3325,23 +3333,114 @@ class basic_f2p:
                 self.indent = max(0, self.indent - 1)
             return True
 
-        # allocate(a(n))
-        mm = re.match(r"allocate\s*\(\s*([a-z_]\w*)\s*\(\s*(.+)\s*\)\s*\)\s*$", s, re.I)
+        # ALLOCATE objects and allocation options are separate top-level items.
+        mm = re.match(r"allocate\s*\((.*)\)\s*$", s, re.I)
         if mm:
-            name = mm.group(1)
-            sz = self._shape_to_py(mm.group(2), arrays_1d)
-            ftype = self._decl_types.get(name.lower(), "")
-            if not ftype:
-                ftype = self._decl_array_types.get(name.lower(), "")
-            if ftype == "integer":
-                self.emit(f"{name} = np.empty({sz}, dtype=int)")
-            elif ftype == "logical":
-                self.emit(f"{name} = np.empty({sz}, dtype=bool)")
-            elif ftype == "real":
-                self.emit(f"{name} = np.empty({sz}, dtype=np.float64)")
-            else:
-                self.emit(f"{name} = np.empty({sz})")
+            options = {}
+            objects = []
+            for item in split_args(mm.group(1)):
+                option = re.match(r"^(\w+)\s*=\s*(.+)$", item.strip(), re.I)
+                if option:
+                    key = option.group(1).lower()
+                    if key not in {"source", "mold", "stat", "errmsg"} or key in options:
+                        raise ValueError(f"unsupported or duplicate ALLOCATE option: {item}")
+                    options[key] = option.group(2).strip()
+                else:
+                    target = re.fullmatch(r"([a-z_]\w*(?:\s*%\s*[a-z_]\w*)*)\s*(?:\((.*)\))?", item.strip(), re.I)
+                    if not target:
+                        raise ValueError(f"unsupported ALLOCATE object/type-spec: {item}")
+                    objects.append((re.sub(r"\s*%\s*", ".", target.group(1)), target.group(2)))
+            if not objects or ("source" in options and "mold" in options):
+                raise ValueError(f"invalid ALLOCATE statement: {s}")
+            self._allocation_counter += 1
+            stem = _choose_fresh_identifier(self._allocation_source, f"_xf2p_allocate_{self._allocation_counter}")
+            model_name = _choose_fresh_identifier(self._allocation_source, f"{stem}_model")
+            model_raw = options.get("source", options.get("mold"))
+            if model_raw is not None:
+                self.emit(f"{model_name} = {self.translate_expr(model_raw, arrays_1d)}")
+            status = self.translate_expr(options["stat"], arrays_1d) if "stat" in options else None
+            message = self.translate_expr(options["errmsg"], arrays_1d) if "errmsg" in options else None
+            if message and not status:
+                raise ValueError("ALLOCATE ERRMSG without STAT is not supported")
+            if status:
+                self.emit("try:")
+                self.indent += 1
+            for name, shape_raw in objects:
+                spec = self._component_spec(name) if "." in name else None
+                ftype = spec["ftype"] if spec else self._decl_types.get(name.lower())
+                if ftype not in _type_dtype and ftype != "type":
+                    raise ValueError(f"unknown ALLOCATE object type: {name}")
+                self.emit(f"if {name} is not None:")
+                self.indent += 1
+                self.emit(f"raise ValueError('ALLOCATE object already allocated: {name}')")
+                self.indent -= 1
+                declared_shape = spec.get("shape") if spec else None
+                rank = len(self._shape_bounds(declared_shape)) if declared_shape else len(self._decl_lbounds.get(name.lower(), []))
+                if not rank and (name.lower() in self._decl_array_types or name in arrays_1d):
+                    rank = 1
+                bounds_name = self._allocation_bound_names.setdefault(name.lower(), _choose_fresh_identifier(self._allocation_source, f"{stem}_bounds_{len(self._allocation_bound_names)}"))
+                component_lows = []
+                if shape_raw is not None:
+                    bounds = self._shape_bounds(shape_raw)
+                    if len(bounds) != rank or any(not hi for _lo, hi in bounds):
+                        raise ValueError(f"invalid ALLOCATE bounds for {name}")
+                    bounds_py = [(self.translate_expr(lo, arrays_1d), self.translate_expr(hi, arrays_1d)) for lo, hi in bounds]
+                    component_lows = [lo for lo, _hi in bounds_py]
+                    self.emit(f"{bounds_name} = [" + ", ".join(f"(int({lo}), int({hi}))" for lo, hi in bounds_py) + "]")
+                    shape_py = f"[max(0, hi - lo + 1) for lo, hi in {bounds_name}]"
+                    lows = [f"{bounds_name}[{d}][0]" for d in range(rank)]
+                elif rank:
+                    if model_raw is None:
+                        raise ValueError(f"ALLOCATE {name} requires bounds, SOURCE, or MOLD")
+                    shape_py = "None"
+                    lows = []
+                    for d in range(rank):
+                        # Whole array variables retain bounds; array expressions
+                        # (including sections) have one-based allocation bounds.
+                        low = self._decl_bound_expr(model_raw, d, "lo", arrays_1d) if re.fullmatch(r"[a-z_]\w*(?:%[a-z_]\w*)*", model_raw, re.I) else None
+                        lows.append(low or "1")
+                    component_lows = list(lows)
+                    self.emit(f"{bounds_name} = [" + ", ".join(f"(int({lo}), None)" for lo in lows) + "]")
+                    lows = [f"{bounds_name}[{d}][0]" for d in range(rank)]
+                else:
+                    shape_py, lows = "()", []
+                if "." in name and any(lo != "1" for lo in component_lows):
+                    self.emit(f"if any(lo != 1 for lo, hi in {bounds_name}):")
+                    self.indent += 1
+                    self.emit("raise NotImplementedError('non-default bounds for allocated components are not supported')")
+                    self.indent -= 1
+                dtype = "object" if ftype == "type" else _type_dtype[ftype]
+                type_name = spec.get("type_name") if spec else self._decl_type_names.get(name.lower())
+                factory = type_name if ftype == "type" else "None"
+                length = spec.get("char_len") if spec else self._decl_char_len.get(name.lower())
+                if length in {":", "*"}:
+                    raise ValueError("deferred-length CHARACTER allocation is not supported")
+                length_py = self.translate_expr(length, arrays_1d) if length is not None else "None"
+                model = model_name if model_raw is not None else "None"
+                self.emit(f"{name} = _f_allocate({model}, shape={shape_py}, dtype={dtype}, source={'source' in options}, rank={rank}, factory={factory}, char_len={length_py})")
+                if "." not in name:
+                    self._decl_lbounds[name.lower()] = [f"({lo}) if _f_size({name}, dim={d+1}) else 1" for d, lo in enumerate(lows)]
+                    self._decl_ubounds[name.lower()] = [f"({lo}) + _f_size({name}, dim={d+1}) - 1 if _f_size({name}, dim={d+1}) else 0" for d, lo in enumerate(lows)]
+            if status:
+                self.indent -= 1
+                self.emit("except (MemoryError, ValueError, TypeError, OverflowError) as _xf2p_allocation_error:")
+                self.indent += 1
+                self.emit(f"{status} = 1")
+                if message:
+                    length = self._decl_char_len.get(options["errmsg"].lower())
+                    text = "str(_xf2p_allocation_error)"
+                    if length:
+                        text = f"_f_str_assign({text}, {self.translate_expr(length, arrays_1d)})"
+                    self.emit(f"{message} = {text}")
+                self.indent -= 1
+                self.emit("else:")
+                self.indent += 1
+                self.emit(f"{status} = 0")
+                self.indent -= 1
             return True
+
+        if re.match(r"allocate\b", s, re.I):
+            raise ValueError(f"unsupported ALLOCATE statement: {s}")
 
         # open(newunit=fp, file="temp.txt", ...) or open(unit=iu, file="temp.txt", ...)
         mm = re.match(r"open\s*\(\s*(.+)\s*\)\s*$", s, re.I)
@@ -4860,6 +4959,9 @@ class basic_f2p:
         self._type_bindings = {}
         self._type_components = {}
         self._component_specs = {}
+        self._allocation_counter = 0
+        self._allocation_bound_names = {}
+        self._allocation_source = src
         self._decl_type_names = {}
         # Bindings precede their implementations; collect signatures before
         # emitting dataclass forwarding methods and resolving bound CALLs.
