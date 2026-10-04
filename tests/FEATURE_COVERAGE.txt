@@ -307,3 +307,26 @@ fixture also matches compiled Fortran, including DO-variable values after normal
 termination, EXIT, and outer CYCLE transfers. Focused checks: 9 passed.
 Established suite: 185 passed, 6 expected failures, 60 exploratory cases excluded,
 in 294.28 seconds. No unexpected failures.
+
+USE-associated module-state follow-up (2026-10-04)
+-------------------------------------------------
+Modules in one Fortran input source now expose variable metadata to USE scopes.
+Main and module/internal procedures bind imported variables to the same Python
+global storage, rather than creating main-local copies. Imported storage is not
+reinitialized on main entry. Array element types/lower bounds and CHARACTER
+lengths are retained. ONLY, PUBLIC/PRIVATE (including private-default reexports),
+transitive USE, procedure-local USE, and local/BLOCK shadowing are tested.
+The new use_module_state fixture matches Fortran for scalars, non-one-based
+arrays, strings, module-internal helpers, and program-internal updates.
+
+Remaining restrictions fail explicitly: renamed USE variables; duplicate mutable
+variable names in different flattened modules; mutable variable imports in the
+CLI's multi-file --mode-program path (which emits separate Python files). Combine
+module and program into one Fortran source for shared-state translations until
+separate module namespaces are implemented. Procedure-only imports are unaffected.
+
+Established-suite run: 196 passed, 6 expected failures, 60 exploratory cases
+excluded, in 401.97 seconds. A subsequent non-execution run including two additional
+guard/accessibility regressions passed all 150 tests in 81.62 seconds. The unchanged
+six expected failures remain; there were no unexpected failures. The standalone
+use_module_state.f90 --run-diff also reports MATCH.

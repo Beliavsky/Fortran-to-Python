@@ -4508,6 +4508,8 @@ class basic_f2p:
                     self.emit(ln)
                 self.emit('"""')
 
+        use_symbols = self._use_variable_symbols(main_lines)
+        self._host_scopes.append((use_symbols, "global"))
         scope_sym = self._procedure_scope(sym, set(args) | {result_name})
         arrays_1d.update(name for name, info in scope_sym.items() if info.get("is_array"))
         local_scope = dict(sym)
@@ -4549,7 +4551,7 @@ class basic_f2p:
         for code, _comment in main_lines:
             for mbase in re.finditer(r"\b([a-z_]\w*)\s*%", code, re.I):
                 comp_bases.add(mbase.group(1))
-        known_names = {k.lower() for k in sym} | {a.lower() for a in args}
+        known_names = {k.lower() for k in scope_sym} | {a.lower() for a in args}
         for b in sorted(comp_bases):
             if b.lower() not in known_names and b not in parameter_names:
                 self.emit(f"{b} = SimpleNamespace()")
@@ -4587,6 +4589,7 @@ class basic_f2p:
         self.emit(f"return {result_name}")
         self._current_result_name = prev_result_name
         self._host_scopes.pop()
+        self._host_scopes.pop()  # procedure-local USE associations
         if self._save_stack:
             self._save_stack.pop()
         self.indent = max(0, self.indent - 1)
@@ -4642,6 +4645,10 @@ class basic_f2p:
 
         # declare/init variables (explicit-shape arrays + scalars)
         self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names)
+        # USE entities already have storage in the translated module. Retain
+        # their type/bounds metadata, but never initialize a local copy here.
+        sym = {**self._use_variable_symbols(body_lines), **sym}
+        arrays_1d.update(name for name, info in sym.items() if info.get("is_array"))
         self._decl_type_names = {k.lower(): v["type_name"].lower() for k, v in sym.items() if v.get("type_name")}
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
@@ -4796,6 +4803,30 @@ class basic_f2p:
         if sym or parameter_names:
             self.emit("")
 
+        module_name = re.fullmatch(r"module\s+([a-z_]\w*)", header.strip(), re.I).group(1).lower()
+        for name, info in sym.items():
+            if "parameter" in info["attrs_l"]:
+                continue
+            owner = self._module_storage_owners.setdefault(name.lower(), module_name)
+            if owner != module_name:
+                raise ValueError(f"module variable '{name}' is declared in both {owner} and {module_name}; separate module namespaces are not yet supported")
+        local_names = set(sym)
+        sym = {**self._use_variable_symbols(decl_lines), **sym}
+        arrays_1d.update(name for name, info in sym.items() if info.get("is_array"))
+        default_private = any(re.fullmatch(r"\s*private\s*", code, re.I) for code, _ in decl_lines)
+        public, private = set(), set()
+        for code, _ in decl_lines:
+            access = re.fullmatch(r"\s*(public|private)\s*(?:::)?\s+(.+)", code, re.I)
+            if access:
+                (public if access.group(1).lower() == "public" else private).update(
+                    item.strip().lower() for item in split_args(access.group(2)))
+        self._module_variable_symbols[module_name] = {
+            name: info for name, info in sym.items()
+            if name.lower() not in private and "private" not in info["attrs_l"]
+            and (not default_private or name.lower() in public
+                 or (name in local_names and "public" in info["attrs_l"]))
+        }
+
         self._host_scopes.append((sym, "global"))
         if contains_idx is not None:
             i = 0
@@ -4859,6 +4890,30 @@ class basic_f2p:
             shadowed.update(name.lower() for name in symbols)
         return {**inherited, **local}
 
+    def _use_variable_symbols(self, lines: list[tuple[str, str]]) -> dict[str, dict]:
+        """Resolve variable storage for modules in this translation unit."""
+        symbols = {}
+        for code, _ in lines:
+            use = re.fullmatch(r"\s*use\s*(?:,\s*(intrinsic|non_intrinsic)\s*)?(?:::)?\s*([a-z_]\w*)\s*(.*)", code, re.I)
+            if not use or (use.group(1) or "").lower() == "intrinsic":
+                continue
+            exported = self._module_variable_symbols.get(use.group(2).lower(), {})
+            tail = use.group(3).strip().lstrip(",").strip()
+            only = re.match(r"only\s*:\s*(.*)", tail, re.I)
+            selected = {} if only else dict(exported)
+            for item in split_args(only.group(1) if only else tail):
+                parts = [part.strip().lower() for part in item.split("=>", 1)]
+                local, remote = parts[0], parts[-1]
+                info = next((info for name, info in exported.items() if name.lower() == remote), None)
+                if info is None:
+                    continue
+                if local != remote:
+                    raise ValueError("renamed USE-associated module variables are not yet supported; use the original name")
+                name = next(name for name in exported if name.lower() == remote)
+                selected[name] = info
+            symbols.update(selected)
+        return symbols
+
     def transpile_program(self, body_lines: list[tuple[str, str]]) -> None:
         # Handle internal procedures after "contains".
         main_lines = body_lines
@@ -4895,6 +4950,10 @@ class basic_f2p:
         # top-level functions reading unrelated Python module globals.
         self.emit("def main() -> None:")
         self.indent += 1
+        use_symbols = self._use_variable_symbols(main_lines)
+        if use_symbols:
+            self.emit(f"global {', '.join(sorted(use_symbols))}")
+        self._host_scopes.append((use_symbols, "global"))
         self._host_scopes.append((self._host_symbol_table(main_lines), "nonlocal"))
         if contains_idx is not None:
             i = 0
@@ -4933,6 +4992,7 @@ class basic_f2p:
         if self._code_emit_count == code0:
             self.emit("pass")
         self._host_scopes.pop()
+        self._host_scopes.pop()  # main-program USE associations
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
@@ -5040,6 +5100,8 @@ class basic_f2p:
         self.emit(f"def {sname}({', '.join(args_annot)}):")
         self.indent += 1
         self._save_stack.append((save_dict_name, save_names))
+        use_symbols = self._use_variable_symbols(main_lines)
+        self._host_scopes.append((use_symbols, "global"))
         scope_sym = self._procedure_scope(sym, set(args))
         arrays_1d.update(name for name, info in scope_sym.items() if info.get("is_array"))
         local_scope = dict(sym)
@@ -5109,6 +5171,7 @@ class basic_f2p:
                 self.emit("return " + ", ".join(out_formals))
 
         self._host_scopes.pop()
+        self._host_scopes.pop()  # procedure-local USE associations
         if self._save_stack:
             self._save_stack.pop()
         self.indent = max(0, self.indent - 1)
@@ -5200,6 +5263,8 @@ class basic_f2p:
 
     def transpile(self, src: str) -> str:
         self._host_scopes = []
+        self._module_variable_symbols: dict[str, dict[str, dict]] = {}
+        self._module_storage_owners: dict[str, str] = {}
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
         raw = self._lower_lexical_blocks(raw)
@@ -6220,6 +6285,7 @@ def main() -> int:
                 module_provider[m.lower()] = p
 
         generated: dict[Path, Path] = {}
+        file_module_variables: dict[Path, dict[str, dict[str, dict]]] = {}
         rc = 0
         for p in in_paths:
             out_path = (Path(args.out_dir) / f"{p.stem}_f.py") if args.out_dir else p.with_name(f"{p.stem}_f.py")
@@ -6244,6 +6310,7 @@ def main() -> int:
                     print(f"--- transpiled: {out_path} ---")
                     print(py.rstrip())
             generated[p] = out_path
+            file_module_variables[p] = t._module_variable_symbols
 
         # Add inter-file imports according to USE dependencies.
         for p in in_paths:
@@ -6274,6 +6341,21 @@ def main() -> int:
                 names = unique_preserve(names)
                 if not names:
                     continue
+                variables = file_module_variables[provider].get(us.module.lower(), {})
+                referenced = {name.lower() for name in names}
+                # _parse_file_interface retains local names in ONLY lists.
+                # Also check remote names so a rename cannot bypass this guard.
+                for code, _ in collapse_fortran_continuations(
+                        [split_fortran_comment(line) for line in file_src[p].splitlines()]):
+                    use = re.match(r"\s*use\s*(?:,\s*(?:intrinsic|non_intrinsic)\s*)?(?:::)?\s*([a-z_]\w*)\b(.*)", code, re.I)
+                    if use and use.group(1).lower() == us.module.lower():
+                        referenced.update(match.group(1).lower() for match in
+                                          re.finditer(r"=>\s*([a-z_]\w*)", use.group(2), re.I))
+                mutable = {var.lower() for var, info in variables.items()
+                           if "parameter" not in info["attrs_l"]}
+                if referenced & mutable:
+                    print("Transpile: FAIL (mutable USE-associated variables across separate Python files are not yet supported; combine the module and program into a single Fortran input file)")
+                    return 1
                 imports.append(f"from {mod_py} import {', '.join(names)}")
             if imports:
                 py = out_path.read_text(encoding="utf-8")

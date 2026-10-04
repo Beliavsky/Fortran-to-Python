@@ -270,3 +270,20 @@ its current value. Counted DO, DO WHILE, and bare DO are covered, along with
 multi-level transfers, blocks, SELECT CASE, empty loops, descending steps, and
 reusing the translator. Unknown/mismatched construct names are rejected.
 Named DO CONCURRENT remains explicitly unsupported.
+
+USE-associated module state
+---------------------------
+For modules and programs in one input source, USE-associated variables retain
+their module storage. Main-program assignments and updates in module/internal
+procedures share that storage. ONLY lists and PUBLIC/PRIVATE accessibility are
+respected; local procedure variables and BLOCK locals can shadow host variables.
+Imported array types/bounds and CHARACTER lengths are retained without local
+reinitialization. Repeated main calls do not reset module storage on entry.
+Transitive USE associations and procedure-local USE statements are tested.
+
+The CLI's multi-file --mode-program path still emits separate Python modules.
+Mutable state imported across those files is rejected to avoid copying scalar
+bindings by value; combine the module and program into one Fortran source for
+this workflow. Renamed USE variables and duplicate mutable-variable names in
+different flattened Fortran modules also fail explicitly pending namespace
+support. These restrictions do not apply to ordinary procedure-only imports.
