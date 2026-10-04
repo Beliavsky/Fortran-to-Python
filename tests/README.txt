@@ -11,17 +11,19 @@ skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (39 programs)
+Corpus (40 programs)
 --------------------
 handwritten/: 18 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
-features/: 17 focused programs covering OPTIONAL/PRESENT, keyword calls,
+features/: 18 focused programs covering OPTIONAL/PRESENT, keyword calls,
 explicit SAVE, EXIT, EQV/NEQV, elemental and impure elemental procedures,
 DO CONCURRENT, derived-type assignment/arguments/results, type extension,
 type-bound procedures, labeled FORMAT, selected-kind intrinsics, and a
 controlled EXECUTE_COMMAND_LINE call. See FEATURE_COVERAGE.txt for results.
+array_component_initializers also verifies default component values and
+independent storage between objects and between derived-type array elements.
 
 existing/xsum_dim_int.f90: copied from C:\python\fortran\xsum_dim_int.f90
 on 2026-10-04; only line-ending differences. Tests integer kinds and axis sums.
@@ -129,3 +131,14 @@ calls from one bound procedure to another as well as ordinary component-array
 indexing. Unsupported/unresolved CALL statements fail explicitly rather than
 being silently discarded. Deferred/generic bindings and indexed-object calls
 are not yet supported by this implementation; type extension remains failing.
+
+Also fixed on 2026-10-04: explicit-shape array-component initialization in
+derived types. Factories preserve initial values, shape, element type, scalar
+expansion, and CHARACTER padding/truncation. Derived-type array components
+construct default elements or copy explicit initializers independently, so
+mutating one element/object does not modify siblings, other instances, or the
+initializer. Uninitialized intrinsic arrays remain np.empty; allocatable and
+pointer components keep their existing unallocated/disassociated behavior.
+Complex scalar initialization is tested; complex-pair literals nested inside
+array constructors and chained component-array indexing remain separate
+expression-translation limitations, recorded in FEATURE_COVERAGE.txt.

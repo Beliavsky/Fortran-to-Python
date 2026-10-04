@@ -34,6 +34,7 @@ __all__ = [
     "_f_size",
     "_f_spread",
     "_f_assign_array",
+    "_f_init_component_array",
     "_f_section_slice",
     "_f_dot_product",
     "_f_reshape",
@@ -167,6 +168,18 @@ def _f_spread(a, dim=None, ncopies=None):
     axis = d - 1
     ex = np.expand_dims(arr, axis=axis)
     return np.repeat(ex, ncopy, axis=axis)
+
+
+def _f_init_component_array(shape, initializer, dtype):
+    """Initialize fresh component storage, with independent derived elements."""
+    result = np.full(shape, initializer, dtype=dtype)
+    if result.dtype == object:
+        import copy
+        for index in np.ndindex(result.shape):
+            # Copy separately: deepcopy of the whole array would retain aliases
+            # introduced by scalar expansion of a derived-type initializer.
+            result[index] = copy.deepcopy(result[index])
+    return result
 
 
 def _f_assign_array(lhs, rhs):

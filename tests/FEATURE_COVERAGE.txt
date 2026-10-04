@@ -5,6 +5,8 @@ All 17 new reference programs compile and run with the local gfortran.
 Initially ten translations matched and seven exposed translator defects.
 No translator or runtime changes were made for the initial survey.
 After the type-bound-call fix, eleven match and six remain failing.
+The added array-component regression also passes: the current feature corpus
+has 18 programs, with 12 matching and six known failures.
 
 Matching cases
 --------------
@@ -19,6 +21,7 @@ derived_type_assignment  copying array components without aliasing the original
 derived_type_arguments   derived-type argument and function result
 labeled_format           WRITE with a labeled FORMAT statement
 type_bound_procedure     explicit bindings, PASS/NOPASS, functions, OUT arguments
+array_component_initializers  defaults, scalar/array values, independent storage
 
 Confirmed failures (strict xfail in test_xf2p_execution.py)
 --------------------------------------------------------
@@ -85,7 +88,26 @@ The refreshed batch comparison passes:
 
 A separate pre-existing issue surfaced while constructing the larger case:
 explicit array-component initializers such as integer :: samples(2) = [2,4]
-are ignored by the dataclass emitter, which uses np.empty instead. The bound
-call regression initializes samples explicitly in executable code to isolate
-the binding fix. Array-component initialization still needs its own regression
-and fix; scalar-component initialization is exercised by the counter test.
+were ignored by the dataclass emitter, which used np.empty instead. That issue
+is now fixed, and the counter uses its declaration initializer again.
+
+Array-component initialization follow-up (2026-10-04)
+---------------------------------------------------
+The factory now allocates fresh typed storage and fills it from the initializer.
+CHARACTER initializers are padded/truncated to their declared length. Each
+derived-type element is copied independently, including default-constructed
+elements, rather than sharing a scalar-expanded object reference.
+The execution regression covers parameter-based initialization, real fractions,
+scalar matrix fill, RESHAPE-based matrix values, logical/complex scalar values,
+character arrays, empty arrays, default-derived and explicitly initialized
+derived arrays. Mutations verify independence between elements and instances.
+Unit tests also check integer conversion and preservation of the initializer.
+The fresh execution comparison passes:
+  reports\xf2p_batch_20261004_134052_rg79j4pk\results.txt
+
+Separate expression limitations discovered while expanding the regression:
+  [(1d0,2d0),(-3d0,4d0)] becomes a list of Python tuples, not complex numbers.
+  a%copies(1)%values(1) leaves the final array access as a function call.
+These are not initializer-factory defects. The execution regression uses a
+complex scalar initializer and ordinary procedure calls to read nested array
+components, isolating initialization from these still-unfixed expression paths.

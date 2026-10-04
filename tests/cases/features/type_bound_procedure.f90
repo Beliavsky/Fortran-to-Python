@@ -2,7 +2,7 @@ module bound_module
    implicit none
    type :: counter
       integer :: value = 0
-      integer :: samples(2)
+      integer :: samples(2) = [2,4]
    contains
       procedure :: increment => add_value
       procedure, pass(object) :: shift => shift_value
@@ -52,7 +52,6 @@ program type_bound_procedure
    type(counter) :: value
    type(box) :: nested
    integer :: exported
-   value%samples = [2,4]
    call value%increment(3)
    print *, value%value
    call value%increment(n=2)

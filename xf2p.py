@@ -1591,11 +1591,17 @@ class basic_f2p:
                         self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} | None = None{cmt}")
                         continue
                     shape_py = self._shape_to_py(shape, set())
-                    if ftype == "type":
-                        self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} = field(default_factory=lambda: np.empty({shape_py}, dtype=object)){cmt}")
+                    dtype = "object" if ftype == "type" else _type_dtype[ftype]
+                    if init is None and ftype != "type":
+                        factory = f"np.empty({shape_py}, dtype={dtype})"
                     else:
-                        dtype = _type_dtype[ftype]
-                        self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} = field(default_factory=lambda: np.empty({shape_py}, dtype={dtype})){cmt}")
+                        init_py = self.translate_expr(init, set()) if init is not None else f"{type_name}()"
+                        if ftype == "character":
+                            length = self._parse_character_len(s)
+                            if length is not None:
+                                init_py = f"_f_str_assign({init_py}, {self.translate_expr(length, set())})"
+                        factory = f"_f_init_component_array({shape_py}, {init_py}, {dtype})"
+                    self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} = field(default_factory=lambda: {factory}){cmt}")
                     continue
                 if "allocatable" in attrs_l or "pointer" in attrs_l:
                     self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=False)} | None = None{cmt}")
