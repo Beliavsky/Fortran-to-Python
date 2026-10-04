@@ -11,9 +11,9 @@ skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (20 programs)
+Corpus (21 programs)
 --------------------
-handwritten/: 16 small deterministic programs exercising scalars, loops,
+handwritten/: 17 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
@@ -44,11 +44,10 @@ I/O cannot accidentally reuse files produced by the reference execution.
 
 Known failures (2026-10-04)
 --------------------------
-strings: string initialization calls undefined helper _f_str_assign.
 xsum_dim_int: ISO_FORTRAN_ENV INT32 becomes undefined Python name int32.
 formatted_file_io: numeric file units produce invalid Python 20.close().
 
-These three cases are strict expected failures, not skipped. Their Fortran
+These two cases are strict expected failures, not skipped. Their Fortran
 references must still compile and execute successfully. Unexpected success
 fails the suite so that obsolete expectations are removed after a fix.
 Other assertion failures inside a known-failing translation may also count
@@ -91,3 +90,12 @@ Fixing TRANSPOSE exposed a wrong-result RESHAPE bug in matrix_operations:
 Fortran source elements must fill in column-major order. Translation now uses
 a dedicated helper implementing Fortran ordering, PAD, and ORDER, without
 changing ordinary NumPy reshape defaults. The original matrix case now passes.
+
+Also fixed on 2026-10-04: missing fixed-length string assignment, LEN_TRIM,
+ADJUSTL, and INDEX helpers. Assignment pads/truncates scalars and arrays;
+LEN_TRIM and ADJUSTL operate elementwise and treat only spaces as blanks.
+INDEX uses one-based positions, zero for no match, optional BACK, and
+broadcasting. The string_assignment program verifies scalar/array assignment,
+initializers, zero length, padding, truncation, and search; strings now passes.
+Substring reads are covered by strings; substring writes and deferred-length
+allocatable strings are not yet covered by these regressions.

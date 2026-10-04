@@ -35,6 +35,12 @@ __all__ = [
     "_f_spread",
     "_f_assign_array",
     "_f_section_slice",
+    "_f_dot_product",
+    "_f_reshape",
+    "_f_str_assign",
+    "_f_len_trim",
+    "_f_adjustl",
+    "_f_index",
     "merge",
     "pack",
     "count",
@@ -56,6 +62,48 @@ __all__ = [
     "r_matmul",
     "matmul",
 ]
+
+
+def _f_str_assign(value, length):
+    """Fixed-length CHARACTER assignment: truncate or pad with blank spaces."""
+    length = max(0, int(length))
+    array = np.asarray(value, dtype=object)
+    def convert(text):
+        return str(text)[:length].ljust(length)
+    if array.ndim == 0:
+        return convert(array.item())
+    return np.vectorize(convert, otypes=[object])(array)
+
+
+def _f_len_trim(value):
+    """Elemental LEN_TRIM removes Fortran blanks, not tabs/newlines."""
+    array = np.asarray(value, dtype=object)
+    if array.ndim == 0:
+        return len(str(array.item()).rstrip(" "))
+    return np.vectorize(lambda text: len(str(text).rstrip(" ")), otypes=[int])(array)
+
+
+def _f_adjustl(value):
+    """Elemental ADJUSTL moves leading blanks to the end without changing LEN."""
+    def adjust(text):
+        text = str(text)
+        return text.lstrip(" ").ljust(len(text))
+    array = np.asarray(value, dtype=object)
+    if array.ndim == 0:
+        return adjust(array.item())
+    return np.vectorize(adjust, otypes=[object])(array)
+
+
+def _f_index(string, substring, back=False):
+    """Elemental Fortran INDEX: one-based positions, zero when not found."""
+    def find(text, needle, reverse):
+        text, needle = str(text), str(needle)
+        return (text.rfind(needle) if reverse else text.find(needle)) + 1
+    a, b, reverse = np.broadcast_arrays(np.asarray(string, dtype=object),
+                                        np.asarray(substring, dtype=object), np.asarray(back, dtype=bool))
+    if a.ndim == 0:
+        return find(a.item(), b.item(), reverse.item())
+    return np.vectorize(find, otypes=[int])(a,b,reverse)
 
 
 def _f_section_slice(a, dim, lower_bound, lower=None, upper=None, stride=1):
@@ -268,5 +316,38 @@ def r_matmul(a, b):
 
 
 def matmul(a, b):
-    """Alias for matrix multiplication."""
+    """Fortran MATMUL, including logical AND/OR matrix multiplication."""
+    aa, bb = np.asarray(a), np.asarray(b)
+    if aa.dtype.kind == bb.dtype.kind == "b":
+        return np.matmul(aa.astype(np.int64), bb.astype(np.int64)) != 0
     return r_matmul(a, b)
+
+
+def _f_dot_product(a, b):
+    """Fortran DOT_PRODUCT conjugates the first complex vector."""
+    aa, bb = np.asarray(a), np.asarray(b)
+    if aa.ndim != 1 or bb.ndim != 1 or aa.shape != bb.shape:
+        raise ValueError("DOT_PRODUCT requires equal-length rank-one vectors")
+    if aa.dtype.kind == bb.dtype.kind == "b":
+        return np.any(aa & bb)
+    return np.vdot(aa, bb)
+
+
+def _f_reshape(source, shape, pad=None, order=None):
+    """Fortran RESHAPE with column-major elements and optional PAD/ORDER."""
+    dimensions = tuple(int(n) for n in np.asarray(shape).ravel())
+    if not dimensions or any(n < 0 for n in dimensions):
+        raise ValueError("RESHAPE requires a nonempty nonnegative shape")
+    count = math.prod(dimensions)
+    values = np.asarray(source).ravel(order="F")
+    if count > values.size:
+        padding = np.asarray(pad).ravel(order="F") if pad is not None else np.array([])
+        if padding.size == 0:
+            raise ValueError("RESHAPE source is too short without nonempty PAD")
+        values = np.concatenate((values, np.resize(padding, count - values.size)))
+    permutation = list(range(len(dimensions))) if order is None else [int(n)-1 for n in np.asarray(order).ravel()]
+    if sorted(permutation) != list(range(len(dimensions))):
+        raise ValueError("RESHAPE ORDER must be a permutation of dimension indices")
+    permuted_shape = tuple(dimensions[i] for i in permutation)
+    result = _np_reshape_orig(values[:count], permuted_shape, order="F")
+    return np.transpose(result, axes=np.argsort(permutation))

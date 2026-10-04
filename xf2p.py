@@ -1966,14 +1966,16 @@ class basic_f2p:
                 "matmul",
                 "dot_product",
                 "reshape",
+                "index",
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
-            if lname in {"transpose", "matmul", "dot_product", "reshape"}:
+            if lname in {"transpose", "matmul", "dot_product", "reshape", "index"}:
                 parameters = {"transpose": ("matrix",),
                               "matmul": ("matrix_a", "matrix_b"),
                               "dot_product": ("vector_a", "vector_b"),
-                              "reshape": ("source", "shape", "pad", "order")}[lname]
+                              "reshape": ("source", "shape", "pad", "order"),
+                              "index": ("string", "substring", "back", "kind")}[lname]
                 bound = {}
                 for part in parts:
                     keyword = re.match(r"^([a-z_]\w*)\s*=\s*(.*)$", part, re.I)
@@ -1985,11 +1987,17 @@ class basic_f2p:
                     if key not in parameters or key in bound:
                         raise ValueError(f"Invalid arguments to {lname}")
                     bound[key] = self.translate_expr(value, arrays_1d)
-                required = parameters[:2] if lname == "reshape" else parameters
+                required = parameters[:2] if lname in {"reshape", "index"} else parameters
                 if not set(required).issubset(bound):
                     raise ValueError(f"Invalid arguments to {lname}")
                 callee = {"transpose": "np.transpose", "matmul": "matmul",
-                          "dot_product": "_f_dot_product", "reshape": "_f_reshape"}[lname]
+                          "dot_product": "_f_dot_product", "reshape": "_f_reshape",
+                          "index": "_f_index"}[lname]
+                if lname == "index":
+                    arguments = [bound["string"], bound["substring"]]
+                    if "back" in bound:
+                        arguments.append(f"back={bound['back']}")
+                    return f"{callee}({', '.join(arguments)})"
                 if lname == "reshape":
                     arguments = [bound["source"], bound["shape"]]
                     arguments.extend(f"{p}={bound[p]}" for p in ("pad", "order") if p in bound)
@@ -1997,7 +2005,7 @@ class basic_f2p:
                 return f"{callee}({', '.join(bound[p] for p in parameters)})"
             args_py = [self.translate_expr(p, arrays_1d) for p in parts]
             if lname == "trim" and len(args_py) == 1:
-                return f"str({args_py[0]}).rstrip()"
+                return f"str({args_py[0]}).rstrip(' ')"
             if lname == "len" and len(args_py) == 1:
                 return f"_f_len({args_py[0]})"
             if lname == "len_trim" and len(args_py) == 1:
