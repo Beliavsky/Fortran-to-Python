@@ -11,9 +11,9 @@ skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (15 programs)
+Corpus (16 programs)
 --------------------
-handwritten/: 11 small deterministic programs exercising scalars, loops,
+handwritten/: 12 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
@@ -45,13 +45,12 @@ I/O cannot accidentally reuse files produced by the reference execution.
 Known failures (2026-10-04)
 --------------------------
 array_sections: strided sections produce invalid Python slice syntax.
-logical_masks: integer array assignment calls scalar int(array).
 matrix_operations: TRANSPOSE becomes undefined Python name transpose.
 strings: string initialization calls undefined helper _f_str_assign.
 xsum_dim_int: ISO_FORTRAN_ENV INT32 becomes undefined Python name int32.
 formatted_file_io: numeric file units produce invalid Python 20.close().
 
-These six cases are strict expected failures, not skipped. Their Fortran
+These five cases are strict expected failures, not skipped. Their Fortran
 references must still compile and execute successfully. Unexpected success
 fails the suite so that obsolete expectations are removed after a fix.
 Other assertion failures inside a known-failing translation may also count
@@ -68,4 +67,10 @@ To save machine-readable test results:
 The suite is a starting corpus, not a complete support guarantee. Larger
 integration programs, helper-dependent p2f output, random-number algorithms,
 complex numbers, derived types, and additional unsupported syntax need
-dedicated tests in subsequent expansions. No translator fixes are included.
+dedicated tests in subsequent expansions.
+
+Fixed on 2026-10-04: integer whole-array, section, and WHERE assignments
+convert elementwise with np.asarray(..., dtype=int), while scalar variables
+and individual elements retain scalar int() conversion. The logical_masks
+case now passes. integer_assignment_conversions checks positive/negative real
+truncation, scalar expansion, vector/matrix sections, elements, and WHERE.

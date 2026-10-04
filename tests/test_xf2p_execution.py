@@ -16,7 +16,6 @@ CASES = Path(__file__).parent / "cases"
 NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?$")
 KNOWN_FAILURES = {
     "array_sections": "strided sections produce invalid Python slice syntax",
-    "logical_masks": "integer array assignment incorrectly calls scalar int()",
     "matrix_operations": "transpose intrinsic emitted as an undefined Python name",
     "strings": "generated string initialization calls undefined _f_str_assign",
     "xsum_dim_int": "iso_fortran_env int32 emitted as an undefined Python name",

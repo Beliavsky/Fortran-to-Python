@@ -2282,14 +2282,30 @@ class basic_f2p:
             pass
         return s
 
+    def _integer_assignment_rhs(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> str:
+        """Convert integer assignments elementwise for arrays, scalarly otherwise."""
+        match = re.match(r"\s*([A-Za-z_]\w*)", lhs)
+        if match is None:
+            return rhs_py
+        base = match.group(1).lower()
+        if self._decl_types.get(base) != "integer":
+            return rhs_py
+        is_array = base in self._decl_array_types or base in arrays_1d
+        suffix = lhs[match.end():].strip()
+        if suffix.startswith("("):
+            # An indexed element is scalar; a section retains array rank.
+            is_array = is_array and ":" in suffix
+        if is_array:
+            return f"np.asarray({rhs_py}, dtype=int)"
+        return f"int({rhs_py})"
+
     def transpile_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> None:
         if self._where_masked_assignment(lhs, rhs_py, arrays_1d):
             return
         lhs = lhs.replace("%", ".")
         mb = re.match(r"\s*([A-Za-z_]\w*)", lhs)
         lhs_base = mb.group(1).lower() if mb else lhs.split(".", 1)[0].strip().lower()
-        if self._decl_types.get(lhs_base) == "integer":
-            rhs_py = f"int({rhs_py})"
+        rhs_py = self._integer_assignment_rhs(lhs, rhs_py, arrays_1d)
         char_len_raw = self._decl_char_len.get(lhs_base)
         if char_len_raw is not None:
             clen_py = self.translate_expr(str(char_len_raw), arrays_1d)
@@ -2721,8 +2737,7 @@ class basic_f2p:
             return False
         lhs = lhs.replace("%", ".")
         lhs_base = lhs.split(".", 1)[0].strip().lower()
-        if self._decl_types.get(lhs_base) == "integer":
-            rhs_py = f"int({rhs_py})"
+        rhs_py = self._integer_assignment_rhs(lhs, rhs_py, arrays_1d)
         mname = re.match(r"^\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(", lhs, re.I)
         idx_name = None
         idx = None
