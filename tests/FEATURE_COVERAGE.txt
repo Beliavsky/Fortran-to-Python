@@ -13,6 +13,9 @@ The location-intrinsic regression brings this to 20 programs, with 14 matching
 and six known failures.
 The mathematical-intrinsic regression brings this to 21 programs, with 15
 matching and six known failures.
+Host association and LOG10 bring the feature corpus to 23 programs, with 18
+matching and five known failures (impure_elemental now passes).
+TAN brings this to 24 feature programs, with 19 matching and five known failures.
 
 Matching cases
 --------------
@@ -31,15 +34,13 @@ array_component_initializers  defaults, scalar/array values, independent storage
 allocate_models          SOURCE/MOLD, explicit bounds, independent storage, STAT
 location_intrinsics      MINLOC/MAXLOC/FINDLOC, DIM/MASK/BACK/KIND, empty arrays
 math_intrinsics          73 mathematical checks, including SciPy special functions
+host_association         internal host updates, module state, shadowing, arrays
+log10_values             scalar and elemental base-ten logarithms
+tan_values               scalar and elemental tangent; preserved printed labels
+impure_elemental         scalar calls updating module state (not general array order)
 
 Confirmed failures (strict xfail in test_xf2p_execution.py)
 --------------------------------------------------------
-impure_elemental: UnboundLocalError for module variable calls.
-  The translated procedure updates module state without declaring it global.
-  This scalar-only test avoids array elemental evaluation-order assumptions;
-  it isolates module-state mutation rather than proving general impure
-  elemental support or lack of support.
-
 type_extension: AttributeError: 'child' object has no attribute 'base'.
   Explicit parent-component access value%base%id is not represented correctly.
 
@@ -195,3 +196,33 @@ with an old fortran_py_runtime.py can still load stale helpers (a separate
 pre-existing runtime-copy limitation). General Fortran REAL kind fidelity is
 also unchanged; the regression uses real64.
 Full suite: 134 passed, 7 strict expected failures in 231.77 seconds.
+
+Host association and LOG10 follow-up (2026-10-04)
+------------------------------------------------
+Program-internal procedures are emitted inside main and bind host variables
+with nonlocal. Module procedures bind module state with global. Locals and
+dummy arguments shadow outer variables. Inherited array bounds, element types,
+derived types, and CHARACTER lengths remain available for expression and
+assignment translation. Tests cover repeated main invocations without leaked
+counter state, local shadowing, module state, a parent's dummy argument,
+host arrays and strings, and internal functions.
+
+The unchanged xintrinsics_all.f90 now passes all 73 checks in both languages.
+The math_intrinsics regression no longer uses the explicit-counter workaround.
+impure_elemental now passes its scalar module-state comparison and its strict
+expected-failure marker has been removed. This does not establish evaluation
+order guarantees for impure elemental array calls.
+
+LOG10 maps to np.log10 for scalar and array expressions; quoted labels remain
+unchanged and SciPy is not required. The original xlog10.f90 passes --run-both.
+New host_association and log10_values batch comparisons both match:
+  reports\xf2p_batch_20261004_154112_sm3hwsov\results.txt
+Full suite: 139 passed, 6 strict expected failures in 229.81 seconds.
+
+TAN follow-up (2026-10-04)
+-------------------------
+TAN now maps to np.tan for scalar and array expressions, without SciPy.
+The user's unchanged xtan.f90 passes --run-both. The tan_values comparison
+covers positive/negative real inputs, scalar and array calls, and unchanged
+quoted labels. Focused math/TAN/LOG10 tests: 9 passed in 10.02 seconds.
+The full suite was not rerun for this small mapping addition.

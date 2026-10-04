@@ -14,13 +14,13 @@ and SciPy-specific unit test skip explicitly when SciPy is unavailable.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (43 programs)
+Corpus (46 programs)
 --------------------
 handwritten/: 18 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
-features/: 21 focused programs covering OPTIONAL/PRESENT, keyword calls,
+features/: 24 focused programs covering OPTIONAL/PRESENT, keyword calls,
 explicit SAVE, EXIT, EQV/NEQV, elemental and impure elemental procedures,
 DO CONCURRENT, derived-type assignment/arguments/results, type extension,
 type-bound procedures, labeled FORMAT, selected-kind intrinsics, and a
@@ -29,9 +29,14 @@ array_component_initializers also verifies default component values and
 independent storage between objects and between derived-type array elements.
 location_intrinsics verifies MINLOC/MAXLOC/FINDLOC, DIM, MASK, BACK, KIND,
 Fortran array-element order, empty arrays, and character/logical searches.
-math_intrinsics is based on the user's xintrinsics_all.f90, with the checker
-counters passed explicitly (unmodified host-scope counter updates remain a
-separate translator limitation). It exercises all 73 original checks. Its
+host_association checks host counter updates, module globals, an internal
+procedure accessing its parent's dummy argument, array bounds and CHARACTER
+metadata, functions, and local-variable shadowing. log10_values tests scalar
+and elemental LOG10 without needing SciPy.
+tan_values tests scalar and elemental TAN, positive/negative arguments,
+and preservation of mathematical names inside printed labels, using NumPy.
+math_intrinsics preserves the user's xintrinsics_all.f90 checker counters
+and internal procedures, exercising all 73 original checks. Its
 Fortran reference uses -O3: the local MinGW compiler/library combination lacks
 the runtime sinpi symbol used at -O0 for the constant elemental test vector.
 All other reference programs continue to use -O0. The generated Python still
@@ -68,7 +73,6 @@ Known failures (2026-10-04)
 --------------------------
 formatted_file_io: numeric file units produce invalid Python 20.close().
 execute_command_line: missing EXECUTE_COMMAND_LINE helper.
-impure_elemental: updating module state lacks a Python global declaration.
 selected_integer_kind, selected_logical_kind, selected_real_kind: missing
 kind-selection intrinsic helpers.
 type_extension: missing parent component of an extended type.
@@ -196,3 +200,15 @@ reduce their arguments before multiplication and preserve exact cardinal values.
 EPSILON reflects the translated value's dtype; the translator's existing
 promotion of Fortran REAL declarations/literals to float64 remains a kind-
 fidelity limitation outside the real64 regression used here.
+
+Host association and LOG10
+--------------------------
+Program-internal procedures are nested Python functions sharing the main
+invocation's bindings. Host names use nonlocal, module names use global, and
+explicit locals/dummy arguments shadow outer names. Host array/type/character
+metadata is retained when translating expressions and assignments. The scalar
+impure_elemental module-state test now passes; this does not establish a
+general evaluation order for side-effecting elemental array calls.
+The original xintrinsics_all.f90 needs no counter-argument workaround anymore.
+LOG10 maps to NumPy for scalars and arrays and does not add a SciPy dependency;
+mathematical names inside printed string labels are preserved.

@@ -1158,6 +1158,7 @@ class basic_f2p:
         self._decl_lbounds: dict[str, list[str]] = {}
         self._decl_ubounds: dict[str, list[str]] = {}
         self._save_stack: list[tuple[str, list[str]]] = []
+        self._host_scopes: list[tuple[dict[str, dict], str]] = []
         self._subr_sigs: dict[str, dict] = {}
         self._func_sigs: dict[str, dict] = {}
         self._current_result_name: str | None = None
@@ -2091,6 +2092,8 @@ class basic_f2p:
             if lname not in {
                 "gamma",
                 "log_gamma",
+                "log10",
+                "tan",
                 "erf",
                 "erfc",
                 "erfc_scaled",
@@ -2270,6 +2273,10 @@ class basic_f2p:
                 return f"sps.gamma({args_py[0]})"
             if lname == "log_gamma" and len(args_py) == 1:
                 return f"sps.gammaln({args_py[0]})"
+            if lname == "log10" and len(args_py) == 1:
+                return f"np.log10({args_py[0]})"
+            if lname == "tan" and len(args_py) == 1:
+                return f"np.tan({args_py[0]})"
             if lname == "erf" and len(args_py) == 1:
                 return f"sps.erf({args_py[0]})"
             if lname == "erfc" and len(args_py) == 1:
@@ -4415,6 +4422,13 @@ class basic_f2p:
                     self.emit(ln)
                 self.emit('"""')
 
+        scope_sym = self._procedure_scope(sym, set(args) | {result_name})
+        arrays_1d.update(name for name, info in scope_sym.items() if info.get("is_array"))
+        local_scope = dict(sym)
+        for arg in args:
+            local_scope.setdefault(arg, dict(ftype="integer", is_array=False))
+        local_scope.setdefault(result_name, dict(ftype=result_ftype, is_array=not result_is_scalar))
+        self._host_scopes.append((local_scope, "nonlocal"))
         if is_elemental:
             self._elemental_funcs.add(fname.lower())
             _xf2p_elem_guard = " or ".join(f"_xf2p_is_arraylike({a})" for a in args) if args else "False"
@@ -4457,16 +4471,16 @@ class basic_f2p:
         if (result_has_components or result_is_derived) and result_name.lower() not in {k.lower() for k in sym}:
             cls = result_type_name if result_type_name else "SimpleNamespace"
             self.emit(f"{result_name} = {cls}()")
-        self._decl_type_names = {k.lower(): v["type_name"].lower() for k, v in sym.items() if v.get("type_name")}
-        self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
-        self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
-        self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
-        self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
-        self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
-        self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
-        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
-        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
-        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_type_names = {k.lower(): v["type_name"].lower() for k, v in scope_sym.items() if v.get("type_name")}
+        self._decl_types = {k.lower(): v["ftype"] for k, v in scope_sym.items()}
+        self._decl_array_types = {k.lower(): v["ftype"] for k, v in scope_sym.items() if v.get("is_array")}
+        self._decl_types = {k.lower(): v["ftype"] for k, v in scope_sym.items()}
+        self._decl_array_types = {k.lower(): v["ftype"] for k, v in scope_sym.items() if v.get("is_array")}
+        self._decl_pointer = {k.lower() for k, v in scope_sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
+        self._decl_target = {k.lower() for k, v in scope_sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
+        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in scope_sym.items() if v.get('char_len') is not None}
+        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
 
         # exec pass
         prev_result_name = self._current_result_name
@@ -4486,6 +4500,7 @@ class basic_f2p:
         self._emit_save_sync()
         self.emit(f"return {result_name}")
         self._current_result_name = prev_result_name
+        self._host_scopes.pop()
         if self._save_stack:
             self._save_stack.pop()
         self.indent = max(0, self.indent - 1)
@@ -4695,6 +4710,7 @@ class basic_f2p:
         if sym or parameter_names:
             self.emit("")
 
+        self._host_scopes.append((sym, "global"))
         if contains_idx is not None:
             i = 0
             n = len(tail)
@@ -4729,6 +4745,33 @@ class basic_f2p:
 
         for gi in generic_interfaces:
             self._emit_generic_interface_wrapper(gi["name"], gi["procedures"])
+        self._host_scopes.pop()
+
+    def _host_symbol_table(self, lines: list[tuple[str, str]]) -> dict[str, dict]:
+        symbols = {}
+        for code, _comment in lines:
+            parsed = self._parse_decl_line(code.strip())
+            if parsed is None:
+                continue
+            ftype, type_name, attrs, items = parsed
+            for name, shape, init in items:
+                symbols[name] = dict(ftype=ftype, type_name=type_name,
+                    is_array=shape is not None, shape=shape, init=init,
+                    attrs_l=attrs, pointer="pointer" in attrs, target="target" in attrs,
+                    char_len=self._parse_character_len(code) if ftype == "character" else None)
+        return symbols
+
+    def _procedure_scope(self, local: dict[str, dict], excluded: set[str]) -> dict[str, dict]:
+        """Declare Python bindings and retain metadata for host-associated names."""
+        shadowed = {name.lower() for name in local} | {name.lower() for name in excluded}
+        inherited = {}
+        for symbols, binding in reversed(self._host_scopes):
+            visible = {name: info for name, info in symbols.items() if name.lower() not in shadowed}
+            if visible:
+                self.emit(f"{binding} {', '.join(sorted(visible))}")
+            inherited.update(visible)
+            shadowed.update(name.lower() for name in symbols)
+        return {**inherited, **local}
 
     def transpile_program(self, body_lines: list[tuple[str, str]]) -> None:
         # Handle internal procedures after "contains".
@@ -4762,6 +4805,11 @@ class basic_f2p:
             i += 1
         main_lines = filtered_main
 
+        # Internal procedures are closures over this invocation of main, not
+        # top-level functions reading unrelated Python module globals.
+        self.emit("def main() -> None:")
+        self.indent += 1
+        self._host_scopes.append((self._host_symbol_table(main_lines), "nonlocal"))
         if contains_idx is not None:
             i = 0
             n = len(tail)
@@ -4794,12 +4842,11 @@ class basic_f2p:
                     continue
                 i += 1
 
-        self.emit("def main() -> None:")
-        self.indent += 1
         code0 = self._code_emit_count
         self.transpile_program_body(main_lines)
         if self._code_emit_count == code0:
             self.emit("pass")
+        self._host_scopes.pop()
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
@@ -4907,6 +4954,12 @@ class basic_f2p:
         self.emit(f"def {sname}({', '.join(args_annot)}):")
         self.indent += 1
         self._save_stack.append((save_dict_name, save_names))
+        scope_sym = self._procedure_scope(sym, set(args))
+        arrays_1d.update(name for name, info in scope_sym.items() if info.get("is_array"))
+        local_scope = dict(sym)
+        for arg in args:
+            local_scope.setdefault(arg, dict(ftype="integer", is_array=False))
+        self._host_scopes.append((local_scope, "nonlocal"))
 
         for kind, header, ibody in internals:
             if kind == "function":
@@ -4944,14 +4997,14 @@ class basic_f2p:
 
         self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_names))
         self._emit_save_restore(save_dict_name, save_names, sym, arrays_1d)
-        self._decl_type_names = {k.lower(): v["type_name"].lower() for k, v in sym.items() if v.get("type_name")}
-        self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
-        self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
-        self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
-        self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
-        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
-        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
-        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_type_names = {k.lower(): v["type_name"].lower() for k, v in scope_sym.items() if v.get("type_name")}
+        self._decl_types = {k.lower(): v["ftype"] for k, v in scope_sym.items()}
+        self._decl_array_types = {k.lower(): v["ftype"] for k, v in scope_sym.items() if v.get("is_array")}
+        self._decl_pointer = {k.lower() for k, v in scope_sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
+        self._decl_target = {k.lower() for k, v in scope_sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
+        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in scope_sym.items() if v.get('char_len') is not None}
+        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
 
         for code, comment in main_lines:
             s = code.strip()
@@ -4969,12 +5022,14 @@ class basic_f2p:
             else:
                 self.emit("return " + ", ".join(out_formals))
 
+        self._host_scopes.pop()
         if self._save_stack:
             self._save_stack.pop()
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
     def transpile(self, src: str) -> str:
+        self._host_scopes = []
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
         self._type_bindings = {}

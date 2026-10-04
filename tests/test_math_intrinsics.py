@@ -5,6 +5,16 @@ from xf2p import basic_f2p
 from fortran_py_runtime import _f_epsilon, _f_norm2, _f_sinpi, _f_cospi, _f_tanpi
 
 
+def test_tan_is_numpy_only_and_preserves_labels(capsys):
+    generated = basic_f2p().transpile("program demo\nprint *, TAN(0d0)\nprint *, 'tan(0.0)'\nend program")
+    assert 'np.tan(' in generated
+    assert 'import scipy' not in generated
+    namespace = {'__name__': 'tan_test'}
+    exec(generated, namespace)
+    namespace['main']()
+    assert capsys.readouterr().out.split() == ['0.0', 'tan(0.0)']
+
+
 def test_norm2_is_scaled_and_dimension_aware():
     assert np.isclose(_f_norm2(np.array([3e200, 4e200])), 5e200)
     assert np.isclose(_f_norm2(np.array([3e-200, 4e-200])) / 5e-200, 1)
