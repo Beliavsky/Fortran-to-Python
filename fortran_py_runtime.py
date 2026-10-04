@@ -5,6 +5,9 @@ Used by xf2p.py and xr2p.py outputs.
 from __future__ import annotations
 
 import math
+import sys
+import functools
+import inspect
 import numpy as np
 
 _np_reshape_orig = np.reshape
@@ -30,6 +33,9 @@ def _reshape_with_pad(a, newshape, order="C", pad=None):
 np.reshape = _reshape_with_pad
 
 __all__ = [
+    "_f_product", "_f_unpack", "_f_cshift", "_f_eoshift", "_f_is_contiguous",
+    "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
+    "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
     "_reshape_with_pad",
     "_f_size",
     "_f_shape",
@@ -119,6 +125,214 @@ def _f_index(string, substring, back=False):
     if a.ndim == 0:
         return find(a.item(), b.item(), reverse.item())
     return np.vectorize(find, otypes=[int])(a,b,reverse)
+
+
+def _f_adjustr(string):
+    def adjust(text):
+        text = str(text)
+        return text.rstrip(' ').rjust(len(text))
+    array = np.asarray(string, dtype=object)
+    return adjust(array.item()) if array.ndim == 0 else np.vectorize(adjust, otypes=[object])(array)
+
+
+def _f_scan(string, set, back=False, kind=4, *, verify=False):
+    a, b, reverse = np.broadcast_arrays(np.asarray(string, dtype=object),
+        np.asarray(set, dtype=object), np.asarray(back, dtype=bool))
+    def find(text, chars, backwards):
+        indices = range(len(str(text)) - 1, -1, -1) if backwards else range(len(str(text)))
+        return next((i + 1 for i in indices if (str(text)[i] in str(chars)) != verify), 0)
+    result = np.vectorize(find, otypes=[np.int64])(a, b, reverse)
+    if int(kind) not in (1, 2, 4, 8):
+        raise ValueError('SCAN/VERIFY requires a supported integer kind')
+    result = result.astype(f'int{8 * int(kind)}')
+    return result[()] if result.ndim == 0 else result
+
+
+def _f_verify(string, set, back=False, kind=4):
+    return _f_scan(string, set, back, kind, verify=True)
+
+
+def _f_repeat(string, ncopies):
+    if np.ndim(string) or np.ndim(ncopies) or int(ncopies) < 0:
+        raise ValueError('REPEAT requires scalar arguments and nonnegative NCOPIES')
+    return str(string) * int(ncopies)
+
+
+def _f_product(array, dim=None, mask=None):
+    array = np.asarray(array)
+    if array.ndim == 0 or array.dtype.kind not in 'iufc':
+        raise ValueError('PRODUCT requires a numeric array')
+    # PRODUCT(ARRAY, MASK) is an alternative to PRODUCT(ARRAY, DIM, MASK).
+    if dim is not None and np.asarray(dim).dtype.kind == 'b':
+        if mask is not None:
+            raise ValueError('PRODUCT MASK specified twice')
+        mask, dim = dim, None
+    axis = None
+    if dim is not None:
+        axis = int(dim) - 1
+        if np.ndim(dim) or not 0 <= axis < array.ndim:
+            raise ValueError('PRODUCT DIM out of range')
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.ndim and mask.shape != array.shape:
+            raise ValueError('PRODUCT MASK must be scalar or conformable')
+        array = np.where(mask, array, np.ones((), dtype=array.dtype))
+    return np.prod(array, axis=axis, dtype=array.dtype)
+
+
+def _f_unpack(vector, mask, field):
+    vector, mask, field = np.asarray(vector), np.asarray(mask, dtype=bool), np.asarray(field)
+    if vector.ndim != 1 or mask.ndim == 0:
+        raise ValueError('UNPACK requires a rank-one VECTOR and array MASK')
+    if field.ndim and field.shape != mask.shape:
+        raise ValueError('UNPACK FIELD must be scalar or conformable with MASK')
+    selected = mask.ravel(order='F')
+    n = int(np.count_nonzero(selected))
+    if vector.size < n:
+        raise ValueError('UNPACK VECTOR is too short')
+    result = np.broadcast_to(field, mask.shape).astype(vector.dtype, copy=True).ravel(order='F').copy()
+    result[selected] = vector[:n]
+    return result.reshape(mask.shape, order='F')
+
+
+def _f_shift(array, shift, dim, boundary, circular):
+    array = np.asarray(array)
+    axis = int(dim) - 1
+    if array.ndim == 0 or np.ndim(dim) or not 0 <= axis < array.ndim:
+        raise ValueError('SHIFT DIM out of range')
+    values = np.moveaxis(array, axis, -1)
+    shifts = np.asarray(shift)
+    if shifts.dtype.kind not in 'iu' or (shifts.ndim and shifts.shape != values.shape[:-1]):
+        raise ValueError('SHIFT must be integer scalar or conformable rank-minus-one array')
+    shifts = np.broadcast_to(shifts, values.shape[:-1])
+    if not circular:
+        if boundary is None:
+            boundary = False if array.dtype.kind == 'b' else 0
+            if array.dtype.kind in 'US':
+                boundary = ' ' * (array.dtype.itemsize // (4 if array.dtype.kind == 'U' else 1))
+            elif array.dtype.kind == 'O':
+                if array.size and isinstance(array.flat[0], str):
+                    boundary = ' ' * len(array.flat[0])
+                elif array.size:
+                    raise ValueError('EOSHIFT requires BOUNDARY for derived-type arrays')
+        boundary = np.asarray(boundary)
+        if boundary.ndim and boundary.shape != values.shape[:-1]:
+            raise ValueError('EOSHIFT BOUNDARY must be scalar or conformable')
+        boundary = np.broadcast_to(boundary, values.shape[:-1])
+    result = np.empty_like(values)
+    n = values.shape[-1]
+    for index in np.ndindex(values.shape[:-1]):
+        distance = int(shifts[index])
+        if circular:
+            result[index] = np.roll(values[index], -distance)
+        else:
+            result[index] = boundary[index]
+            if 0 <= distance < n:
+                result[index][:n - distance] = values[index][distance:]
+            elif -n < distance < 0:
+                result[index][-distance:] = values[index][:n + distance]
+    return np.moveaxis(result, -1, axis)
+
+
+def _f_cshift(array, shift, dim=1):
+    return _f_shift(array, shift, dim, None, True)
+
+
+def _f_eoshift(array, shift, boundary=None, dim=1):
+    return _f_shift(array, shift, dim, boundary, False)
+
+
+def _f_is_contiguous(array):
+    if array is None:
+        raise ValueError('IS_CONTIGUOUS requires associated storage')
+    array = np.asarray(array)
+    return bool(array.flags.f_contiguous or array.flags.c_contiguous)
+
+
+def _f_contiguous_arguments(*specifications):
+    """Supply contiguous temporaries; copy modified INOUT/OUT values back."""
+    def decorate(function):
+        signature = inspect.signature(function)
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs)
+            copies = []
+            for name, writable in specifications:
+                value = bound.arguments.get(name)
+                if value is None:
+                    continue
+                original = np.asarray(value)
+                if not _f_is_contiguous(original):
+                    temporary = np.array(original, copy=True, order='F')
+                    bound.arguments[name] = temporary
+                    if writable:
+                        copies.append((original, temporary))
+            try:
+                return function(*bound.args, **bound.kwargs)
+            finally:
+                for original, temporary in copies:
+                    original[...] = temporary
+        return wrapped
+    return decorate
+
+
+def _f_command_argument_count():
+    return max(0, len(sys.argv) - 1)
+
+
+def _f_get_command_argument(number, value_length=None):
+    number = int(number)
+    exists = 0 <= number < len(sys.argv)
+    text = sys.argv[number] if exists else ''
+    length = len(text)
+    status = 0 if exists else 1
+    if value_length is not None:
+        if exists and length > value_length:
+            status = -1
+        text = _f_str_assign(text, value_length)
+    return text, length, status
+
+
+def _f_bits(operation, i, j=None, *, pos=None, length=None, shift=None, bits=32):
+    """Elemental bit operations with an explicit two's-complement word width."""
+    bits = int(bits)
+    if bits not in (8, 16, 32, 64):
+        raise ValueError('unsupported integer bit width')
+    operands = [np.asarray(i, dtype=object)]
+    second = j if j is not None else pos if pos is not None else shift
+    if second is not None:
+        operands.append(np.asarray(second, dtype=object))
+    if length is not None:
+        operands.append(np.asarray(length, dtype=object))
+    operands = np.broadcast_arrays(*operands)
+    mask = (1 << bits) - 1
+    def apply(*values):
+        value = int(values[0]) & mask
+        other = int(values[1]) if len(values) > 1 else 0
+        if operation in {'btest', 'ibset', 'ibclr'} and not 0 <= other < bits:
+            raise ValueError('bit position out of range')
+        if operation == 'btest':
+            return bool(value & (1 << other))
+        if operation == 'ibset': result = value | (1 << other)
+        elif operation == 'ibclr': result = value & ~(1 << other)
+        elif operation == 'ibits':
+            size = int(values[2])
+            if other < 0 or size < 0 or other + size > bits:
+                raise ValueError('IBITS position/length out of range')
+            result = (value >> other) & ((1 << size) - 1)
+        elif operation == 'iand': result = value & other
+        elif operation == 'ior': result = value | other
+        elif operation == 'ieor': result = value ^ other
+        elif operation in {'shiftl', 'shiftr'}:
+            if not 0 <= other <= bits:
+                raise ValueError('SHIFT count out of range')
+            result = value << other if operation == 'shiftl' else value >> other
+        else: raise ValueError('unsupported bit operation')
+        result &= mask
+        return result - (1 << bits) if result >= (1 << (bits - 1)) else result
+    dtype = bool if operation == 'btest' else np.dtype(f'int{bits}')
+    result = np.vectorize(apply, otypes=[dtype])(*operands)
+    return result[()] if result.ndim == 0 else result
 
 
 def _f_section_slice(a, dim, lower_bound, lower=None, upper=None, stride=1):

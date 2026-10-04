@@ -120,6 +120,10 @@ procedures and host association, named loop control, lexical `BLOCK` scopes,
 and selected derived-type and type-bound procedure features. Elemental functions
 and elementwise logical expressions have focused tests. `SHAPE` and `RANK`
 inquiries are supported independently of `SELECT RANK`.
+Other tested intrinsics include `PRODUCT`, `UNPACK`, `CSHIFT`/`EOSHIFT`,
+`ADJUSTR`, `SCAN`/`VERIFY`, `REPEAT`, and selected integer bit operations.
+Named allocatable variables support `MOVE_ALLOC`; command-argument intrinsics
+use Python's command line (argument zero names the Python script).
 
 Support is incomplete and varies by construct and context. In particular:
 
@@ -128,6 +132,9 @@ Support is incomplete and varies by construct and context. In particular:
 - `SELECT RANK`, coarrays, polymorphic allocation, finalization, and parameterized
   derived types are not generally supported.
 - Some intrinsics and formatted external I/O forms remain unsupported.
+- `IS_CONTIGUOUS` uses NumPy storage flags, which do not fully reproduce Fortran
+  descriptors when multidimensional storage layouts differ. Nonpointer,
+  nonallocatable `CONTIGUOUS` array dummies use temporaries when needed.
 - Same-source modules and programs can share mutable module state. Cross-file
   mutable `USE` state and renamed `USE` variables have explicit restrictions;
   combining sources into one input can help with the former.

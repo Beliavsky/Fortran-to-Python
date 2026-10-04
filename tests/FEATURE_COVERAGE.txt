@@ -371,3 +371,39 @@ Fresh-directory test48_random_number.f90 retry reports Run diff: MATCH.
 Focused logical/component checks: 40 passed, 1 expected failure. Established
 suite: 261 passed, 6 expected failures, 60 exploratory cases excluded, in
 402.29 seconds. No unexpected failures.
+
+Additional intrinsics (2026-10-04)
+---------------------------------
+Added PRODUCT, UNPACK, CSHIFT/EOSHIFT, ADJUSTR, SCAN/VERIFY, REPEAT,
+IS_CONTIGUOUS, COMMAND_ARGUMENT_COUNT/GET_COMMAND_ARGUMENT, MOVE_ALLOC, and
+BTEST/IBSET/IBCLR/IBITS/IAND/IOR/IEOR/SHIFTL/SHIFTR. The additional_intrinsics
+and move_alloc_contiguous fixtures cover dimensions and masks, Fortran array
+element order, scalar/array shift and boundary operands, string padding/search,
+signed words and integer kind selectors, command-argument status, allocation
+ownership and bounds, and CONTIGUOUS dummy temporaries/copy-back.
+
+Fresh-directory source retries report MATCH for test02_arrays,
+test18_move_alloc, test30_contiguous, test32_pack_unpack, test33_shift_spread,
+test41_string_intrinsics, and test56_bit_intrinsics. test49_command_arguments
+executes both versions successfully; argument zero names the original executable
+or Python script and can legitimately cause DIFF. Long temporary paths can hide
+this difference after truncation to the fixture's CHARACTER length; a shorter
+output path confirmed the expected program-name difference.
+
+The first established-suite run exposed a new numeric-literal kind regression
+in the added fixture. Bit calls now recover integer kinds before suffix removal,
+including nested calls and keyword arguments. Numeric kind suffixes in string
+contents are left untouched. The corrected suite passed 297 tests with six
+unchanged expected failures and 60 exploratory cases excluded (307.17 seconds).
+Additional intrinsic/kind/component checks passed all 49 tests.
+
+Limits: bit-expression kind inference is not general, MOVE_ALLOC components and
+general cross-procedure allocatable ownership remain limited, and NumPy layout
+flags are not full Fortran descriptors for multidimensional IS_CONTIGUOUS.
+Refresh stale copied fortran_py_runtime.py files when using these new helpers.
+
+Intrinsic specifications consulted:
+https://gcc.gnu.org/onlinedocs/gfortran/PRODUCT.html
+https://gcc.gnu.org/onlinedocs/gfortran/UNPACK.html
+https://gcc.gnu.org/onlinedocs/gfortran/CSHIFT.html
+https://gcc.gnu.org/onlinedocs/gfortran/GET_005fCOMMAND_005fARGUMENT.html

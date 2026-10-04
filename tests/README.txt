@@ -316,3 +316,30 @@ lowers logical operations to np.logical_and/or/not, preserving comparison and
 AND/OR/NOT precedence. Operator-looking text inside strings is left unchanged.
 Both operands are evaluated; Fortran does not guarantee short-circuit
 evaluation. Generated Python retains idiomatic True/False output.
+
+Additional array, string, allocation, and bit intrinsics
+------------------------------------------------------
+tests/test_additional_intrinsics.py and features/additional_intrinsics.f90
+exercise PRODUCT (DIM/MASK, positional logical MASK, empty reductions, numeric
+types), UNPACK (Fortran element order, scalar/array FIELD), CSHIFT/EOSHIFT
+(dimensions, scalar/array SHIFT and BOUNDARY, zero/large/negative shifts),
+ADJUSTR, SCAN/VERIFY (BACK/KIND), REPEAT, and elemental bit operations BTEST,
+IBSET/IBCLR/IBITS, IAND/IOR/IEOR, SHIFTL/SHIFTR. Bit operations use default
+32-bit words or recognized integer declaration kinds/kind-suffixed I literals;
+this does not solve general expression-result kind inference or kind fidelity.
+
+features/move_alloc_contiguous.f90 checks MOVE_ALLOC, destination replacement,
+source deallocation, bound transfer, later source reallocation, and unallocated
+sources. MOVE_ALLOC currently requires named allocatable variables, not derived
+components; general allocatable dummy ownership across procedure calls remains
+limited. IS_CONTIGUOUS uses NumPy storage flags. Nonpointer, nonallocatable
+CONTIGUOUS array dummies use temporaries for strided arguments, copying writable
+temporaries back. This is not a complete emulation of Fortran array descriptors:
+multidimensional inquiries can differ where NumPy storage order differs from
+the original Fortran layout. Derived-type/pointer allocation semantics remain
+partial.
+
+COMMAND_ARGUMENT_COUNT and GET_COMMAND_ARGUMENT use sys.argv, including optional
+VALUE/LENGTH/STATUS, fixed-length padding, truncation, and missing arguments.
+Argument zero denotes the Python script rather than the original executable;
+do not expect --run-diff to equate those program names.

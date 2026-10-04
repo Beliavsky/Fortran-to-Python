@@ -987,6 +987,45 @@ _LOCAL_RUNTIME_HELPERS = {
     "random_choice_norep",
 }
 
+_INTRINSIC_ARGUMENTS = {
+    'product': (('array', 'dim', 'mask'), 1),
+    'unpack': (('vector', 'mask', 'field'), 3),
+    'cshift': (('array', 'shift', 'dim'), 2),
+    'eoshift': (('array', 'shift', 'boundary', 'dim'), 2),
+    'is_contiguous': (('array',), 1),
+    'adjustr': (('string',), 1),
+    'scan': (('string', 'set', 'back', 'kind'), 2),
+    'verify': (('string', 'set', 'back', 'kind'), 2),
+    'repeat': (('string', 'ncopies'), 2),
+    'command_argument_count': ((), 0),
+    'btest': (('i', 'pos'), 2), 'ibset': (('i', 'pos'), 2),
+    'ibclr': (('i', 'pos'), 2), 'ibits': (('i', 'pos', 'len'), 3),
+    'iand': (('i', 'j'), 2), 'ior': (('i', 'j'), 2), 'ieor': (('i', 'j'), 2),
+    'shiftl': (('i', 'shift'), 2), 'shiftr': (('i', 'shift'), 2),
+}
+_BIT_INTRINSICS = {'btest', 'ibset', 'ibclr', 'ibits', 'iand', 'ior', 'ieor', 'shiftl', 'shiftr'}
+
+
+def _bind_intrinsic_arguments(name, text, parameters, required):
+    bound = {}
+    keyword_seen = False
+    for part in split_args(text) if text.strip() else []:
+        keyword = re.match(r'^([a-z_]\w*)\s*=(?!=)\s*(.+)$', part.strip(), re.I)
+        if keyword:
+            key, value = keyword.group(1).lower(), keyword.group(2)
+            keyword_seen = True
+        else:
+            if keyword_seen:
+                raise ValueError(f'{name.upper()}: positional argument after keyword')
+            key = next((p for p in parameters if p not in bound), '')
+            value = part.strip()
+        if not value or key not in parameters or key in bound:
+            raise ValueError(f'{name.upper()}: invalid or duplicate argument {key}')
+        bound[key] = value
+    if any(p not in bound for p in parameters[:required]):
+        raise ValueError(f'{name.upper()}: missing required argument')
+    return bound
+
 
 def infer_function_result_ftype(header: str) -> str | None:
     """Infer scalar Fortran result type from function header when explicit.
@@ -1838,11 +1877,52 @@ class basic_f2p:
             stop = ""
         return f"{start}:{stop}"
 
+    def _translate_bit_call(self, name, inner, arrays_1d):
+        parameters, required = _INTRINSIC_ARGUMENTS[name]
+        raw = _bind_intrinsic_arguments(name, inner, parameters, required)
+        bound = {k: self.translate_expr(v, arrays_1d) for k, v in raw.items()}
+        bits = '32'
+        literal = re.fullmatch(r'([+-]?\d+)_([a-z_]\w*|\d+)', raw['i'], re.I)
+        if literal:
+            bound['i'] = literal.group(1)
+            bits = f'8 * ({self.translate_expr(literal.group(2), arrays_1d)})'
+        name_match = re.match(r'^([a-z_]\w*)(?:\s*\(.*\))?$', raw['i'], re.I)
+        if name_match:
+            for symbols, _binding in reversed(self._host_scopes):
+                info = symbols.get(name_match.group(1))
+                if info is not None:
+                    selector = re.match(r'^\s*\(\s*(?:kind\s*=\s*)?([^)]*)\)', info.get('attrs_l', ''), re.I)
+                    if selector:
+                        bits = f'8 * ({self.translate_expr(selector.group(1), arrays_1d)})'
+                    break
+        arguments = [repr(name)]
+        arguments.extend(f"{'length' if k == 'len' else k}={v}" for k, v in bound.items())
+        arguments.append(f'bits={bits}')
+        return f"_f_bits({', '.join(arguments)})"
+
     def translate_expr(self, expr: str, arrays_1d: set[str]) -> str:
         s = expr.strip()
         keyword = re.match(r"^([a-z_]\w*)\s*=(?!=)\s*(.+)$", s, re.I)
         if keyword:
             return f"{keyword.group(1)}={self.translate_expr(keyword.group(2), arrays_1d)}"
+        # Bit widths must be recovered before ordinary numeric-kind suffixes
+        # are removed. Scan nested calls too, without matching string contents.
+        bit_pattern = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|"
+            r"\b(btest|ibset|ibclr|ibits|iand|ior|ieor|shiftl|shiftr)\s*\(", re.I)
+        out, cursor = [], 0
+        while match := bit_pattern.search(s, cursor):
+            out.append(s[cursor:match.start()])
+            if match.group(1):
+                opening = s.find('(', match.start())
+                closing = find_matching_paren(s, opening)
+                if closing < 0:
+                    raise ValueError('unbalanced bit intrinsic call')
+                out.append(self._translate_bit_call(match.group(1).lower(), s[opening + 1:closing], arrays_1d))
+                cursor = closing + 1
+            else:
+                out.append(match.group())
+                cursor = match.end()
+        s = ''.join(out) + s[cursor:]
         s = s.replace("%", ".")
         concat_parts = split_top_level_concat(s)
         if len(concat_parts) > 1:
@@ -1931,7 +2011,10 @@ class basic_f2p:
         )
         # fortran kind suffix literal -> plain python numeric literal
         # e.g. 1.0_dp, 2_ikind, 3.5_rk
-        s = re.sub(r"(?i)\b((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*_[a-z_]\w*\b", r"\1", s)
+        s = re.sub(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|"
+                   r"\b(?P<number>(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*_(?:[a-z_]\w*|\d+)\b",
+                   lambda m: m.group('number') if m.group('number') is not None else m.group(),
+                   s, flags=re.I)
 
         def _top_level_complex_literal(txt: str) -> tuple[str, str] | None:
             t = txt.strip()
@@ -2088,7 +2171,7 @@ class basic_f2p:
 
         def _translate_special_call(name: str, inner: str) -> str | None:
             lname = name.lower()
-            if lname not in {
+            if lname not in _INTRINSIC_ARGUMENTS and lname not in {
                 "gamma",
                 "log_gamma",
                 "log10",
@@ -2159,6 +2242,13 @@ class basic_f2p:
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
+            if lname in _INTRINSIC_ARGUMENTS:
+                parameters, required = _INTRINSIC_ARGUMENTS[lname]
+                raw = _bind_intrinsic_arguments(lname, inner, parameters, required)
+                bound = {k: self.translate_expr(v, arrays_1d) for k, v in raw.items()}
+                if lname in _BIT_INTRINSICS:
+                    return self._translate_bit_call(lname, inner, arrays_1d)
+                return f"_f_{lname}({', '.join(f'{k}={v}' for k, v in bound.items())})"
             if lname in {"shape", "rank"}:
                 parameters = ("source", "kind") if lname == "shape" else ("a",)
                 bound = {}
@@ -3812,6 +3902,41 @@ class basic_f2p:
                         kwargs_py[mk.group(1).lower()] = self.translate_expr(mk.group(2), arrays_1d)
                     else:
                         args_py.append(self.translate_expr(a, arrays_1d))
+            if cname_l == 'move_alloc':
+                raw = _bind_intrinsic_arguments(cname_l, argtxt, ('from', 'to', 'stat', 'errmsg'), 2)
+                source, destination = raw['from'], raw['to']
+                if not all(re.fullmatch(r'[a-z_]\w*', name, re.I) for name in (source, destination)):
+                    raise ValueError('MOVE_ALLOC currently requires named variables, not components')
+                symbols = {name: info for scope, _ in self._host_scopes for name, info in scope.items()}
+                a, b = symbols.get(source), symbols.get(destination)
+                if not a or not b or any('allocatable' not in info.get('attrs_l', '') for info in (a, b)):
+                    raise ValueError('MOVE_ALLOC requires ALLOCATABLE variables')
+                rank_a = len(self._shape_bounds(a['shape'])) if a.get('shape') else 0
+                rank_b = len(self._shape_bounds(b['shape'])) if b.get('shape') else 0
+                if source == destination or rank_a != rank_b or a['ftype'] != b['ftype'] or a.get('type_name') != b.get('type_name'):
+                    raise ValueError('MOVE_ALLOC requires distinct variables of matching type and rank')
+                if rank_a:
+                    self._allocation_counter += 1
+                    bounds_name = _choose_fresh_identifier(self._allocation_source, f'_xf2p_move_bounds_{self._allocation_counter}')
+                    lows = [self._decl_bound_expr(source, d, 'lo', arrays_1d) or '1' for d in range(rank_a)]
+                    self.emit(f"{bounds_name} = [{', '.join(lows)}] if {source} is not None else None")
+                    self._decl_lbounds[destination.lower()] = [f'{bounds_name}[{d}]' for d in range(rank_a)]
+                    self._decl_ubounds[destination.lower()] = [''] * rank_a
+                self.emit(f'{destination}, {source} = {source}, None')
+                if 'stat' in raw:
+                    self.emit(f"{self.translate_expr(raw['stat'], arrays_1d)} = 0")
+                return True
+            if cname_l == 'get_command_argument':
+                raw = _bind_intrinsic_arguments(cname_l, argtxt, ('number', 'value', 'length', 'status'), 1)
+                number = self.translate_expr(raw['number'], arrays_1d)
+                length = f"len({self.translate_expr(raw['value'], arrays_1d)})" if 'value' in raw else 'None'
+                self._allocation_counter += 1
+                temporary = _choose_fresh_identifier(self._allocation_source, f'_xf2p_command_arg_{self._allocation_counter}')
+                self.emit(f'{temporary} = _f_get_command_argument({number}, {length})')
+                for index, output in enumerate(('value', 'length', 'status')):
+                    if output in raw:
+                        self.emit(f"{self.translate_expr(raw[output], arrays_1d)} = {temporary}[{index}]")
+                return True
             # Fortran random_seed adapters for valid Python
             if cname.lower() == "random_seed":
                 if "size" in kwargs_py:
@@ -4541,6 +4666,12 @@ class basic_f2p:
         save_names = self._collect_save_names(main_lines, sym, args)
         save_dict_name = f"_{fname}_save"
         self.emit(f"{save_dict_name} = {{}}")
+        contiguous = [(a, 'intent(in)' not in str(sym[a].get('attrs_l', '')).replace(' ', ''))
+                      for a in args if a in sym and sym[a].get('is_array')
+                      and 'contiguous' in sym[a].get('attrs_l', '')
+                      and not sym[a].get('pointer') and 'allocatable' not in sym[a].get('attrs_l', '')]
+        if contiguous:
+            self.emit(f"@_f_contiguous_arguments({', '.join(repr(spec) for spec in contiguous)})")
         self.emit(f"def {fname}({', '.join(args_annot)}) -> {result_hint}:")
         self.indent += 1
         self._save_stack.append((save_dict_name, save_names))
@@ -5155,6 +5286,12 @@ class basic_f2p:
         save_names = self._collect_save_names(main_lines, sym, args)
         save_dict_name = f"_{sname}_save"
         self.emit(f"{save_dict_name} = {{}}")
+        contiguous = [(a, 'intent(in)' not in str(sym[a].get('attrs_l', '')).replace(' ', ''))
+                      for a in args if a in sym and sym[a].get('is_array')
+                      and 'contiguous' in sym[a].get('attrs_l', '')
+                      and not sym[a].get('pointer') and 'allocatable' not in sym[a].get('attrs_l', '')]
+        if contiguous:
+            self.emit(f"@_f_contiguous_arguments({', '.join(repr(spec) for spec in contiguous)})")
         self.emit(f"def {sname}({', '.join(args_annot)}):")
         self.indent += 1
         self._save_stack.append((save_dict_name, save_names))
