@@ -390,7 +390,7 @@ def split_args(s: str) -> list[str]:
         args.append(tail)
     return args
 
-def split_top_level(s: str, delim: str) -> list[str]:
+def split_top_level(s: str, delim: str, preserve_empty: bool = False) -> list[str]:
     parts: list[str] = []
     buf: list[str] = []
     pdepth = 0
@@ -441,7 +441,7 @@ def split_top_level(s: str, delim: str) -> list[str]:
         buf.append(ch)
         i += 1
     tail = ''.join(buf).strip()
-    if tail or not parts:
+    if tail or not parts or preserve_empty:
         parts.append(tail)
     return parts
 
@@ -1674,8 +1674,24 @@ class basic_f2p:
             return f"({idx_py}) - 1"
         return f"({idx_py}) - ({lo_py})"
 
+    @staticmethod
+    def _split_section(text: str) -> tuple[str, str]:
+        parts = split_top_level(text, ':', preserve_empty=True)
+        if len(parts) not in (2, 3):
+            raise ValueError(f"Invalid Fortran array section: {text!r}")
+        return parts[0], ':'.join(parts[1:])
+
     def _slice_expr_from_decl_bounds(self, name: str, lo_txt: str, hi_txt: str, dim0: int, arrays_1d: set[str]) -> str:
         base_lo_py = self._decl_bound_expr(name, dim0, "lo", arrays_1d)
+        triplet_tail = split_top_level(hi_txt, ':', preserve_empty=True)
+        if len(triplet_tail) > 1:
+            if len(triplet_tail) != 2 or not triplet_tail[1].strip():
+                raise ValueError("Invalid Fortran array section stride")
+            hi_txt, step_txt = triplet_tail
+            lo_py = self.translate_expr(lo_txt.strip(), arrays_1d) if lo_txt.strip() else "None"
+            hi_py = self.translate_expr(hi_txt.strip(), arrays_1d) if hi_txt.strip() else "None"
+            step_py = self.translate_expr(step_txt.strip(), arrays_1d)
+            return f"_f_section_slice({name}, {dim0}, {base_lo_py or '1'}, {lo_py}, {hi_py}, {step_py})"
         lo_txt = lo_txt.strip()
         hi_txt = hi_txt.strip()
         if lo_txt:
@@ -2128,7 +2144,7 @@ class basic_f2p:
                                     if ptxt == ":":
                                         idx_parts.append(":")
                                     elif ":" in ptxt:
-                                        lo, hi = ptxt.split(":", 1)
+                                        lo, hi = self._split_section(ptxt)
                                         lo = lo.strip()
                                         hi = hi.strip()
                                         idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
@@ -2138,7 +2154,7 @@ class basic_f2p:
                                 i = pclose + 1
                                 continue
                             if ":" in inner:
-                                lo, hi = inner.split(":", 1)
+                                lo, hi = self._split_section(inner)
                                 lo = lo.strip()
                                 hi = hi.strip()
                                 out.append(f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}]")
@@ -2333,7 +2349,7 @@ class basic_f2p:
                         if ptxt == ":":
                             idx_parts.append(":")
                         elif ":" in ptxt:
-                            lo, hi = ptxt.split(":", 1)
+                            lo, hi = self._split_section(ptxt)
                             lo = lo.strip()
                             hi = hi.strip()
                             idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
@@ -2342,7 +2358,7 @@ class basic_f2p:
                     self.emit(f"{name}[{', '.join(idx_parts)}] = {rhs_py}")
                     return
                 if ":" in idx:
-                    lo, hi = idx.split(":", 1)
+                    lo, hi = self._split_section(idx)
                     lo = lo.strip()
                     hi = hi.strip()
                     self.emit(f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}] = {rhs_py}")
@@ -2379,7 +2395,7 @@ class basic_f2p:
             else:
                 self.emit("return")
             return
-        if "=" in s and "::" not in s:
+        if "=" in s and _find_top_level_double_colon(s) == -1:
             lhs, rhs = s.split("=", 1)
             lhs = lhs.strip()
             rhs_py = self.translate_expr(rhs, arrays_1d)
@@ -2758,7 +2774,7 @@ class basic_f2p:
                     if ptxt == ":":
                         idx_parts.append(":")
                     elif ":" in ptxt:
-                        lo, hi = ptxt.split(":", 1)
+                        lo, hi = self._split_section(ptxt)
                         lo = lo.strip()
                         hi = hi.strip()
                         idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
@@ -2766,7 +2782,7 @@ class basic_f2p:
                         idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
                 target = f"{name}[{', '.join(idx_parts)}]"
             else:
-                lo, hi = idx.split(":", 1)
+                lo, hi = self._split_section(idx)
                 lo = lo.strip()
                 hi = hi.strip()
                 target = f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}]"
@@ -3869,7 +3885,7 @@ class basic_f2p:
                         return True
 
         # assignment
-        if "=" in s and "::" not in s:
+        if "=" in s and _find_top_level_double_colon(s) == -1:
             lhs, rhs = s.split("=", 1)
             lhs = lhs.strip()
             rhs_py = self.translate_expr(rhs, arrays_1d)

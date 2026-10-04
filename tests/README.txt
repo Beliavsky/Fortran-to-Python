@@ -11,9 +11,9 @@ skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (16 programs)
+Corpus (17 programs)
 --------------------
-handwritten/: 12 small deterministic programs exercising scalars, loops,
+handwritten/: 13 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
@@ -44,13 +44,12 @@ I/O cannot accidentally reuse files produced by the reference execution.
 
 Known failures (2026-10-04)
 --------------------------
-array_sections: strided sections produce invalid Python slice syntax.
 matrix_operations: TRANSPOSE becomes undefined Python name transpose.
 strings: string initialization calls undefined helper _f_str_assign.
 xsum_dim_int: ISO_FORTRAN_ENV INT32 becomes undefined Python name int32.
 formatted_file_io: numeric file units produce invalid Python 20.close().
 
-These five cases are strict expected failures, not skipped. Their Fortran
+These four cases are strict expected failures, not skipped. Their Fortran
 references must still compile and execute successfully. Unexpected success
 fails the suite so that obsolete expectations are removed after a fix.
 Other assertion failures inside a known-failing translation may also count
@@ -74,3 +73,11 @@ convert elementwise with np.asarray(..., dtype=int), while scalar variables
 and individual elements retain scalar int() conversion. The logical_masks
 case now passes. integer_assignment_conversions checks positive/negative real
 truncation, scalar expansion, vector/matrix sections, elements, and WHERE.
+
+Also fixed on 2026-10-04: strided sections on expression and assignment paths,
+including WHERE and single-line IF assignments. strided_sections checks
+positive/negative/dynamic strides, omitted bounds, empty sections, non-unit
+declared lower bounds, multiple dimensions, nested bounds, and overlapping
+assignment. Unlike Python, Fortran's omitted bounds do not reverse with a
+negative stride. Runtime triplet conversion rejects zero strides and selected
+out-of-bounds elements. The original array_sections case now passes.

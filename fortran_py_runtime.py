@@ -34,6 +34,7 @@ __all__ = [
     "_f_size",
     "_f_spread",
     "_f_assign_array",
+    "_f_section_slice",
     "merge",
     "pack",
     "count",
@@ -55,6 +56,31 @@ __all__ = [
     "r_matmul",
     "matmul",
 ]
+
+
+def _f_section_slice(a, dim, lower_bound, lower=None, upper=None, stride=1):
+    """Inclusive Fortran triplet -> Python slice, including reverse sections."""
+    stride = int(stride)
+    if stride == 0:
+        raise ValueError("Fortran array section stride must not be zero")
+    base = int(lower_bound)
+    size = np.asarray(a).shape[int(dim)]
+    last_bound = base + size - 1
+    # Unlike Python, Fortran's omitted bounds do not change with stride sign.
+    first = base if lower is None else int(lower)
+    last = last_bound if upper is None else int(upper)
+    count = max(0, (last - first) // stride + 1)
+    if count == 0:
+        return slice(0, 0, stride)
+    final = first + (count - 1) * stride
+    if not (base <= first <= last_bound and base <= final <= last_bound):
+        raise IndexError("Fortran array section is out of bounds")
+    stop = last - base + (1 if stride > 0 else -1)
+    # A literal -1 stop indexes from the end in Python, rather than denoting
+    # the exclusive position before the first element.
+    if stride < 0 and stop < 0:
+        stop = None
+    return slice(first - base, stop, stride)
 
 
 def _f_size(a, dim=None):
