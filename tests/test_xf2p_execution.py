@@ -21,7 +21,6 @@ KNOWN_FAILURES = {
     "selected_integer_kind": "SELECTED_INT_KIND has no translated helper",
     "selected_logical_kind": "SELECTED_LOGICAL_KIND has no translated helper",
     "selected_real_kind": "SELECTED_REAL_KIND has no translated helper",
-    "type_bound_procedure": "type-bound call silently fails to update the object",
     "type_extension": "parent component of an extended type is missing",
 }
 

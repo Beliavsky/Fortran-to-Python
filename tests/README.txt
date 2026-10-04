@@ -55,7 +55,6 @@ execute_command_line: missing EXECUTE_COMMAND_LINE helper.
 impure_elemental: updating module state lacks a Python global declaration.
 selected_integer_kind, selected_logical_kind, selected_real_kind: missing
 kind-selection intrinsic helpers.
-type_bound_procedure: silently fails to update the object (wrong result).
 type_extension: missing parent component of an extended type.
 
 These cases are strict expected failures, not skipped. Their Fortran
@@ -119,3 +118,14 @@ Kind-number values use the existing GNU-style convention (1/2/4/8 for integer
 storage sizes). They are not portable processor-independent kind identifiers.
 Resolving these constants does not yet guarantee exact kind-sized integer
 storage or overflow semantics throughout translated Python/NumPy operations.
+
+Also fixed on 2026-10-04: type-bound calls no longer disappear. Derived types
+emit forwarding methods for explicit procedure bindings, including renamed
+bindings, default/named PASS, NOPASS, optional arguments, function results,
+and explicit scalar OUT arguments. CLASS(type) dummies retain derived-type
+metadata. CONTAINS inside a type is distinguished from the enclosing unit's
+CONTAINS. The expanded type_bound_procedure case checks nested objects and
+calls from one bound procedure to another as well as ordinary component-array
+indexing. Unsupported/unresolved CALL statements fail explicitly rather than
+being silently discarded. Deferred/generic bindings and indexed-object calls
+are not yet supported by this implementation; type extension remains failing.

@@ -1162,6 +1162,10 @@ class basic_f2p:
         self._func_sigs: dict[str, dict] = {}
         self._current_result_name: str | None = None
         self._derived_types: set[str] = set()
+        self._type_bindings: dict[str, dict[str, dict]] = {}
+        self._type_components: dict[str, dict[str, str]] = {}
+        self._decl_type_names: dict[str, str] = {}
+        self._binding_targets: dict[str, dict] = {}
         self._select_case_stack: list[dict[str, object]] = []
         self._associate_stack: list[dict[str, object]] = []
         self._where_stack: list[dict[str, str]] = []
@@ -1233,7 +1237,7 @@ class basic_f2p:
         if pd:
             ftype, attrs, rest = pd
             return ftype, None, attrs.lower(), parse_decl_items(rest, parse_decl_attr_dimension(attrs))
-        td = re.match(r"^type\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
+        td = re.match(r"^(?:type|class)\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
         if td:
             attrs = td.group(2).strip()
             return "type", td.group(1), attrs.lower(), parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(attrs))
@@ -1450,11 +1454,7 @@ class basic_f2p:
         return body, i
 
     def _split_internal_subprograms(self, body_lines: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], list[tuple[str, str, list[tuple[str, str]]]]]:
-        contains_idx = None
-        for i, (code, _comment) in enumerate(body_lines):
-            if code.strip().lower() == "contains":
-                contains_idx = i
-                break
+        contains_idx = self._unit_contains_index(body_lines)
         if contains_idx is None:
             return body_lines, []
         main_lines = body_lines[:contains_idx]
@@ -1482,6 +1482,27 @@ class basic_f2p:
             i += 1
         return main_lines, internals
 
+    @staticmethod
+    def _unit_contains_index(lines: list[tuple[str, str]]) -> int | None:
+        """Find a unit's CONTAINS, not the binding section inside a type."""
+        in_type = False
+        for i, (code, _comment) in enumerate(lines):
+            s = code.strip()
+            if re.match(r"^end\s*type\b", s, re.I):
+                in_type = False
+            elif re.match(r"^type\b(?:\s*,[^:]*)?(?:\s*::\s*|\s+)[a-z_]\w*\s*$", s, re.I):
+                in_type = True
+            elif s.lower() == "contains" and not in_type:
+                return i
+        return None
+
+    def _bound_signature(self, callee: str) -> dict | None:
+        parts = callee.lower().replace("%", ".").split(".")
+        type_name = self._decl_type_names.get(parts[0], "")
+        for component in parts[1:-1]:
+            type_name = self._type_components.get(type_name, {}).get(component, "")
+        return self._type_bindings.get(type_name, {}).get(parts[-1])
+
     def transpile_derived_type(self, header: str, body_lines: list[tuple[str, str]]) -> None:
         h = header.strip()
         m = re.match(r"^type\b(?:\s*,[^:]*)?(?:\s*::\s*|\s+)([a-z_]\w*)\s*$", h, re.I)
@@ -1489,13 +1510,63 @@ class basic_f2p:
             return
         tname = m.group(1)
         self._derived_types.add(tname)
+        bindings = self._type_bindings.setdefault(tname.lower(), {})
+        components = self._type_components.setdefault(tname.lower(), {})
 
         self.emit("@dataclass")
         self.emit(f"class {tname}:")
         self.indent += 1
         had_field = False
+        in_bindings = False
         for code, comment in body_lines:
             s = code.strip()
+            if s.lower() == "contains":
+                in_bindings = True
+                continue
+            if in_bindings:
+                binding = re.match(r"^procedure\b\s*(?:\([^)]*\))?\s*(.*?)::\s*(.+)$", s, re.I)
+                if not binding:
+                    if s:
+                        raise ValueError(f"unsupported type-bound declaration: {s}")
+                    continue
+                attrs = binding.group(1).lower()
+                if "deferred" in attrs:
+                    raise ValueError(f"unsupported deferred binding: {s}")
+                for item in split_args(binding.group(2)):
+                    pair = item.split("=>", 1)
+                    name = pair[0].strip().lower()
+                    target = pair[-1].strip().lower()
+                    spec = self._binding_targets.get(target)
+                    if spec is None:
+                        raise ValueError(f"no translated procedure for binding {tname}%{name}: {target}")
+                    passed = None
+                    if not re.search(r"\bnopass\b", attrs):
+                        named = re.search(r"\bpass\s*\(\s*(\w+)\s*\)", attrs)
+                        passed = named.group(1) if named else (spec["args"][0] if spec["args"] else None)
+                        if passed not in spec["args"]:
+                            raise ValueError(f"invalid passed-object argument for {tname}%{name}")
+                    args = [a for a in spec["args"] if a != passed]
+                    outputs = [a for a in spec["out"] if a != passed]
+                    bindings[name] = {"args": args, "out": outputs, "kind": spec["kind"]}
+                    object_arg = _choose_fresh_identifier(" ".join(spec["args"]), "_xf2p_object")
+                    formals = [object_arg] + [a + ("=None" if a in spec["optional"] else "") for a in args]
+                    self.emit(f"def {name}({', '.join(formals)}):")
+                    self.indent += 1
+                    actuals = [f"{a}={object_arg if a == passed else a}" for a in spec["args"]]
+                    call = f"{target}({', '.join(actuals)})"
+                    if spec["kind"] == "function" or passed not in spec["out"]:
+                        self.emit(f"return {call}")
+                    elif not outputs:
+                        self.emit(call)
+                    else:
+                        # Subroutines return their OUT/INOUT dummies, including
+                        # the mutable passed object. Only expose explicit outputs.
+                        self.emit(f"_xf2p_result = {call}")
+                        indices = [spec["out"].index(a) for a in outputs]
+                        self.emit("return " + ", ".join(f"_xf2p_result[{i}]" for i in indices))
+                    self.indent -= 1
+                    had_field = True
+                continue
             pd = parse_decl(s)
             if pd:
                 ftype, attrs, rest = pd
@@ -1511,6 +1582,8 @@ class basic_f2p:
                 items = parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(td.group(2).strip()))
                 type_name = td.group(1)
             for name, shape, init in items:
+                if type_name:
+                    components[name.lower()] = type_name.lower()
                 had_field = True
                 cmt = f"  # {comment.strip()}" if comment.strip() else ""
                 if shape is not None:
@@ -2177,7 +2250,7 @@ class basic_f2p:
                         inner = txt[k + 1 : pclose]
                         inner_py = self.translate_expr(inner, arrays_1d)
                         root = name.split(".", 1)[0].lower()
-                        dotted_array_ref = ("." in name) and (root not in {"np", "math", "random", "sps"})
+                        dotted_array_ref = ("." in name) and (root not in {"np", "math", "random", "sps"}) and self._bound_signature(name) is None
                         special_call = None if "." in name else _translate_special_call(name, inner)
                         if special_call is not None:
                             out.append(special_call)
@@ -3334,11 +3407,14 @@ class basic_f2p:
             return True
 
         # call foo(...)
-        mm = re.match(r"call\s+([a-z_]\w*)\s*\((.*)\)\s*$", s, re.I)
+        mm = re.match(r"call\s+([a-z_]\w*(?:\s*%\s*[a-z_]\w*)*)\s*(?:\((.*)\))?\s*$", s, re.I)
         if mm:
-            cname = mm.group(1)
+            opening = s.find("(")
+            if opening != -1 and find_matching_paren(s, opening) != len(s) - 1:
+                raise ValueError(f"unsupported CALL statement: {s}")
+            cname = re.sub(r"\s*%\s*", ".", mm.group(1))
             cname_l = cname.lower()
-            argtxt = mm.group(2).strip()
+            argtxt = (mm.group(2) or "").strip()
             args_py: list[str] = []
             kwargs_py: dict[str, str] = {}
             if argtxt:
@@ -3361,7 +3437,9 @@ class basic_f2p:
             merged = list(args_py)
             for k, v in kwargs_py.items():
                 merged.append(f"{k}={v}")
-            sig = self._subr_sigs.get(cname_l)
+            sig = self._bound_signature(cname) if "." in cname else self._subr_sigs.get(cname_l)
+            if "." in cname and sig is None:
+                raise ValueError(f"unsupported or unresolved type-bound call: {s}")
             if sig:
                 formal_args = sig.get("args", [])
                 out_formals = sig.get("out", [])
@@ -3381,6 +3459,9 @@ class basic_f2p:
                     return True
             self.emit(f"{cname}({', '.join(merged)})")
             return True
+
+        if re.match(r"^call\b", s, re.I):
+            raise ValueError(f"unsupported CALL statement: {s}")
 
         # return
         if sl == "return":
@@ -3989,7 +4070,7 @@ class basic_f2p:
                 items = parse_decl_items(rest, parse_decl_attr_dimension(attrs))
                 type_name = None
             else:
-                td = re.match(r"^type\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
+                td = re.match(r"^(?:type|class)\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
                 if not td:
                     continue
                 ftype = "type"
@@ -4129,6 +4210,7 @@ class basic_f2p:
         if (result_has_components or result_is_derived) and result_name.lower() not in {k.lower() for k in sym}:
             cls = result_type_name if result_type_name else "SimpleNamespace"
             self.emit(f"{result_name} = {cls}()")
+        self._decl_type_names = {k.lower(): v["type_name"].lower() for k, v in sym.items() if v.get("type_name")}
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
@@ -4212,6 +4294,7 @@ class basic_f2p:
 
         # declare/init variables (explicit-shape arrays + scalars)
         self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names)
+        self._decl_type_names = {k.lower(): v["type_name"].lower() for k, v in sym.items() if v.get("type_name")}
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
         self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
@@ -4289,11 +4372,7 @@ class basic_f2p:
         # and contained procedures are emitted as top-level defs.
         decl_lines = body_lines
         tail: list[tuple[str, str]] = []
-        contains_idx = None
-        for i, (code, _comment) in enumerate(body_lines):
-            if code.strip().lower() == "contains":
-                contains_idx = i
-                break
+        contains_idx = self._unit_contains_index(body_lines)
         if contains_idx is not None:
             decl_lines = body_lines[:contains_idx]
             tail = body_lines[contains_idx + 1 :]
@@ -4408,11 +4487,7 @@ class basic_f2p:
         # Handle internal procedures after "contains".
         main_lines = body_lines
         tail: list[tuple[str, str]] = []
-        contains_idx = None
-        for i, (code, _comment) in enumerate(body_lines):
-            if code.strip().lower() == "contains":
-                contains_idx = i
-                break
+        contains_idx = self._unit_contains_index(body_lines)
         if contains_idx is not None:
             main_lines = body_lines[:contains_idx]
             tail = body_lines[contains_idx + 1 :]
@@ -4508,7 +4583,7 @@ class basic_f2p:
                 items = parse_decl_items(rest, parse_decl_attr_dimension(attrs))
                 type_name = None
             else:
-                td = re.match(r"^type\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
+                td = re.match(r"^(?:type|class)\s*\(\s*([a-z_]\w*)\s*\)\s*(.*?)::\s*(.*)$", s, re.I)
                 if not td:
                     continue
                 ftype = "type"
@@ -4622,6 +4697,7 @@ class basic_f2p:
 
         self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_names))
         self._emit_save_restore(save_dict_name, save_names, sym, arrays_1d)
+        self._decl_type_names = {k.lower(): v["type_name"].lower() for k, v in sym.items() if v.get("type_name")}
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
         self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
@@ -4654,6 +4730,33 @@ class basic_f2p:
     def transpile(self, src: str) -> str:
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
+        self._type_bindings = {}
+        self._type_components = {}
+        self._decl_type_names = {}
+        # Bindings precede their implementations; collect signatures before
+        # emitting dataclass forwarding methods and resolving bound CALLs.
+        self._binding_targets = {}
+        for i, (code, _comment) in enumerate(raw):
+            header = re.search(r"\b(function|subroutine)\s+(\w+)\s*\(([^)]*)\)", code, re.I)
+            if not header or re.match(r"\s*end\b", code, re.I):
+                continue
+            kind, name = header.group(1).lower(), header.group(2).lower()
+            args = [a.strip().lower() for a in split_args(header.group(3)) if a.strip()]
+            body, _end = self._collect_subprogram_body(raw, i + 1, kind)
+            main_lines, _internals = self._split_internal_subprograms(body)
+            outputs, optional = set(), set()
+            for statement, _ in main_lines:
+                declaration = self._parse_decl_line(statement.strip())
+                if not declaration:
+                    continue
+                _ftype, _type_name, attrs, items = declaration
+                for arg, _shape, _init in items:
+                    if re.search(r"intent\s*\(\s*(?:out|inout)\s*\)", attrs):
+                        outputs.add(arg.lower())
+                    if "optional" in attrs:
+                        optional.add(arg.lower())
+            self._binding_targets[name] = {"kind": kind, "args": args,
+                "out": [a for a in args if a in outputs], "optional": optional}
         self.seen_parameter = any(re.search(r"\bparameter\b", code, re.I) for code, _c in raw)
         self._seen_scipy_special = any(
             re.search(r"\b(?:gamma|log_gamma|erf|erfc|bessel_j0|bessel_j1|bessel_jn|bessel_yn)\s*\(", code, re.I)

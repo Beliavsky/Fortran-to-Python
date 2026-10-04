@@ -2,8 +2,9 @@ Language-feature execution survey (2026-10-04)
 =============================================
 
 All 17 new reference programs compile and run with the local gfortran.
-Ten translations match the Fortran output; seven expose translator defects.
-No translator or runtime changes were made for this survey.
+Initially ten translations matched and seven exposed translator defects.
+No translator or runtime changes were made for the initial survey.
+After the type-bound-call fix, eleven match and six remain failing.
 
 Matching cases
 --------------
@@ -17,14 +18,10 @@ do_concurrent            independent single-index array updates
 derived_type_assignment  copying array components without aliasing the original
 derived_type_arguments   derived-type argument and function result
 labeled_format           WRITE with a labeled FORMAT statement
+type_bound_procedure     explicit bindings, PASS/NOPASS, functions, OUT arguments
 
 Confirmed failures (strict xfail in test_xf2p_execution.py)
 --------------------------------------------------------
-type_bound_procedure: WRONG RESULT. Fortran prints 3; Python prints 0.
-  The call to value%increment(3) is omitted from the generated Python;
-  value%value consequently remains zero.
-  Investigate this first: execution succeeds while the answer is wrong.
-
 impure_elemental: UnboundLocalError for module variable calls.
   The translated procedure updates module state without declaring it global.
   This scalar-only test avoids array elemental evaluation-order assumptions;
@@ -69,3 +66,26 @@ Passing these small cases is not a complete language-support guarantee.
 Additional tests should cover multiple concurrent indices, locality clauses,
 absent optional arguments forwarded to other procedures, polymorphism,
 overridden bindings, and impure elemental array calls with well-defined results.
+
+Type-bound-call follow-up (2026-10-04)
+-------------------------------------
+The original counter regression printed 3 in Fortran but 0 in Python: its
+type-bound CALL was omitted. The parser confused a type's CONTAINS with the
+module's CONTAINS, discarded binding declarations, and only accepted simple
+procedure names in CALL statements.
+The fix emits methods forwarding to translated procedures and recognizes
+CLASS(type) dummies. The regression now covers renamed bindings, named PASS
+in a non-first position, NOPASS, optional/keyword arguments, scalar OUT values,
+no-argument CALL without parentheses, bound function expressions, nested
+objects, bound-to-bound calls, and component-array indexing. It is no longer
+an expected failure. Deferred/generic bindings and indexed-object CALLs are
+rejected explicitly; general inheritance/polymorphic dispatch is not claimed.
+The refreshed batch comparison passes:
+  reports\xf2p_batch_20261004_132123_mcdzcb_e\results.txt
+
+A separate pre-existing issue surfaced while constructing the larger case:
+explicit array-component initializers such as integer :: samples(2) = [2,4]
+are ignored by the dataclass emitter, which uses np.empty instead. The bound
+call regression initializes samples explicitly in executable code to isolate
+the binding fix. Array-component initialization still needs its own regression
+and fix; scalar-component initialization is exercised by the counter test.
