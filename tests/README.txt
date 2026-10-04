@@ -259,4 +259,14 @@ are preserved. Tests cover program, subroutine, and module-function contexts,
 host updates, and collisions with generated names.
 BLOCK-local USE, SAVE/initialized nonparameter locals, and derived-type
 definitions currently fail explicitly instead of being flattened incorrectly.
-Named EXIT/CYCLE control flow is a separate, still-open issue.
+
+Named DO control flow
+---------------------
+EXIT/CYCLE resolve construct names case-insensitively. Transfers to the current
+loop use break/continue; transfers across nested loops use a private control
+exception caught by the target iteration. Only that private exception is caught.
+Counted-loop normal termination still updates the DO variable; EXIT preserves
+its current value. Counted DO, DO WHILE, and bare DO are covered, along with
+multi-level transfers, blocks, SELECT CASE, empty loops, descending steps, and
+reusing the translator. Unknown/mismatched construct names are rejected.
+Named DO CONCURRENT remains explicitly unsupported.

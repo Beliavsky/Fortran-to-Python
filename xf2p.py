@@ -3152,6 +3152,39 @@ class basic_f2p:
                     self.emit("pass")
             self.indent = max(0, self.indent - 1)
 
+    def _enter_do_loop(self, entry: dict[str, object], name: str | None) -> None:
+        """Wrap named loop iterations so outer transfers can unwind inner loops."""
+        entry["name"] = name.lower() if name else None
+        if name:
+            if any(isinstance(loop, dict) and loop.get("name") == name.lower()
+                   for loop in self._do_stack):
+                raise ValueError(f"duplicate active DO construct name: {name}")
+            entry["target"] = self._loop_counter
+            self.emit("try:")
+            self.indent += 1
+        self._block_code_start.append(self._code_emit_count)
+        self._do_stack.append(entry)
+
+    def _close_do_loop_body(self, entry: dict[str, object]) -> None:
+        start = self._block_code_start.pop()
+        if self._code_emit_count == start:
+            self.emit("pass")
+        self.indent -= 1
+        if entry.get("name"):
+            control = f"_xf2p_loop_control_{entry['target']}"
+            self.emit(f"except _xf2p_LoopControl as {control}:")
+            self.indent += 1
+            self.emit(f"if {control}.args[0] != {entry['target']}:")
+            self.indent += 1
+            self.emit("raise")
+            self.indent -= 1
+            self.emit(f"if {control}.args[1] == 'cycle':")
+            self.indent += 1
+            self.emit("continue")
+            self.indent -= 1
+            self.emit("break")
+            self.indent -= 2
+
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
         if s in getattr(self, "_lexical_block_entries", {}):
@@ -3192,6 +3225,8 @@ class basic_f2p:
         pdo_concurrent = None
         mm = re.match(r"(?:[a-z_]\w*\s*:\s*)?do\s+concurrent", s, re.I)
         if mm:
+            if re.match(r"[a-z_]\w*\s*:", s, re.I):
+                raise ValueError("named DO CONCURRENT is not yet supported")
             p0 = mm.end()
             while p0 < len(s) and s[p0].isspace():
                 p0 += 1
@@ -3334,20 +3369,28 @@ class basic_f2p:
             return True
 
         # [label:] do while (...)
-        mm = re.match(r"(?:[a-z_]\w*\s*:\s*)?do\s+while\s*\(\s*(.+)\s*\)$", s, re.I)
+        mm = re.match(r"(?:([a-z_]\w*)\s*:\s*)?do\s+while\s*\(\s*(.+)\s*\)$", s, re.I)
         if mm:
-            cond = self.translate_expr(mm.group(1), arrays_1d)
+            cond = self.translate_expr(mm.group(2), arrays_1d)
             self.emit(f"while {cond}:")
             self.indent += 1
-            self._block_code_start.append(self._code_emit_count)
-            self._do_stack.append(1)
+            self._loop_counter += 1
+            self._enter_do_loop({"kind": "while", "levels": 1}, mm.group(1))
+            return True
+
+        mm = re.fullmatch(r"(?:([a-z_]\w*)\s*:\s*)?do", s, re.I)
+        if mm:
+            self.emit("while True:")
+            self.indent += 1
+            self._loop_counter += 1
+            self._enter_do_loop({"kind": "while", "levels": 1}, mm.group(1))
             return True
 
         # [label:] do i = a, b[, step]
-        mm = re.match(r"(?:[a-z_]\w*\s*:\s*)?do\s+([a-z_]\w*)\s*=\s*(.+)$", s, re.I)
+        mm = re.match(r"(?:([a-z_]\w*)\s*:\s*)?do\s+([a-z_]\w*)\s*=\s*(.+)$", s, re.I)
         if mm:
-            var = mm.group(1)
-            rhs = mm.group(2).strip()
+            var = mm.group(2)
+            rhs = mm.group(3).strip()
             parts = split_args(rhs)
             if len(parts) in (2, 3):
                 a = self.translate_expr(parts[0], arrays_1d)
@@ -3368,18 +3411,17 @@ class basic_f2p:
                 self.emit(f"{stop_tmp} = {hi_tmp} + (1 if {step_tmp} > 0 else -1)")
                 self.emit(f"for {var} in range({lo_tmp}, {stop_tmp}, {step_tmp}):")
                 self.indent += 1
-                self._block_code_start.append(self._code_emit_count)
-                self._do_stack.append({"kind": "fortran_do", "levels": 1, "post_assign": f"{var} = {hi_tmp} + {step_tmp}"})
+                self._enter_do_loop({"kind": "fortran_do", "levels": 1,
+                                     "post_assign": f"{var} = {hi_tmp} + {step_tmp}"}, mm.group(1))
                 return True
 
         if re.match(r"end\s+do(?:\s+[a-z_]\w*)?$", s, re.I):
             entry = self._do_stack.pop() if self._do_stack else 1
-            if isinstance(entry, dict) and entry.get("kind") == "fortran_do":
-                if self._block_code_start:
-                    start = self._block_code_start.pop()
-                    if self._code_emit_count == start:
-                        self.emit("pass")
-                self.indent = max(0, self.indent - 1)
+            end_name = re.fullmatch(r"end\s+do\s+([a-z_]\w*)", s, re.I)
+            if end_name and (not isinstance(entry, dict) or entry.get("name") != end_name.group(1).lower()):
+                raise ValueError(f"END DO construct name does not match active loop: {s}")
+            if isinstance(entry, dict) and entry.get("kind") in {"fortran_do", "while"}:
+                self._close_do_loop_body(entry)
                 post_assign = str(entry.get("post_assign", ""))
                 if post_assign:
                     self.emit("else:")
@@ -3759,11 +3801,20 @@ class basic_f2p:
             else:
                 self.emit("return")
             return True
-        if re.match(r"^exit(?:\s+[a-z_]\w*)?$", s, re.I):
-            self.emit("break")
-            return True
-        if re.match(r"^cycle(?:\s+[a-z_]\w*)?$", s, re.I):
-            self.emit("continue")
+        mm = re.fullmatch(r"(exit|cycle)(?:\s+([a-z_]\w*))?", s, re.I)
+        if mm:
+            action, name = mm.group(1).lower(), mm.group(2)
+            if not self._do_stack:
+                raise ValueError(f"{action.upper()} outside a DO loop is not supported")
+            if name:
+                target = next((loop for loop in reversed(self._do_stack)
+                               if isinstance(loop, dict) and loop.get("name") == name.lower()), None)
+                if target is None:
+                    raise ValueError(f"unknown DO construct name in {action.upper()}: {name}")
+                if target is not self._do_stack[-1]:
+                    self.emit(f"raise _xf2p_LoopControl({target['target']}, {action!r})")
+                    return True
+            self.emit("break" if action == "exit" else "continue")
             return True
         mm = re.match(r"(?:error\s+)?stop(?:\s+(.+))?$", s, re.I)
         if mm:
@@ -5195,12 +5246,20 @@ class basic_f2p:
         self._code_emit_count = 0
         self._block_code_start = []
         self._select_case_stack = []
+        self._do_stack = []
+        self._loop_counter = 0
 
         self.emit("import numpy as np")
         self.emit("import numpy.typing as npt")
         self.emit("from dataclasses import dataclass, field")
         self.emit("from types import SimpleNamespace")
         self.emit("from fortran_py_runtime import *")
+        if any(re.match(r"\s*[a-z_]\w*\s*:\s*do\b", code, re.I) for code, _ in raw):
+            self.emit("class _xf2p_LoopControl(Exception):")
+            self.indent += 1
+            self.emit("pass")
+            self.indent -= 1
+            self.emit("")
         if self._seen_scipy_special:
             self.emit("try:")
             self.indent += 1

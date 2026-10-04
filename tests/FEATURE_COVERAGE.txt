@@ -289,3 +289,21 @@ Verification: 131 non-execution tests passed in 71.12 seconds; existing executio
 corpus plus the new block_scope case: 46 passed, 6 expected failures in 325.85
 seconds. The 60 exploratory cases in tests\cases\more were excluded from that
 execution run because their known unsupported features are still under review.
+
+Named DO EXIT/CYCLE follow-up (2026-10-04)
+----------------------------------------
+Named loop transfers resolve their target rather than always breaking/continuing
+the innermost Python loop. Current-loop transfers stay native break/continue;
+outer-loop transfers use a private exception caught by the target iteration.
+Intervening loop termination assignments are skipped during unwinding. Only the
+private control exception is caught; unrelated runtime errors still propagate.
+Counted DO, DO WHILE, bare DO, nested targets, case-insensitive construct names,
+descending steps, empty loops, BLOCK/SELECT CASE, and translator reuse are tested.
+Unknown/mismatched names fail explicitly; named DO CONCURRENT remains unsupported.
+
+The unchanged tests\cases\more\test46_named_loop_cycle_exit.f90 now reports
+MATCH with total 63 (previous translation returned 84). The new named_loop_control
+fixture also matches compiled Fortran, including DO-variable values after normal
+termination, EXIT, and outer CYCLE transfers. Focused checks: 9 passed.
+Established suite: 185 passed, 6 expected failures, 60 exploratory cases excluded,
+in 294.28 seconds. No unexpected failures.
