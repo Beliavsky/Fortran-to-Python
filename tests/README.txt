@@ -305,3 +305,14 @@ The shape_rank fixture checks non-one-based bounds, sections, assumed-shape/rank
 arguments, scalar/empty inquiries, allocation-independent ranks, and RESHAPE
 ORDER. SELECT RANK is not yet supported and is rejected rather than executing
 all branches. This inquiry support does not imply SELECT RANK support.
+
+Elementwise logical expressions
+------------------------------
+tests/test_logical_expressions.py and features/elementwise_logical.f90 cover
+.and., .or., and .not. on scalars and arrays, including mixed scalar/array
+operands, multidimensional and empty arrays, compound comparisons, nested
+function arguments, WHERE masks, and scalar IF conditions. The expression AST
+lowers logical operations to np.logical_and/or/not, preserving comparison and
+AND/OR/NOT precedence. Operator-looking text inside strings is left unchanged.
+Both operands are evaluated; Fortran does not guarantee short-circuit
+evaluation. Generated Python retains idiomatic True/False output.

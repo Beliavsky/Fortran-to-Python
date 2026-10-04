@@ -357,3 +357,17 @@ unchanged. Existing copied runtimes must be refreshed when using new helpers.
 Focused shape/rank/module-state checks: 33 passed. Established suite: 218 passed,
 6 expected failures, 60 exploratory cases excluded, in 260.59 seconds. No
 unexpected failures. The extended shape_rank execution fixture also passes.
+
+Elementwise logical operations (2026-10-04)
+------------------------------------------
+AND/OR/NOT expressions now use NumPy logical calls rather than Python's scalar
+and/or/not. Scalars, arrays, and scalar/array operands retain their logical
+values and compound comparison precedence. The elementwise_logical fixture
+exercises vectors, matrices, reductions, IF conditions, and WHERE masks.
+Unit tests also cover empty/higher-rank arrays, nested calls, case-insensitive
+Fortran operators, and operator-looking text in strings. No short-circuit
+behavior is promised: both operands are evaluated, as Fortran permits.
+Fresh-directory test48_random_number.f90 retry reports Run diff: MATCH.
+Focused logical/component checks: 40 passed, 1 expected failure. Established
+suite: 261 passed, 6 expected failures, 60 exploratory cases excluded, in
+402.29 seconds. No unexpected failures.

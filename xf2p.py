@@ -1985,20 +1985,18 @@ class basic_f2p:
             return f"_xf2p_cmplx({re_py}, {im_py})"
         s = _rewrite_complex_groups(s)
 
-        s = re.sub(r"\.true\.", "True", s, flags=re.I)
-        s = re.sub(r"\.false\.", "False", s, flags=re.I)
-        s = re.sub(r"\.eqv\.", " == ", s, flags=re.I)
-        s = re.sub(r"\.neqv\.", " != ", s, flags=re.I)
-        s = re.sub(r"\.eq\.", " == ", s, flags=re.I)
-        s = re.sub(r"\.ne\.", " != ", s, flags=re.I)
-        s = re.sub(r"\.lt\.", " < ", s, flags=re.I)
-        s = re.sub(r"\.le\.", " <= ", s, flags=re.I)
-        s = re.sub(r"\.gt\.", " > ", s, flags=re.I)
-        s = re.sub(r"\.ge\.", " >= ", s, flags=re.I)
+        # Keep operator-looking text in Python-quoted string literals intact.
+        # AND/OR/NOT first use Python precedence, then the AST pass below lowers
+        # them to elementwise logical calls (including scalar/array operands).
+        operators = {"true": "True", "false": "False", "eqv": " == ",
+                     "neqv": " != ", "eq": " == ", "ne": " != ",
+                     "lt": " < ", "le": " <= ", "gt": " > ", "ge": " >= ",
+                     "and": " and ", "or": " or ", "not": " not "}
+        s = re.sub(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|"
+                   r"\.(true|false|eqv|neqv|eq|ne|lt|le|gt|ge|and|or|not)\.",
+                   lambda m: operators[m.group(1).lower()] if m.group(1) else m.group(),
+                   s, flags=re.I)
         s = s.replace("/=", " != ")
-        s = re.sub(r"\.and\.", " and ", s, flags=re.I)
-        s = re.sub(r"\.or\.", " or ", s, flags=re.I)
-        s = re.sub(r"\.not\.", " not ", s, flags=re.I)
 
         s = re.sub(r"\bsqrt\s*\(", "np.sqrt(", s, flags=re.I)
         s = re.sub(r"\bacos\s*\(", "np.arccos(", s, flags=re.I)
@@ -2567,6 +2565,27 @@ class basic_f2p:
             return None
 
         class _ExprFixer(ast.NodeTransformer):
+            @staticmethod
+            def logical_call(name, operands):
+                return ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()),
+                                       attr=name, ctx=ast.Load()),
+                    args=operands, keywords=[])
+
+            def visit_BoolOp(self, node: ast.BoolOp):
+                self.generic_visit(node)
+                name = "logical_and" if isinstance(node.op, ast.And) else "logical_or"
+                result = node.values[0]
+                for operand in node.values[1:]:
+                    result = self.logical_call(name, [result, operand])
+                return ast.copy_location(result, node)
+
+            def visit_UnaryOp(self, node: ast.UnaryOp):
+                self.generic_visit(node)
+                if isinstance(node.op, ast.Not):
+                    return ast.copy_location(self.logical_call("logical_not", [node.operand]), node)
+                return node
+
             def visit_List(self, node: ast.List):
                 self.generic_visit(node)
                 kind = _expr_kind(node)
@@ -2598,7 +2617,7 @@ class basic_f2p:
                 return node
 
         try:
-            tree = ast.parse(s, mode="eval")
+            tree = ast.parse(s.strip(), mode="eval")
             tree = _ExprFixer().visit(tree)
             ast.fix_missing_locations(tree)
             s = ast.unparse(tree)
