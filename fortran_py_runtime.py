@@ -56,6 +56,9 @@ __all__ = [
     "_f_sinpi",
     "_f_cospi",
     "_f_tanpi",
+    "_f_fraction", "_f_exponent", "_f_scale", "_f_set_exponent",
+    "_f_nearest", "_f_spacing", "_f_rrspacing", "_f_numeric_model",
+    "_f_dim", "_f_sign",
     "spread",
     "huge",
     "tiny",
@@ -279,6 +282,93 @@ def minval(x, dim=None):
     if dim is None:
         return np.min(a)
     return np.min(a, axis=int(dim) - 1)
+
+
+def _f_real_array(x):
+    a = np.asarray(x)
+    if a.dtype.kind != "f":
+        raise TypeError("floating-point intrinsic requires REAL input")
+    return a
+
+
+def _f_fraction(x):
+    return np.frexp(_f_real_array(x))[0]
+
+
+def _f_exponent(x):
+    return np.frexp(_f_real_array(x))[1]
+
+
+def _f_scale(x, i):
+    return np.ldexp(_f_real_array(x), np.asarray(i))
+
+
+def _f_set_exponent(x, i):
+    return np.ldexp(_f_fraction(x), np.asarray(i))
+
+
+def _f_nearest(x, s):
+    a = _f_real_array(x)
+    direction = _f_real_array(s)
+    if np.any(direction == 0):
+        raise ValueError("NEAREST direction must be nonzero")
+    toward = np.where(direction > 0, np.inf, -np.inf).astype(a.dtype)
+    return np.nextafter(a, toward)
+
+
+def _f_spacing(x):
+    a = _f_real_array(x)
+    info = np.finfo(a.dtype)
+    # Fortran SPACING uses model numbers, not the subnormal lattice.
+    distance = np.maximum(np.ldexp(np.ones_like(a), _f_exponent(a) - info.nmant - 1), info.tiny)
+    return np.where(a == 0, info.tiny, distance)
+
+
+def _f_rrspacing(x):
+    a = _f_real_array(x)
+    return np.ldexp(np.abs(_f_fraction(a)), np.finfo(a.dtype).nmant + 1)
+
+
+def _f_numeric_model(x, inquiry):
+    dtype = np.asarray(x).dtype
+    if dtype.kind in "iu":
+        info = np.iinfo(dtype)
+        if inquiry == "huge":
+            return info.max
+        if inquiry == "digits":
+            return info.bits - (dtype.kind == "i")
+        if inquiry == "range":
+            return int(math.floor(math.log10(info.max)))
+        if inquiry == "radix":
+            return 2
+        raise TypeError(f"{inquiry.upper()} requires REAL or COMPLEX input")
+    if dtype.kind not in "fc":
+        raise TypeError("numeric model inquiry requires numeric input")
+    info = np.finfo(dtype)
+    if inquiry == "tiny":
+        return info.tiny
+    if inquiry == "huge":
+        return info.max
+    if inquiry == "digits":
+        return info.nmant + 1
+    if inquiry == "precision":
+        return info.precision
+    if inquiry == "range":
+        return int(math.floor(min(math.log10(info.max), -math.log10(info.tiny))))
+    if inquiry == "radix":
+        return 2
+    raise ValueError(f"unknown model inquiry: {inquiry}")
+
+
+def _f_dim(x, y):
+    return np.maximum(np.asarray(x) - np.asarray(y), 0)
+
+
+def _f_sign(a, b):
+    a, b = np.broadcast_arrays(np.asarray(a), np.asarray(b))
+    if a.dtype.kind in "iu":
+        return np.where(b < 0, -np.abs(a), np.abs(a))
+    return np.copysign(np.abs(a), b)
 
 
 def _f_epsilon(x):

@@ -2024,8 +2024,6 @@ class basic_f2p:
         s = re.sub(r"\bpresent\s*\(\s*([a-z_]\w*)\s*\)", r"(\1 is not None)", s, flags=re.I)
         s = re.sub(r"\bassociated\s*\(\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\)", r"(\1 is not None)", s, flags=re.I)
         s = re.sub(r"\bnull\s*\(\s*\)", "None", s, flags=re.I)
-        s = re.sub(r"\btiny\s*\(\s*[^)]*\)", "np.finfo(float).tiny", s, flags=re.I)
-        s = re.sub(r"\bhuge\s*\(\s*[^)]*\)", "np.finfo(float).max", s, flags=re.I)
         s = s.replace("np.np.", "np.")
         s = re.sub(r"(?i)\.re\b", ".real", s)
         s = re.sub(r"(?i)\.im\b", ".imag", s)
@@ -2094,6 +2092,11 @@ class basic_f2p:
                 "log_gamma",
                 "log10",
                 "tan",
+                "asin", "atan", "atan2",
+                "fraction", "exponent", "scale", "set_exponent",
+                "nearest", "spacing", "rrspacing",
+                "tiny", "huge", "digits", "precision", "range", "radix",
+                "dim", "sign",
                 "erf",
                 "erfc",
                 "erfc_scaled",
@@ -2277,6 +2280,16 @@ class basic_f2p:
                 return f"np.log10({args_py[0]})"
             if lname == "tan" and len(args_py) == 1:
                 return f"np.tan({args_py[0]})"
+            if lname in {"asin", "atan"} and len(args_py) == 1:
+                return f"np.arc{lname[1:]}({args_py[0]})"
+            if lname in {"atan", "atan2"} and len(args_py) == 2:
+                return f"np.arctan2({', '.join(args_py)})"
+            if lname in {"fraction", "exponent", "spacing", "rrspacing"} and len(args_py) == 1:
+                return f"_f_{lname}({args_py[0]})"
+            if lname in {"scale", "set_exponent", "nearest", "dim", "sign"} and len(args_py) == 2:
+                return f"_f_{lname}({', '.join(args_py)})"
+            if lname in {"tiny", "huge", "digits", "precision", "range", "radix"} and len(args_py) == 1:
+                return f"_f_numeric_model({args_py[0]}, '{lname}')"
             if lname == "erf" and len(args_py) == 1:
                 return f"sps.erf({args_py[0]})"
             if lname == "erfc" and len(args_py) == 1:

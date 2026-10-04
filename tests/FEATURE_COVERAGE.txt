@@ -16,6 +16,8 @@ matching and six known failures.
 Host association and LOG10 bring the feature corpus to 23 programs, with 18
 matching and five known failures (impure_elemental now passes).
 TAN brings this to 24 feature programs, with 19 matching and five known failures.
+The modern-math and floating-point cases bring this to 26 feature programs,
+with 21 matching and five known failures.
 
 Matching cases
 --------------
@@ -37,6 +39,8 @@ math_intrinsics          73 mathematical checks, including SciPy special functio
 host_association         internal host updates, module state, shadowing, arrays
 log10_values             scalar and elemental base-ten logarithms
 tan_values               scalar and elemental tangent; preserved printed labels
+modern_math_intrinsics   complete xintrinsics.f90 numerical/label comparison
+floating_intrinsics      decomposition, scaling, neighbors, model inquiries, arrays
 impure_elemental         scalar calls updating module state (not general array order)
 
 Confirmed failures (strict xfail in test_xf2p_execution.py)
@@ -226,3 +230,22 @@ The user's unchanged xtan.f90 passes --run-both. The tan_values comparison
 covers positive/negative real inputs, scalar and array calls, and unchanged
 quoted labels. Focused math/TAN/LOG10 tests: 9 passed in 10.02 seconds.
 The full suite was not rerun for this small mapping addition.
+
+Modern-math/floating-point follow-up (2026-10-04)
+------------------------------------------------
+The unchanged xintrinsics.f90 now executes and matches Fortran's numerical
+output. Added ASIN, one/two-argument ATAN, ATAN2, FRACTION, EXPONENT, SCALE,
+SET_EXPONENT, NEAREST, SPACING, RRSPACING, numeric model inquiries, DIM, and
+SIGN. TINY/HUGE use the inquiry parser instead of the earlier blanket float64
+expression rewrite. Labels and Fortran integer inquiry results are compared
+alongside real values; the full program is retained as modern_math_intrinsics.
+
+floating_intrinsics adds elemental arrays, negative inputs, zero, subnormal
+neighbors, half-ULP downward steps at one, and exact indicator comparisons.
+Runtime unit tests cover binary32/binary64, integer model inquiries, invalid
+zero NEAREST direction, and signed-zero SIGN behavior. General source-kind
+fidelity and processor-dependent nonfinite results remain outside this fix.
+Fresh batch comparisons both match:
+  reports\xf2p_batch_20261004_155648_fx3omssi\results.txt
+Focused tests: 7 passed. Full suite: 148 passed, 6 strict expected failures
+in 241.10 seconds.

@@ -9,18 +9,19 @@ Run from the repository root:
 Requirements: Python, NumPy, pytest, and gfortran on PATH. Execution tests
 skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 SciPy is optional for the translator/runtime and ordinary translated programs;
-special-function programs require it. The math_intrinsics execution comparison
+special-function programs require it. The math_intrinsics and
+modern_math_intrinsics execution comparisons
 and SciPy-specific unit test skip explicitly when SciPy is unavailable.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
-Corpus (46 programs)
+Corpus (48 programs)
 --------------------
 handwritten/: 18 small deterministic programs exercising scalars, loops,
 branches, SELECT CASE, arrays, masks, matrices, procedures, modules, strings,
 allocation, and formatted file I/O.
 
-features/: 24 focused programs covering OPTIONAL/PRESENT, keyword calls,
+features/: 26 focused programs covering OPTIONAL/PRESENT, keyword calls,
 explicit SAVE, EXIT, EQV/NEQV, elemental and impure elemental procedures,
 DO CONCURRENT, derived-type assignment/arguments/results, type extension,
 type-bound procedures, labeled FORMAT, selected-kind intrinsics, and a
@@ -35,6 +36,9 @@ metadata, functions, and local-variable shadowing. log10_values tests scalar
 and elemental LOG10 without needing SciPy.
 tan_values tests scalar and elemental TAN, positive/negative arguments,
 and preservation of mathematical names inside printed labels, using NumPy.
+modern_math_intrinsics preserves the user's xintrinsics.f90 and compares all
+printed mathematical results. floating_intrinsics adds arrays, signed inputs,
+zero/subnormal neighbors, model spacing, and two-argument ATAN checks.
 math_intrinsics preserves the user's xintrinsics_all.f90 checker counters
 and internal procedures, exercising all 73 original checks. Its
 Fortran reference uses -O3: the local MinGW compiler/library combination lacks
@@ -212,3 +216,18 @@ general evaluation order for side-effecting elemental array calls.
 The original xintrinsics_all.f90 needs no counter-argument workaround anymore.
 LOG10 maps to NumPy for scalars and arrays and does not add a SciPy dependency;
 mathematical names inside printed string labels are preserved.
+
+Floating-point decomposition and model inquiries
+------------------------------------------------
+FRACTION/EXPONENT and SCALE/SET_EXPONENT use binary decomposition and scaling.
+NEAREST returns the adjacent representable value in the requested direction;
+zero direction is rejected. SPACING is positive and clamped to TINY for zero
+and subnormal inputs, rather than blindly using NumPy's spacing. RRSPACING
+uses ABS(FRACTION(x))*2**DIGITS(x). Numeric model inquiries use the translated
+dtype. Runtime tests cover binary32/binary64; general Fortran kind fidelity
+remains the existing limitation described above. Nonfinite inputs whose
+Fortran result is processor-dependent are not assigned a compatibility guarantee.
+References:
+  https://gcc.gnu.org/onlinedocs/gfortran/SPACING.html
+  https://gcc.gnu.org/onlinedocs/gfortran/RRSPACING.html
+  https://numpy.org/doc/stable/reference/generated/numpy.finfo.html
