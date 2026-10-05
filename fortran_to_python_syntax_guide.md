@@ -355,8 +355,16 @@ Fortran `value%component` becomes Python attribute access, `value.component`.
 Derived types may be represented by generated dataclasses. Intrinsic
 derived-type assignment must copy value components appropriately; assigning
 the same Python object to two names is not generally equivalent. Pointer
-components have distinct association semantics, and type extension and
-polymorphism are not generally supported.
+components have distinct association semantics.
+
+For supported `TYPE, EXTENDS(base)` declarations, the generated dataclass
+contains one parent object. Inherited-component properties forward to it, so
+`value%id` and `value%base%id` refer to the same storage, not independent copies.
+Assigning/copying the parent component excludes extension fields. Multi-level
+extension, parent-value and inherited-component constructors, and explicit
+inherited/overridden procedure bindings have focused tests. This does not add
+general polymorphic allocation or `SELECT TYPE`, parameterized derived types,
+deferred/generic bindings, or finalization support.
 
 Fixed-length Fortran character assignment pads with spaces or truncates:
 

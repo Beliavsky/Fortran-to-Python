@@ -146,6 +146,11 @@ and logical list-directed input and scalar character `'(a)'` input, with
 Fortran I/O implementation; other input formats, direct/unformatted access,
 and advanced list-directed input syntax remain unsupported.
 
+Supported derived-type extension keeps inherited fields and the explicit
+parent component in one storage object. Multi-level access, value copies,
+structure constructors and explicit inherited/overridden bindings have tests;
+this is not general polymorphism support.
+
 Support is incomplete and varies by construct and context. In particular:
 
 - Numeric kinds are not fully preserved; default Fortran real arithmetic may

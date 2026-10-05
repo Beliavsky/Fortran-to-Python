@@ -197,6 +197,7 @@ __all__ = [
     "_f_array_indices",
     "_f_elemental_subroutine",
     "_f_component_array", "_f_assign_component_array",
+    "_f_extended_type",
     "_f_product", "_f_unpack", "_f_cshift", "_f_eoshift", "_f_is_contiguous",
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
@@ -721,6 +722,57 @@ def pack(array, mask, vector=None):
         import copy
         selected = copy.deepcopy(selected)
     return selected
+
+
+def _f_extended_type(parent_name, parent_type, bindings=()):
+    """Keep inherited components and the explicit parent in one storage object."""
+    from dataclasses import fields
+    import copy
+
+    def decorate(cls):
+        inherited = tuple(dict.fromkeys(
+            [f.name for f in fields(parent_type)]
+            + list(getattr(parent_type, '_f_inherited_components', ()))))
+        own = tuple(f.name for f in fields(cls) if f.name != parent_name)
+        flat = tuple(getattr(parent_type, '_f_constructor_components',
+                             tuple(f.name for f in fields(parent_type)))) + own
+        cls._f_inherited_components = inherited
+        cls._f_constructor_components = flat
+        for name in inherited:
+            def get(self, name=name):
+                return getattr(getattr(self, parent_name), name)
+            def set_value(self, value, name=name):
+                setattr(getattr(self, parent_name), name, value)
+            setattr(cls, name, property(get, set_value))
+        for name in bindings:
+            if name not in cls.__dict__:
+                def forward(self, *args, _name=name, **kwargs):
+                    return getattr(parent_type, _name)(self, *args, **kwargs)
+                setattr(cls, name, forward)
+        original_init = cls.__init__
+
+        def initialize(self, *args, **kwargs):
+            # Fortran constructors accept a parent value or inherited components.
+            if args and not isinstance(args[0], parent_type):
+                if len(args) > len(flat):
+                    raise TypeError('too many extended-type constructor arguments')
+                positional = dict(zip(flat, args))
+                if positional.keys() & kwargs.keys():
+                    raise TypeError('duplicate extended-type constructor component')
+                kwargs = {**positional, **kwargs}
+                args = ()
+            inherited_values = {name: kwargs.pop(name) for name in inherited if name in kwargs}
+            if inherited_values:
+                if args or parent_name in kwargs:
+                    raise TypeError('cannot specify both parent and inherited components')
+                kwargs[parent_name] = parent_type(**inherited_values)
+            original_init(self, *args, **kwargs)
+            # Structure construction copies a parent value, not a reference to it.
+            setattr(self, parent_name, copy.deepcopy(getattr(self, parent_name)))
+
+        cls.__init__ = initialize
+        return cls
+    return decorate
 
 
 def _f_component_array(obj, path, dtype=None):

@@ -1813,10 +1813,26 @@ class basic_f2p:
         components = self._type_components.setdefault(tname.lower(), {})
         component_specs = self._component_specs.setdefault(tname.lower(), {})
 
+        extension = re.search(r'\bextends\s*\(\s*([a-z_]\w*)\s*\)', h, re.I)
+        parent = extension.group(1).lower() if extension else None
+        if parent:
+            if parent not in self._component_specs or parent == tname.lower():
+                raise ValueError(f'no translated parent type for {tname}: {parent}')
+            bindings.update(self._type_bindings.get(parent, {}))
+            components.update(self._type_components.get(parent, {}))
+            component_specs.update(self._component_specs[parent])
+            components[parent] = parent
+            component_specs[parent] = {'ftype': 'type', 'shape': None,
+                                      'type_name': parent, 'attrs_l': '', 'char_len': None}
+            parent_class = next(name for name in self._derived_types if name.lower() == parent)
+            self.emit(f'@_f_extended_type({parent!r}, {parent_class}, bindings={tuple(bindings)!r})')
+
         self.emit("@dataclass")
         self.emit(f"class {tname}:")
         self.indent += 1
-        had_field = False
+        had_field = bool(parent)
+        if parent:
+            self.emit(f'{parent}: {parent_class} = field(default_factory={parent_class})')
         in_bindings = False
         for code, comment in body_lines:
             s = code.strip()
@@ -1882,6 +1898,8 @@ class basic_f2p:
                 items = parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(td.group(2).strip()))
                 type_name = td.group(1)
             for name, shape, init in items:
+                if parent and name.lower() in component_specs:
+                    raise ValueError(f'component {tname}%{name} conflicts with inherited component')
                 component_specs[name.lower()] = {"ftype": ftype, "shape": shape,
                     "type_name": type_name.lower() if type_name else None,
                     "attrs_l": attrs_l,
@@ -5850,6 +5868,7 @@ class basic_f2p:
         self._data_handled_count = 0
         raw = self._lower_lexical_blocks(raw)
         self._type_bindings = {}
+        self._derived_types = set()
         self._type_components = {}
         self._component_specs = {}
         self._allocation_counter = 0

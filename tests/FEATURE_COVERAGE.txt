@@ -465,3 +465,17 @@ The three established kind-selection fixtures are no longer expected failures.
 selected_kinds.f90 adds boundary, declaration, array, and model-inquiry checks;
 tests/test_selected_kinds.py also covers negative requests, unsupported radix,
 extended requests, malformed calls, and nested expressions.
+
+Derived-type extension (2026-10-05)
+---------------------------------
+Extended dataclasses contain a parent value with forwarding properties for
+inherited components, preserving aliases such as x%id and x%base%id without
+duplicate fields. Parent/child value copies remain independent; the parent
+component excludes extension-only fields. Metadata follows inherited fields
+and explicit parent paths, including array component projections and nested
+extension. Structure constructors accept parent values or inherited fields.
+Inherited bindings retain the child receiver for overrides; explicit parent
+binding calls use the parent receiver. Unknown parents/redeclared fields are
+diagnosed. type_extension is no longer an expected failure.
+General polymorphism, parameterized derived types, deferred/generic bindings,
+and finalization remain outside this change.

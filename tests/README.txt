@@ -104,7 +104,6 @@ I/O cannot accidentally reuse files produced by the reference execution.
 Known failures
 --------------
 execute_command_line: missing EXECUTE_COMMAND_LINE helper.
-type_extension: missing parent component of an extended type.
 
 These cases are strict expected failures, not skipped. Their Fortran
 references must still compile and execute successfully. Unexpected success
@@ -177,7 +176,8 @@ CONTAINS. The expanded type_bound_procedure case checks nested objects and
 calls from one bound procedure to another as well as ordinary component-array
 indexing. Unsupported/unresolved CALL statements fail explicitly rather than
 being silently discarded. Deferred/generic bindings and indexed-object calls
-are not yet supported by this implementation; type extension remains failing.
+are not yet supported by this implementation. Parent components are covered by
+the later type-extension fix below.
 
 Also fixed on 2026-10-04: explicit-shape array-component initialization in
 derived types. Factories preserve initial values, shape, element type, scalar
@@ -453,6 +453,20 @@ with native Fortran. These three cases are no longer expected failures.
 Selection uses the translator's byte-kind convention: INTEGER/LOGICAL 1,2,4,8
 and IEEE REAL 4,8. It is not a query of the installed compiler's extended kinds,
 nor does it add exact kind-dependent arithmetic/storage emulation.
+
+Derived-type extension
+----------------------
+tests/test_type_extension.py, features/type_extension.f90,
+features/type_extension_components.f90 and features/type_extension_bindings.f90
+cover inherited component access and explicit parent-component aliases, scalar
+and array components, multi-level extension, independent assignment copies,
+parent replacement, structure constructors, component-array projection, and
+inherited/overridden procedure bindings. The parent is one contained object;
+forwarding properties avoid duplicate storage. A parent-component copy has the
+parent type and excludes extension fields. Unknown parents and redeclared
+inherited fields are diagnosed. type_extension is no longer an expected failure.
+This does not add general SELECT TYPE/polymorphic allocation, parameterized
+derived types, deferred/generic bindings or finalization support.
 
 Integer enumerators
 -------------------
