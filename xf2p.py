@@ -350,6 +350,34 @@ def reject_defined_operations(lines: list[tuple[str, str]]) -> None:
         raise ValueError(f"{description} is not yet supported: {kind.upper()}({symbol}){detail}")
 
 
+def reject_goto_statements(lines: list[tuple[str, str]]) -> None:
+    """Reject control transfers before unsupported statements can be discarded."""
+    for code, _comment in lines:
+        for statement in split_top_level(code, ";"):
+            statement = re.sub(r"^\s*\d+\s+", "", statement).strip()
+            action = statement
+            conditional = re.match(r"if\s*\(", action, re.I)
+            if conditional:
+                close = find_matching_paren(action, conditional.end() - 1)
+                if close < 0:
+                    continue
+                action = action[close + 1:].strip()
+            jump = re.match(r"go\s*to(?=\s|\(|\d|$)", action, re.I)
+            if jump is None:
+                continue
+            target = action[jump.end():].strip()
+            # Fortran keywords are not reserved: GOTO can name a variable.
+            if target.startswith("=") or re.match(r"[a-z_]\w*\s*=", action, re.I):
+                continue
+            if target.startswith("("):
+                close = find_matching_paren(target, 0)
+                if close >= 0 and target[close + 1:].lstrip().startswith("="):
+                    continue
+            raise ValueError(
+                f"GOTO control flow is not yet supported; rewrite using structured "
+                f"IF/DO, EXIT or CYCLE: {statement}")
+
+
 def find_matching_paren(text: str, open_pos: int) -> int:
     depth = 0
     in_str = False
@@ -5523,6 +5551,7 @@ class basic_f2p:
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
         reject_defined_operations(raw)
+        reject_goto_statements(raw)
         raw = self._lower_lexical_blocks(raw)
         self._type_bindings = {}
         self._type_components = {}
