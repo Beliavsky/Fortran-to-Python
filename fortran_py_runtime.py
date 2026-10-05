@@ -33,6 +33,7 @@ def _reshape_with_pad(a, newshape, order="C", pad=None):
 np.reshape = _reshape_with_pad
 
 __all__ = [
+    "_f_elemental_subroutine",
     "_f_component_array", "_f_assign_component_array",
     "_f_product", "_f_unpack", "_f_cshift", "_f_eoshift", "_f_is_contiguous",
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
@@ -84,6 +85,41 @@ __all__ = [
     "r_matmul",
     "matmul",
 ]
+
+
+def _f_elemental_subroutine(function, arguments, output_indices, output_dtypes, pure_output_indices=()):
+    """Call a scalar elemental subroutine once per element, then copy back outputs.
+
+    Input scalars expand over the common array shape; arrays must conform.
+    Calls are performed in Fortran array element order.
+    """
+    arrays = [np.asarray(arg) if isinstance(arg, (list, tuple, np.ndarray)) else None
+              for arg in arguments]
+    shape = next(a.shape for a in arrays if a is not None)
+    if any(a is not None and a.shape != shape for a in arrays):
+        raise ValueError("elemental subroutine array arguments must be conformable")
+    if any(arrays[i] is None for i in output_indices):
+        raise ValueError("elemental subroutine outputs must be arrays for an array call")
+    results = [np.empty(shape, dtype=dtype) for dtype in output_dtypes]
+    for flat_index in range(int(np.prod(shape))):
+        index = np.unravel_index(flat_index, shape, order='F')
+        scalar_args = [None if i in pure_output_indices else
+                       (arrays[i][index] if arrays[i] is not None else arg)
+                       for i, arg in enumerate(arguments)]
+        returned = function(*scalar_args)
+        values = (returned,) if len(results) == 1 else returned
+        for result, value in zip(results, values if results else ()):
+            if result.dtype == object:
+                import copy
+                value = copy.deepcopy(value)
+            result[index] = value
+    # Retain ndarray identities and views, including strided actual arguments.
+    for result_index, (position, result) in enumerate(zip(output_indices, results)):
+        if isinstance(arguments[position], np.ndarray):
+            arguments[position][...] = result
+            result = arguments[position]
+        results[result_index] = result
+    return results[0] if len(results) == 1 else tuple(results) if results else None
 
 
 def _f_str_assign(value, length):

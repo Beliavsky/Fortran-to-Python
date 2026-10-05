@@ -169,7 +169,7 @@ def _parse_file_interface(src: str) -> tuple[list[str], list[str], list[UseSpec]
 
         # function declarations
         mf = re.match(
-            r"^(?!\s*end\s+function\b)\s*(?:(?:pure|elemental|recursive)\s+)*(?:\w+(?:\s*\([^)]*\))?\s+)*function\s+([a-z_]\w*)\s*\(",
+            r"^(?!\s*end\s+function\b)\s*(?:(?:pure|impure|elemental|recursive)\s+)*(?:\w+(?:\s*\([^)]*\))?\s+)*function\s+([a-z_]\w*)\s*\(",
             sl,
             re.I,
         )
@@ -179,7 +179,7 @@ def _parse_file_interface(src: str) -> tuple[list[str], list[str], list[UseSpec]
 
         # subroutine declarations
         ms = re.match(
-            r"^(?!\s*end\s+subroutine\b)\s*(?:(?:pure|elemental|recursive)\s+)*subroutine\s+([a-z_]\w*)\s*\(",
+            r"^(?!\s*end\s+subroutine\b)\s*(?:(?:pure|impure|elemental|recursive)\s+)*subroutine\s+([a-z_]\w*)\s*\(",
             sl,
             re.I,
         )
@@ -320,6 +320,34 @@ def collapse_fortran_continuations(raw_lines: list[tuple[str, str]]) -> list[tup
         out.append((cur_code, cur_comment))
         i += 1
     return out
+
+
+def reject_defined_operations(lines: list[tuple[str, str]]) -> None:
+    """Reject declarations whose dispatch/assignment semantics we cannot preserve."""
+    for index, (code, _comment) in enumerate(lines):
+        declaration = re.match(r"^\s*interface\s+(operator|assignment)\s*\(\s*([^)]*?)\s*\)", code, re.I)
+        binding = re.match(r"^\s*generic\b[^:]*::\s*(operator|assignment)\s*\(\s*([^)]*?)\s*\)\s*=>\s*(.*)$", code, re.I)
+        match = declaration or binding
+        if match is None:
+            continue
+        kind, symbol = match.group(1).lower(), match.group(2).strip()
+        procedures = []
+        if binding:
+            procedures = split_args(binding.group(3))
+        else:
+            for body, _ in lines[index + 1:]:
+                if re.match(r"^\s*end\s*interface\b", body, re.I):
+                    break
+                named = re.match(r"^\s*(?:module\s+)?procedure\b\s*(?:::)?\s*(.+)$", body, re.I)
+                if named:
+                    procedures.extend(split_args(named.group(1)))
+                elif not re.match(r"^\s*end\b", body, re.I):
+                    header = re.search(r"\b(?:function|subroutine)\s+(\w+)\s*\(", body, re.I)
+                    if header:
+                        procedures.append(header.group(1))
+        detail = f"; procedure(s): {', '.join(procedures)}" if procedures else ""
+        description = "operator overloading" if kind == "operator" else "defined assignment"
+        raise ValueError(f"{description} is not yet supported: {kind.upper()}({symbol}){detail}")
 
 
 def find_matching_paren(text: str, open_pos: int) -> int:
@@ -1442,10 +1470,10 @@ class basic_f2p:
 
 
     def _is_function_header(self, s: str) -> bool:
-        return bool(re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure|elemental|recursive)\s+)*(?:\w+(?:\s*\([^)]*\))?\s+)*function\b", s, re.I))
+        return bool(re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure|impure|elemental|recursive)\s+)*(?:\w+(?:\s*\([^)]*\))?\s+)*function\b", s, re.I))
 
     def _is_subroutine_header(self, s: str) -> bool:
-        return bool(re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:(?:pure|elemental|recursive)\s+)*subroutine\b", s, re.I))
+        return bool(re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:(?:pure|impure|elemental|recursive)\s+)*subroutine\b", s, re.I))
 
     def _is_elemental_header(self, s: str) -> bool:
         return bool(re.search(r"\belemental\b", s, re.I))
@@ -5232,7 +5260,7 @@ class basic_f2p:
     def transpile_subroutine(self, header: str, body_lines: list[tuple[str, str]]) -> None:
         hdr = header.strip()
         is_elemental = self._is_elemental_header(hdr)
-        m = re.match(r"(?:(?:pure|elemental|recursive)\s+)*subroutine\s+(\w+)\s*\(\s*([^\)]*)\s*\)", hdr, re.I)
+        m = re.match(r"(?:(?:pure|impure|elemental|recursive)\s+)*subroutine\s+(\w+)\s*\(\s*([^\)]*)\s*\)", hdr, re.I)
         if not m:
             return
         sname = m.group(1)
@@ -5299,21 +5327,17 @@ class basic_f2p:
                 args_annot.append(f"{a}: {hint}")
         out_formals: list[str] = []
         pure_out_formals: list[str] = []
-        vector_formals: list[str] = []
         out_otypes: list[str] = []
         for a in args:
             info = sym.get(a)
             if not info:
-                vector_formals.append(a)
                 continue
-            attrs_l = info.get("attrs_l", "")
+            attrs_l = re.sub(r"\s+", "", info.get("attrs_l", ""))
             if "intent(out" in attrs_l or "intent(inout" in attrs_l:
                 out_formals.append(a)
                 out_otypes.append(self._scalar_otype_expr(cast(str, info.get("ftype")), cast(str | None, info.get("type_name"))))
             if "intent(out" in attrs_l and "intent(inout" not in attrs_l:
                 pure_out_formals.append(a)
-            else:
-                vector_formals.append(a)
         arg_specs = []
         for a in args:
             info = sym.get(a)
@@ -5354,21 +5378,13 @@ class basic_f2p:
             else:
                 self.transpile_subroutine(header, ibody)
 
-        if is_elemental and out_formals and vector_formals:
-            _xf2p_elem_guard = " or ".join(f"_xf2p_is_arraylike({a})" for a in vector_formals)
-            _xf2p_lambda_args = [f"_xf2p_{a}" for a in vector_formals]
-            _xf2p_call_args: list[str] = []
-            for _xf2p_a in args:
-                if _xf2p_a in pure_out_formals:
-                    _xf2p_call_args.append("None")
-                elif _xf2p_a in vector_formals:
-                    _xf2p_call_args.append(f"_xf2p_{_xf2p_a}")
-                else:
-                    _xf2p_call_args.append(_xf2p_a)
+        if is_elemental and args:
+            _xf2p_elem_guard = " or ".join(f"_xf2p_is_arraylike({a})" for a in args)
             self.emit(f"if {_xf2p_elem_guard}:")
             self.indent += 1
-            self.emit(f"_xf2p_vec = np.vectorize(lambda {', '.join(_xf2p_lambda_args)}: {sname}({', '.join(_xf2p_call_args)}), otypes=[{', '.join(out_otypes)}])")
-            self.emit(f"return _xf2p_vec({', '.join(vector_formals)})")
+            output_indices = [args.index(a) for a in out_formals]
+            pure_output_indices = [args.index(a) for a in pure_out_formals]
+            self.emit(f"return _f_elemental_subroutine({sname}, [{', '.join(args)}], {output_indices!r}, [{', '.join(out_otypes)}], {pure_output_indices!r})")
             self.indent -= 1
 
         parameter_names: set[str] = set()
@@ -5506,6 +5522,7 @@ class basic_f2p:
         self._module_storage_owners: dict[str, str] = {}
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
+        reject_defined_operations(raw)
         raw = self._lower_lexical_blocks(raw)
         self._type_bindings = {}
         self._type_components = {}

@@ -368,3 +368,24 @@ Fixed-length strings retain their padding/truncation rules. Deferred-length
 character array and pointer assignments are not supported; the covered named
 forms are rejected with a clear diagnostic. Explicit deferred-length ALLOCATE
 and character substring assignment are not covered by this feature.
+
+Impure elemental subroutines
+---------------------------
+tests/test_elemental_subroutines.py and features/impure_elemental_subroutines.f90
+cover IMPURE/ELEMENTAL subroutine recognition, input-only side effects, scalar
+input expansion, INTENT(OUT)/INTENT(INOUT) values, output-only calls, multiple
+outputs, keyword arguments, matrices in Fortran element order, empty arrays,
+and strided actuals. The runtime calls the scalar routine once per element and
+copies outputs back into the original ndarray/view. Conformability is required;
+NumPy's general broadcasting is not substituted for Fortran argument rules.
+Refresh adjacent runtime copies when running newly generated translations.
+
+Defined operation diagnostics
+----------------------------
+tests/test_defined_operations_diagnostics.py checks translation-time rejection
+of INTERFACE OPERATOR(...) and INTERFACE ASSIGNMENT(=), including named operators,
+continuations, explicit procedure interfaces, and type-bound GENERIC bindings.
+Messages identify the operation and available procedure names. Declarations are
+rejected even if unused; overload resolution is not implemented. CLI checks
+verify a nonzero exit and no generated Python rather than a later runtime error.
+Intrinsic operations and ordinary named generic interfaces remain supported.

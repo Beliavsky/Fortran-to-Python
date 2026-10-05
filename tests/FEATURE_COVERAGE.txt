@@ -434,3 +434,22 @@ saved locals, and deallocation/reassignment. Unit tests exercise BLOCK locals,
 function results, and rejection of unsupported named deferred-length array and
 pointer assignments. This does not add explicit deferred-length ALLOCATE or
 substring assignment support.
+
+Impure elemental subroutines (2026-10-04)
+---------------------------------------
+Added IMPURE to subroutine-header recognition and replaced output-dependent
+vectorization with explicit scalar calls in Fortran array element order. Input-
+only side effects and output-only calls now work; empty arrays perform no calls.
+Outputs copy back into the original arrays/views, preserving strided updates.
+test47_pure_impure executes with matching outputs. ximpure.f90 prints one line
+per input and reports MATCH with --rtol 1e-6; its default-REAL square roots differ
+slightly from Python's double-precision arithmetic. This fix does not change
+the project's existing floating-point kind fidelity limitations.
+
+Defined operation diagnostics (2026-10-04)
+----------------------------------------
+test11_operator and test36_defined_assignment now stop at translation with
+operator-overloading/defined-assignment diagnostics naming their implementation
+procedures. Named operators and type-bound GENERIC operator/assignment bindings
+are also rejected; intrinsic operations and ordinary named interfaces are not.
+This is an explicit limitation diagnostic, not overload-resolution support.
