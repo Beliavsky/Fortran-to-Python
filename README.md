@@ -175,9 +175,3 @@ operations. It is an optional preparation tool, not a required translation step
 or a general optimizer. Its supporting scanner and transformation scripts are
 included in this repository. Run `python xarray.py --help` for its options.
 
-## Safety
-
-These are local development tools, not a sandbox. Running either original
-Fortran or translated Python executes code with your permissions. Use trusted
-input, inspect generated code, and validate numerical results before relying
-on a translation. Batch timeouts are not a security boundary.
