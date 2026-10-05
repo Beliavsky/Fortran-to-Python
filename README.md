@@ -12,6 +12,10 @@ It is not a complete Fortran implementation. Review and test every translation;
 successful translation or execution alone does not establish correctness.
 Loop-heavy translations may be substantially slower than compiled Fortran.
 
+See the [Fortran-to-Python syntax guide](fortran_to_python_syntax_guide.md)
+for side-by-side examples, array indexing and memory-order differences,
+procedure calling conventions, runtime helpers, and translation caveats.
+
 ## Requirements
 
 - Python (development and testing currently use Python 3.13).
@@ -110,6 +114,10 @@ Each run creates an isolated directory under `reports/` containing `results.txt`
 stage timings, start/end times, and outcome counts. `--verbose` also displays
 successful execution output. Use `--data` for required input files; they are
 not copied automatically. See [the batch guide](BATCH_README.txt).
+
+Use `--failures-only` to suppress successful case details while retaining progress,
+warnings, library-only skips, and the final summary. With `--verbose`, full stage
+output is displayed only for cases needing attention. Saved reports remain complete.
 
 ## Supported features and limitations
 
