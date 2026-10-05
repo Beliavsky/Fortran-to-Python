@@ -33,6 +33,12 @@ literal repeat counts, character padding/truncation, and implicit SAVE of local
 scalar/array values across calls. Partial objects, implied-DOs, named repeat
 counts, mixed array/scalar groups, and unsupported DATA contexts are diagnosed
 explicitly rather than discarded. DATA does not execute as an assignment.
+derived_scalar_initializers checks constructor and named-value initializers,
+independent derived-object storage, keyword constructors, and implicit SAVE
+of initialized derived scalars in functions and subroutines.
+nested_sum_dimensions checks dimensional and masked SUM inside other calls,
+nested reductions, and the column standard-deviation expression using SPREAD.
+Already-lowered NumPy axes must survive recursive expression translation.
 location_intrinsics verifies MINLOC/MAXLOC/FINDLOC, DIM, MASK, BACK, KIND,
 Fortran array-element order, empty arrays, and character/logical searches.
 host_association checks host counter updates, module globals, an internal

@@ -1515,7 +1515,7 @@ class basic_f2p:
             else:
                 if ftype == "type":
                     cls = info.get("type_name") or "SimpleNamespace"
-                    init_py = f"{cls}()"
+                    init_py = self.translate_expr(str(init), arrays_1d) if init is not None else f"{cls}()"
                 elif init is None:
                     default_val = _type_default_scalar_value.get(ftype, "0")
                     if ftype == "character" and info.get("char_len") is not None:
@@ -2297,6 +2297,7 @@ class basic_f2p:
                     continue
                 arr = parts[0]
                 dim_expr = None
+                axis_expr = None
                 mask_expr = None
                 for ptxt in parts[1:]:
                     mk = re.match(r"^([a-z_]\w*)\s*=\s*(.+)$", ptxt, re.I)
@@ -2305,6 +2306,10 @@ class basic_f2p:
                         val = mk.group(2).strip()
                         if key == "dim":
                             dim_expr = val
+                        elif key == "axis":
+                            # Recursive translation can revisit an already
+                            # lowered SUM. Keep its zero-based NumPy axis.
+                            axis_expr = val
                         elif key == "mask":
                             mask_expr = val
                     elif dim_expr is None:
@@ -2314,7 +2319,9 @@ class basic_f2p:
                 else:
                     arr_eff = arr
                 if dim_expr is not None:
-                    repl = f"np.sum({arr_eff}, axis=({dim_expr}) - 1)"
+                    axis_expr = f"({dim_expr}) - 1"
+                if axis_expr is not None:
+                    repl = f"np.sum({arr_eff}, axis={axis_expr})"
                 else:
                     repl = f"np.sum({arr_eff})"
                 out.append(repl)
@@ -3112,7 +3119,11 @@ class basic_f2p:
                     # Pointer-to-derived-type starts disassociated.
                     self.emit(f"{name} = None")
                 else:
-                    self.emit(f"{name} = {cls}()")
+                    if init is None:
+                        self.emit(f"{name} = {cls}()")
+                    else:
+                        init_py = self.translate_expr(str(init), arrays_1d)
+                        self.emit(f"{name} = _xf2p_copy_value({init_py})")
                 continue
 
             # Pointer scalars start disassociated unless explicitly initialized.
