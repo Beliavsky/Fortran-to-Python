@@ -394,8 +394,15 @@ numeric kinds does not imply support for every `SELECTED_*_KIND` inquiry.
 `PRINT *, ...` becomes Python output machinery, including flattening arrays
 in Fortran element order. Python may print logical values as `True` and `False`
 rather than `T` and `F`. Formatting, whitespace, and default real precision can
-differ even when the numerical result is acceptable. Formatted external I/O
-has incomplete coverage; Python file objects are not Fortran unit numbers.
+differ even when the numerical result is acceptable.
+
+For sequential formatted external I/O, integer `UNIT` and negative `NEWUNIT`
+values resolve through a runtime table of Python file objects, shared across
+procedures. Named and scratch files, `REWIND`, and `CLOSE` are supported.
+External input supports numeric/logical list-directed reads and named scalar
+character `'(a)'` reads, including `IOSTAT`/`IOMSG` handling. Other input formats,
+direct/unformatted access, and advanced list-directed syntax remain unsupported;
+this is not a complete emulation of Fortran records or file connections.
 
 Validate against the original program:
 

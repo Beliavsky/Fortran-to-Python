@@ -5,12 +5,143 @@ Used by xf2p.py and xr2p.py outputs.
 from __future__ import annotations
 
 import math
+import re
 import sys
 import functools
 import inspect
+import os
+import tempfile
 import numpy as np
 
 _np_reshape_orig = np.reshape
+
+# Unit numbers remain integers, including negative NEWUNIT values. Connections
+# are shared by procedures in the same Python process, just as in Fortran.
+_f_file_units = {}
+
+
+def _f_file(unit, action=None):
+    if hasattr(unit, "read") or hasattr(unit, "write"):
+        return unit  # Compatibility with older generated programs.
+    number = int(unit)
+    if number in _f_file_units:
+        permitted = _f_file_units[number][3]
+        if action is not None and permitted not in {action, "readwrite"}:
+            raise OSError(f"Cannot {action.upper()} unit opened with ACTION='{permitted}'")
+        return _f_file_units[number][0]
+    if number in (5, 6, 0):
+        return {5: sys.stdin, 6: sys.stdout, 0: sys.stderr}[number]
+    raise OSError(f"Fortran unit {number} is not connected")
+
+
+def _f_file_open(unit=None, *, file=None, status="unknown", action="readwrite",
+                 position="asis", access="sequential", form="formatted"):
+    status, action, position, access, form = (
+        str(value).strip().lower() for value in (status, action, position, access, form))
+    if access != "sequential" or form != "formatted":
+        raise ValueError("Only sequential formatted file I/O is supported")
+    if status not in {"old", "new", "replace", "unknown", "scratch"}:
+        raise ValueError(f"Unsupported OPEN status: {status}")
+    if action not in {"read", "write", "readwrite"} or position not in {"asis", "rewind", "append"}:
+        raise ValueError("Unsupported OPEN action or position")
+    if status == "scratch" and file is not None:
+        raise ValueError("Scratch files cannot have a FILE name")
+    if status != "scratch" and file is None:
+        raise ValueError("OPEN requires FILE unless STATUS is scratch")
+    if unit is None:
+        number = -10
+        while number in _f_file_units:
+            number -= 1
+    else:
+        number = int(unit)
+        if number < 0:
+            raise ValueError("Explicit UNIT must be nonnegative; use NEWUNIT for negative units")
+    if number in _f_file_units:
+        raise ValueError("Reopening a connected unit requires CLOSE first")
+    filename = None if file is None else str(file).rstrip()
+    if status == "scratch":
+        handle = tempfile.TemporaryFile(mode="w+", encoding="utf-8", newline="")
+    else:
+        mode = {"old": "r+", "new": "x+", "replace": "w+", "unknown": "r+"}[status]
+        if status == "unknown" and not os.path.exists(filename):
+            mode = "w+"
+        if action == "read" and status in {"old", "unknown"} and os.path.exists(filename):
+            mode = "r"
+        handle = open(filename, mode, encoding="utf-8", newline="")
+    if position == "append":
+        handle.seek(0, 2)
+    _f_file_units[number] = (handle, filename, status == "scratch", action)
+    return number
+
+
+def _f_file_close(unit, status=None):
+    number = int(unit)
+    if status is not None and str(status).strip().lower() not in {"keep", "delete"}:
+        raise ValueError("Unsupported CLOSE status")
+    if number not in _f_file_units:
+        return  # Closing an unconnected unit is permitted by Fortran.
+    handle, filename, scratch, _action = _f_file_units[number]
+    disposition = str(status).strip().lower() if status is not None else ("delete" if scratch else "keep")
+    if scratch and disposition == "keep":
+        raise ValueError("Scratch files cannot be kept")
+    handle.close()
+    del _f_file_units[number]
+    if disposition == "delete" and filename is not None:
+        os.remove(filename)
+
+
+def _f_file_rewind(unit):
+    handle = _f_file(unit)
+    handle.flush()
+    handle.seek(0)
+
+
+def _f_file_read(unit, counts, kinds):
+    """Read complete numeric/logical input lists, continuing across records."""
+    if int(unit) in _f_file_units and _f_file_units[int(unit)][3] == "write":
+        raise OSError("Cannot READ a unit opened with ACTION='write'")
+    handle = _f_file(unit)
+    needed = sum(int(n) for n in counts)
+    tokens = []
+    consumed_record = False
+    while len(tokens) < needed or not consumed_record:
+        line = handle.readline()
+        if line == "":
+            raise EOFError("End of file")
+        consumed_record = True
+        # Null values, repeats, slash termination, and complex/character lists
+        # require additional Fortran parsing; do not silently misread them.
+        if re.search(r",\s*,|^\s*,|[,\s]$", line.rstrip()) and "," in line:
+            raise ValueError("Null list-directed input values are not supported")
+        tokens.extend(line.replace(",", " ").split())
+    result, offset = [], 0
+    for count, kind in zip(counts, kinds):
+        values = []
+        for token in tokens[offset:offset + int(count)]:
+            if kind == "integer":
+                value = int(token)
+            elif kind == "logical":
+                spelling = token.strip(".").lower()
+                if spelling not in {"t", "true", "f", "false"}:
+                    raise ValueError(f"Invalid logical input: {token}")
+                value = spelling in {"t", "true"}
+            elif kind == "real":
+                value = float(token.replace("D", "e").replace("d", "e"))
+            else:
+                raise ValueError(f"Unsupported list-directed input type: {kind}")
+            values.append(value)
+        result.append(values)
+        offset += int(count)
+    return result
+
+
+def _f_file_read_assign(target, values):
+    array = np.asarray(target)
+    result = np.asarray(values, dtype=array.dtype).reshape(array.shape, order="F")
+    if array.ndim:
+        array[...] = result
+        return target
+    return result.item()
 
 
 def _reshape_with_pad(a, newshape, order="C", pad=None):
@@ -61,6 +192,8 @@ def _f_array_indices(array, *indices):
 
 
 __all__ = [
+    "_f_file", "_f_file_open", "_f_file_close", "_f_file_rewind",
+    "_f_file_read", "_f_file_read_assign",
     "_f_array_indices",
     "_f_elemental_subroutine",
     "_f_component_array", "_f_assign_component_array",

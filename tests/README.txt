@@ -97,7 +97,6 @@ I/O cannot accidentally reuse files produced by the reference execution.
 
 Known failures (2026-10-04)
 --------------------------
-formatted_file_io: numeric file units produce invalid Python 20.close().
 execute_command_line: missing EXECUTE_COMMAND_LINE helper.
 selected_integer_kind, selected_logical_kind, selected_real_kind: missing
 kind-selection intrinsic helpers.
@@ -431,6 +430,24 @@ dummies and host/local scope. Model inquiries do not evaluate the integer value.
 This uses the existing kind-to-byte convention for kinds 1, 2, 4 and 8; it is
 not general integer-kind or overflow emulation. Unknown expression kinds and
 REAL/COMPLEX model inquiries still use their translated NumPy storage dtype.
+
+Sequential formatted file units
+-------------------------------
+tests/test_file_units.py and features/file_units.f90 cover integer UNIT and
+negative NEWUNIT connections, shared procedure connections, scratch files,
+named OLD/NEW/REPLACE/UNKNOWN files, append positioning, REWIND, CLOSE/DELETE,
+list-directed numeric/logical input, whole arrays and sections in Fortran order,
+character '(a)' reads, EOF, and OPEN/READ IOSTAT/IOMSG. formatted_file_io is no
+longer an expected failure. Named files default to read/write access; explicit
+ACTION is checked. Units 5/6/0 resolve to stdin/stdout/stderr when not otherwise
+connected. Older generated file-object handles remain usable for output.
+
+This does not implement full Fortran record or list-directed input semantics:
+null/repeated values, slash termination, complex/character list input, direct
+and unformatted access, other input formats and control specifiers remain
+unsupported. Implicit fort.N file creation and reopening a connected unit
+without CLOSE are not supported. Existing generated translations need a refreshed
+adjacent fortran_py_runtime.py before using the new file helpers.
 
 Extreme reductions
 ------------------

@@ -133,6 +133,13 @@ Other tested intrinsics include `PRODUCT`, `UNPACK`, `CSHIFT`/`EOSHIFT`,
 Named allocatable variables support `MOVE_ALLOC`; command-argument intrinsics
 use Python's command line (argument zero names the Python script).
 
+Sequential formatted file I/O supports integer `UNIT`/`NEWUNIT` connections,
+named and scratch files, `REWIND`, and `CLOSE`. External `READ` supports numeric
+and logical list-directed input and scalar character `'(a)'` input, with
+`IOSTAT` and `IOMSG`. Units are shared across procedures. This is not a complete
+Fortran I/O implementation; other input formats, direct/unformatted access,
+and advanced list-directed input syntax remain unsupported.
+
 Support is incomplete and varies by construct and context. In particular:
 
 - Numeric kinds are not fully preserved; default Fortran real arithmetic may

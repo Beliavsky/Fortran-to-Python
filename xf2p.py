@@ -3604,8 +3604,147 @@ class basic_f2p:
             self.emit("break")
             self.indent -= 2
 
+    def _external_file_io(self, s: str, arrays_1d: set[str]) -> bool:
+        match = re.match(r"(open|close|rewind|read)\b", s, re.I)
+        if not match:
+            return False
+        operation = match.group(1).lower()
+        opening = s.find("(")
+        if opening < 0:
+            if operation != "rewind":
+                raise ValueError(f"unsupported {operation.upper()} form: {s}")
+            parts, rest = [s[match.end():].strip()], ""
+        else:
+            closing = find_matching_paren(s, opening)
+            if closing < 0:
+                raise ValueError(f"invalid {operation.upper()} control list: {s}")
+            parts, rest = split_args(s[opening + 1:closing]), s[closing + 1:].strip()
+        spec = {}
+        for index, part in enumerate(parts):
+            kw = re.fullmatch(r"\s*([a-z_]\w*)\s*=\s*(.+)", part, re.I)
+            key, value = (kw.group(1).lower(), kw.group(2)) if kw else (
+                "unit" if index == 0 else "fmt", part.strip())
+            if key in spec:
+                raise ValueError(f"duplicate {operation.upper()} specifier: {key}")
+            spec[key] = value
+        unit_raw = spec.get("unit", spec.get("newunit"))
+        if unit_raw is None:
+            raise ValueError(f"{operation.upper()} requires UNIT or NEWUNIT")
+        if operation == "read":
+            base = re.match(r"[a-z_]\w*", unit_raw, re.I)
+            name = base.group().lower() if base else ""
+            if self._decl_types.get(name) == "character" or self._decl_array_types.get(name) == "character":
+                return False  # Existing internal-file input lowering.
+            if "fmt" not in spec:
+                raise ValueError("Unformatted READ is not yet supported")
+        allowed = {
+            "open": {"unit", "newunit", "file", "status", "action", "position", "access", "form", "iostat", "iomsg"},
+            "close": {"unit", "status", "iostat", "iomsg"},
+            "rewind": {"unit", "iostat", "iomsg"},
+            "read": {"unit", "fmt", "iostat", "iomsg"},
+        }[operation]
+        unknown = set(spec) - allowed
+        if unknown:
+            raise ValueError(f"unsupported {operation.upper()} specifier(s): {', '.join(sorted(unknown))}")
+        py = lambda value: self.translate_expr(value, arrays_1d)
+        unit = "5" if unit_raw == "*" else py(unit_raw)
+        lines = []
+        if operation == "open":
+            if "unit" in spec and "newunit" in spec:
+                raise ValueError("OPEN cannot specify both UNIT and NEWUNIT")
+            if "newunit" in spec and not re.fullmatch(r"[a-z_]\w*", unit_raw, re.I):
+                raise ValueError("NEWUNIT currently requires a named integer variable")
+            for key, expected in (("access", "sequential"), ("form", "formatted")):
+                value = spec.get(key)
+                if value is not None and _is_fortran_string_literal(value) and _fortran_unquote(value).strip().lower() != expected:
+                    raise ValueError("Only sequential formatted file I/O is supported")
+            arguments = [f"{key}={py(value)}" for key, value in spec.items()
+                         if key not in {"unit", "newunit", "iostat", "iomsg"}]
+            call = f"_f_file_open({', '.join(([] if 'newunit' in spec else [unit]) + arguments)})"
+            lines.append(f"{unit} = {call}" if "newunit" in spec else call)
+        elif operation == "close":
+            status = f", status={py(spec['status'])}" if "status" in spec else ""
+            lines.append(f"_f_file_close({unit}{status})")
+        elif operation == "rewind":
+            lines.append(f"_f_file_rewind({unit})")
+        else:
+            fmt = spec.get("fmt", "*")
+            targets = [part.strip() for part in split_args(rest) if part.strip()]
+            if not targets:
+                raise ValueError("READ without an input list is not yet supported")
+            target_exprs = [py(target) for target in targets]
+            self._allocation_counter += 1
+            temporary = _choose_fresh_identifier(self._allocation_source, f"_xf2p_read_{self._allocation_counter}")
+            if fmt == "*":
+                kinds = []
+                for target in targets:
+                    base = re.match(r"[a-z_]\w*", target, re.I)
+                    name = base.group().lower() if base else ""
+                    kind = self._decl_types.get(name, self._decl_array_types.get(name, ""))
+                    if kind not in {"integer", "real", "logical"} or "%" in target:
+                        raise ValueError("External list-directed READ currently supports numeric/logical variables and sections")
+                    kinds.append(kind)
+                counts = ', '.join(f"np.size({target})" for target in target_exprs)
+                lines.append(f"{temporary} = _f_file_read({unit}, [{counts}], {kinds!r})")
+                lines.extend(f"{target} = _f_file_read_assign({target}, {temporary}[{index}])"
+                             for index, target in enumerate(target_exprs))
+            elif _is_fortran_string_literal(fmt) and _fortran_unquote(fmt).strip().lower() == "(a)" and len(targets) == 1:
+                base = re.match(r"[a-z_]\w*", targets[0], re.I)
+                name = base.group().lower() if base else ""
+                if self._decl_types.get(name) != "character" or name in self._decl_array_types or not re.fullmatch(r"[a-z_]\w*", targets[0], re.I):
+                    raise ValueError("External '(a)' READ currently requires a scalar character target")
+                lines.append(f"{temporary} = _f_file({unit}, 'read').readline()")
+                lines.append(f"if {temporary} == '': raise EOFError('End of file')")
+                lines.append(f"{target_exprs[0]} = _f_str_assign({temporary}.rstrip('\\r\\n'), len({target_exprs[0]}))")
+            else:
+                raise ValueError("External formatted READ currently supports only '(a)' and list-directed input")
+        ios = py(spec["iostat"]) if "iostat" in spec else None
+        message = py(spec["iomsg"]) if "iomsg" in spec else None
+        if message is not None and ios is None:
+            raise ValueError("IOMSG currently requires IOSTAT")
+        if ios is not None:
+            self.emit("try:")
+            self.indent += 1
+        for line in lines:
+            self.emit(line)
+        if ios is not None:
+            self.emit(f"{ios} = 0")
+            self.indent -= 1
+            self.emit("except (OSError, ValueError, EOFError, OverflowError) as _xf2p_io_error:")
+            self.indent += 1
+            self.emit(f"{ios} = -1 if isinstance(_xf2p_io_error, EOFError) else 1")
+            if message is not None:
+                self.emit(f"{message} = _f_str_assign(str(_xf2p_io_error), len({message}))")
+            self.indent -= 1
+        return True
+
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
+        if re.match(r"(open|close|rewind|read|write)\b", s, re.I) and len(split_top_level(s, "=")) > 1:
+            parts = split_top_level(s, "=")
+            self.transpile_assignment(parts[0].strip(), self.translate_expr("=".join(parts[1:]).strip(), arrays_1d), arrays_1d)
+            return True  # Assignment to a variable named like an I/O keyword.
+        if self._external_file_io(s, arrays_1d):
+            return True
+        # Existing WRITE format lowering expects positional UNIT and FMT.
+        if re.match(r"write\s*\(", s, re.I) and len(split_top_level(s, "=")) == 1:
+            opening = s.find("(")
+            closing = find_matching_paren(s, opening)
+            if closing >= 0:
+                controls = split_args(s[opening + 1:closing])
+                if any(re.match(r"\s*(unit|fmt)\s*=", part, re.I) for part in controls):
+                    spec = {}
+                    for index, part in enumerate(controls):
+                        kw = re.fullmatch(r"\s*([a-z_]\w*)\s*=\s*(.+)", part, re.I)
+                        key, value = (kw.group(1).lower(), kw.group(2)) if kw else (
+                            "unit" if index == 0 else "fmt", part.strip())
+                        if key in spec or key not in {"unit", "fmt"}:
+                            raise ValueError(f"unsupported or duplicate WRITE specifier: {key}")
+                        spec[key] = value
+                    if set(spec) != {"unit", "fmt"}:
+                        raise ValueError("WRITE requires UNIT and FMT")
+                    s = f"write({spec['unit']}, {spec['fmt']}) {s[closing + 1:]}"
+                    sl = s.lower()
         if next(data_statements([(s, '')]), None) is not None:
             # DATA was applied in the specification pass, never at runtime.
             return True
@@ -3971,40 +4110,6 @@ class basic_f2p:
         if re.match(r"allocate\b", s, re.I):
             raise ValueError(f"unsupported ALLOCATE statement: {s}")
 
-        # open(newunit=fp, file="temp.txt", ...) or open(unit=iu, file="temp.txt", ...)
-        mm = re.match(r"open\s*\(\s*(.+)\s*\)\s*$", s, re.I)
-        if mm:
-            spec = mm.group(1).strip()
-            unit_m = re.search(r"\b(?:newunit|unit)\s*=\s*([^,]+)", spec, re.I)
-            file_m = re.search(r"\bfile\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
-            status_m = re.search(r"\bstatus\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
-            action_m = re.search(r"\baction\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
-            position_m = re.search(r"\bposition\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
-            unit_var = unit_m.group(1).strip() if unit_m else None
-            file_expr = file_m.group(1).strip() if file_m else None
-            status = status_m.group(1).strip() if status_m else None
-            action = action_m.group(1).strip() if action_m else None
-            position = position_m.group(1).strip() if position_m else None
-            if unit_var is None or file_expr is None:
-                self.emit(f"# unsupported open form: {s}")
-                return True
-            mode = "r"
-            st = status.strip().strip("'\"").lower() if status else ""
-            act = action.strip().strip("'\"").lower() if action else ""
-            pos = position.strip().strip("'\"").lower() if position else ""
-            if act == "write" or st == "replace":
-                mode = "w"
-            if pos == "append":
-                mode = "a"
-            self.emit(f"{unit_var} = open({self.translate_expr(file_expr, arrays_1d)}, {mode!r})")
-            return True
-
-        # close(fp)
-        mm = re.match(r"close\s*\(\s*(.+?)\s*\)\s*$", s, re.I)
-        if mm:
-            unit = self.translate_expr(mm.group(1), arrays_1d)
-            self.emit(f"{unit}.close()")
-            return True
 
         # call random_number(x)
         mm = re.match(r"call\s+random_number\s*\(\s*([a-z_]\w*)\s*\)\s*$", s, re.I)
@@ -4016,40 +4121,6 @@ class basic_f2p:
                 self.emit(f"{name} = np.float64(np.random.random())")
             return True
 
-        # open(newunit=fp, file="temp.txt", ...) or open(unit=iu, file="temp.txt", ...)
-        mm = re.match(r"open\s*\(\s*(.+)\s*\)\s*$", s, re.I)
-        if mm:
-            spec = mm.group(1).strip()
-            unit_m = re.search(r"\b(?:newunit|unit)\s*=\s*([^,]+)", spec, re.I)
-            file_m = re.search(r"\bfile\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
-            status_m = re.search(r"\bstatus\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
-            action_m = re.search(r"\baction\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
-            position_m = re.search(r"\bposition\s*=\s*(.+?)(?:,\s*[a-z_]\w*\s*=|$)", spec, re.I)
-            unit_var = unit_m.group(1).strip() if unit_m else None
-            file_expr = file_m.group(1).strip() if file_m else None
-            status = status_m.group(1).strip() if status_m else None
-            action = action_m.group(1).strip() if action_m else None
-            position = position_m.group(1).strip() if position_m else None
-            if unit_var is None or file_expr is None:
-                self.emit(f"# unsupported open form: {s}")
-                return True
-            mode = "r"
-            st = status.strip().strip("'\"").lower() if status else ""
-            act = action.strip().strip("'\"").lower() if action else ""
-            pos = position.strip().strip("'\"").lower() if position else ""
-            if act == "write" or st == "replace":
-                mode = "w"
-            if pos == "append":
-                mode = "a"
-            self.emit(f"{unit_var} = open({self.translate_expr(file_expr, arrays_1d)}, {mode!r})")
-            return True
-
-        # close(fp)
-        mm = re.match(r"close\s*\(\s*(.+?)\s*\)\s*$", s, re.I)
-        if mm:
-            unit = self.translate_expr(mm.group(1), arrays_1d)
-            self.emit(f"{unit}.close()")
-            return True
 
         # read(unit, "(a)", iostat=ios) text
         if sl.startswith("read"):
@@ -4124,42 +4195,6 @@ class basic_f2p:
                                 self.emit(f"{lhs} = __xf2p_line.rstrip('\\n')")
                                 return True
 
-        # read(fp,*) a, b, arr(i,:), ...
-        mm = re.match(r"read\s*\(\s*([a-z_]\w*)\s*,\s*\*\s*\)\s*(.+)$", s, re.I)
-        if mm:
-            unit = mm.group(1)
-            rest = mm.group(2).strip()
-            items = [a.strip() for a in split_args(rest) if a.strip()]
-            if len(items) == 1:
-                tgt = items[0]
-                # row-slice target: mat(i,:)
-                mrow = re.match(r"^([a-z_]\w*)\s*\(\s*([^,]+)\s*,\s*:\s*\)\s*$", tgt, re.I)
-                if mrow:
-                    arr = mrow.group(1)
-                    ridx = self.translate_expr(mrow.group(2), arrays_1d)
-                    ftype = self._decl_array_types.get(arr.lower(), "")
-                    cast = "int" if ftype == "integer" else "float"
-                    self.emit(f"__read_vals = [{cast}(v) for v in {unit}.readline().split()]")
-                    self.emit(f"{arr}[{self._index_expr_from_decl_bounds(arr, mrow.group(2), 0, arrays_1d)}, :] = np.asarray(__read_vals[:{arr}.shape[1]], dtype={arr}.dtype)")
-                    return True
-                # scalar target
-                lhs = self.translate_expr(tgt, arrays_1d)
-                base = re.match(r"^([a-z_]\w*)", tgt, re.I)
-                bnm = base.group(1).lower() if base else ""
-                ftype = self._decl_types.get(bnm, "")
-                cast = "int" if ftype == "integer" else ("bool" if ftype == "logical" else "float")
-                self.emit(f"{lhs} = {cast}({unit}.readline().split()[0])")
-                return True
-            # multiple scalar targets
-            self.emit(f"__read_parts = {unit}.readline().split()")
-            for i, tgt in enumerate(items):
-                lhs = self.translate_expr(tgt, arrays_1d)
-                base = re.match(r"^([a-z_]\w*)", tgt, re.I)
-                bnm = base.group(1).lower() if base else ""
-                ftype = self._decl_types.get(bnm, "")
-                cast = "int" if ftype == "integer" else ("bool" if ftype == "logical" else "float")
-                self.emit(f"{lhs} = {cast}(__read_parts[{i}])")
-            return True
 
         # call foo(...)
         mm = re.match(r"call\s+([a-z_]\w*(?:\s*%\s*[a-z_]\w*)*)\s*(?:\((.*)\))?\s*$", s, re.I)
@@ -4445,7 +4480,7 @@ class basic_f2p:
                             rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
                             self.transpile_assignment(unit_raw, rhs, arrays_1d)
                             return True
-                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        file_txt = "" if unit_raw == "*" else f", file=_f_file({self.translate_expr(unit_raw, arrays_1d)}, 'write')"
                         if not args_star:
                             if file_txt:
                                 self.emit(f"print({file_txt[2:]})")
@@ -4482,7 +4517,7 @@ class basic_f2p:
                             rhs = f"_f_str_assign({rhs_core}, _f_len({target_py}))"
                             self.transpile_assignment(unit_raw, rhs, arrays_1d)
                             return True
-                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        file_txt = "" if unit_raw == "*" else f", file=_f_file({self.translate_expr(unit_raw, arrays_1d)}, 'write')"
                         if fmt_expr is not None:
                             self.emit(f"print({fmt_expr}{', end=""' if advance_no else ''}{file_txt})")
                         else:
@@ -4497,7 +4532,7 @@ class basic_f2p:
                         rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
                         self.transpile_assignment(unit_raw, rhs, arrays_1d)
                     else:
-                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        file_txt = "" if unit_raw == "*" else f", file=_f_file({self.translate_expr(unit_raw, arrays_1d)}, 'write')"
                         if args_star:
                             self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
                         else:
@@ -4540,9 +4575,9 @@ class basic_f2p:
             return True
 
         # write(unit,*) ...
-        mm = re.match(r"write\s*\(\s*([a-z_]\w*)\s*,\s*\*\s*\)\s*(.*)$", s, re.I)
+        mm = re.match(r"write\s*\(\s*([a-z_]\w*|\d+)\s*,\s*\*\s*\)\s*(.*)$", s, re.I)
         if mm:
-            unit = mm.group(1)
+            unit = f"_f_file({self.translate_expr(mm.group(1), arrays_1d)}, 'write')"
             rest = mm.group(2).strip()
             if not rest:
                 self.emit(f"print(file={unit})")
@@ -4617,7 +4652,7 @@ class basic_f2p:
         # write(unit,"fmt") ...
         mm = re.match(r"write\s*\(\s*([^,]+?)\s*,\s*(([\"']).*?\3)\s*\)\s*(.*)$", s, re.I)
         if mm:
-            unit = mm.group(1).strip()
+            unit = f"_f_file({self.translate_expr(mm.group(1).strip(), arrays_1d)}, 'write')"
             fmt = mm.group(2)
             rest = mm.group(4).strip()
             if not rest:
@@ -4704,7 +4739,7 @@ class basic_f2p:
                             rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
                             self.transpile_assignment(unit_raw, rhs, arrays_1d)
                             return True
-                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        file_txt = "" if unit_raw == "*" else f", file=_f_file({self.translate_expr(unit_raw, arrays_1d)}, 'write')"
                         if not args_star:
                             if file_txt:
                                 self.emit(f"print({file_txt[2:]})")
@@ -4750,7 +4785,7 @@ class basic_f2p:
                             rhs = f"_f_str_assign({rhs_core}, _f_len({target_py}))"
                             self.transpile_assignment(unit_raw, rhs, arrays_1d)
                             return True
-                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        file_txt = "" if unit_raw == "*" else f", file=_f_file({self.translate_expr(unit_raw, arrays_1d)}, 'write')"
                         if fmt_expr is not None:
                             self.emit(f"print({fmt_expr}{', end=""' if advance_no else ''}{file_txt})")
                         else:
@@ -4785,7 +4820,7 @@ class basic_f2p:
                         rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
                         self.transpile_assignment(unit_raw, rhs, arrays_1d)
                     else:
-                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        file_txt = "" if unit_raw == "*" else f", file=_f_file({self.translate_expr(unit_raw, arrays_1d)}, 'write')"
                         if args_star:
                             self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
                         else:
