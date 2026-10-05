@@ -534,3 +534,16 @@ integer MAXVAL. Native comparisons check an explicit sentinel-range invariant
 for those cases; runtime unit tests require exactly -HUGE. Other fixture outputs
 are compared normally, including a selected most-negative integer. Infinities
 have separate runtime tests.
+
+inferred_scalar_outputs.f90 checks modified scalar dummies without INTENT,
+forward and keyword CALL chains, early RETURN with SAVE, omitted optional
+outputs, and assumed-length CHARACTER copy-back. Unit regressions are in
+test_inferred_scalar_outputs.py.
+
+function_scalar_outputs.f90 and test_function_scalar_outputs.py check scalar
+copy-back from functions, including nested expressions, forward calls, early
+RETURN, keyword/optional actuals, array elements, and reevaluated loop tests.
+
+value_arguments.f90 and test_value_arguments.py check that VALUE dummies in
+functions and subroutines are not copied back, including mixed VALUE/reference
+arguments, expression actuals, and local copies of derived-type components.

@@ -318,7 +318,32 @@ x = increment(x)
 ```
 
 The translator returns output dummy values and rewrites callers to receive
-them; multiple outputs can require tuple unpacking. Array and derived-type
+them; multiple outputs can require tuple unpacking. Scalar subroutine dummies
+without `INTENT` are also returned when assignments, input statements, or
+ordinary calls to known subroutines define them. This inference propagates
+through call chains, including forward references and keyword arguments.
+Read-only scalars are not returned, so expressions remain valid actual
+arguments for them. Modified scalars require assignable actuals; output values
+are copied back even on an early `RETURN`. Assumed-length scalar character
+assignment preserves the actual argument's length.
+
+Ordinary functions may modify scalar dummy arguments too. Such translations
+return a tuple containing the function result followed by the modified dummies.
+Generated call sites unpack the scalar updates while yielding the original
+function result to the surrounding expression. Inline sequencing keeps the call
+inside its condition or loop test and evaluates it once; array-element and
+component destinations are captured before the call. This changes the Python
+calling convention when invoking such a translated function manually. Calls
+through procedure arguments or type-bound dispatch need manual review.
+
+`VALUE` dummies are an exception: modifying one changes only the procedure's
+local copy, never the caller's actual argument. They are excluded from
+copy-back, and derived-type values are copied on entry so component assignments
+also remain local. A procedure with both `VALUE` and ordinary modified dummies
+copies back only the latter. Expressions are valid actuals for `VALUE` dummies.
+
+This is not a complete alias or side-effect analysis: writes through unknown
+procedures and complicated argument aliasing need manual review. Array and derived-type
 arguments also need appropriate value, mutation, and copying behavior.
 Preserve both generated procedure signatures and calling conventions when
 editing a translation.

@@ -1348,6 +1348,7 @@ class basic_f2p:
         self._subr_sigs: dict[str, dict] = {}
         self._func_sigs: dict[str, dict] = {}
         self._current_result_name: str | None = None
+        self._current_subroutine_outputs: list[str] = []
         self._derived_types: set[str] = set()
         self._type_bindings: dict[str, dict[str, dict]] = {}
         self._type_components: dict[str, dict[str, str]] = {}
@@ -1670,6 +1671,220 @@ class basic_f2p:
 
     def _is_elemental_header(self, s: str) -> bool:
         return bool(re.search(r"\belemental\b", s, re.I))
+
+    @staticmethod
+    def _has_value_attribute(attrs):
+        return 'value' in {part.strip().lower() for part in split_args(attrs)}
+
+    def _emit_value_dummy_copies(self, args, symbols):
+        # Immutable scalars already behave by value. Copy mutable derived-type
+        # values as well, so component assignments cannot affect the actual.
+        for name in args:
+            info = symbols.get(name, {})
+            if self._has_value_attribute(info.get('attrs_l', '')):
+                self.emit(f'{name} = _xf2p_copy_value({name})')
+
+    def _scalar_dummy_writes(self, lines, eligible, signatures, symbols):
+        """Find direct scalar definitions and copy-back through known CALLs."""
+        written = set()
+
+        def mark(target):
+            match = re.match(r'^\s*([a-z_]\w*)\s*(?:\(|$)', target, re.I)
+            if match and match.group(1).lower() in eligible:
+                written.add(match.group(1).lower())
+
+        for code, _comment in lines:
+            statement = code.strip()
+            if self._parse_decl_line(statement):
+                continue
+            statement = re.sub(r'^\w+\s*:\s*(?=do\b)', '', statement, flags=re.I)
+            conditional = re.match(r'if\s*\(', statement, re.I)
+            if conditional:
+                closing = find_matching_paren(statement, statement.find('('))
+                if closing >= 0:
+                    statement = statement[closing + 1:].strip()
+            assignment = split_top_level(statement, '=')
+            if len(assignment) > 1 and _find_top_level_double_colon(statement) == -1:
+                mark(assignment[0].strip())
+            loop = re.match(r'do\s+(?:\d+\s+)?([a-z_]\w*)\s*=', statement, re.I)
+            if loop:
+                mark(loop.group(1))
+            call = re.fullmatch(r'call\s+(\w+)\s*(?:\((.*)\))?', statement, re.I)
+            if call:
+                callee, arguments = call.group(1).lower(), split_args(call.group(2) or '')
+                signature = signatures.get(callee)
+                if signature and signature['kind'] == 'subroutine':
+                    formals = signature['args']
+                    for index, actual in enumerate(arguments):
+                        keyword = re.fullmatch(r'\s*(\w+)\s*=\s*(.+)', actual)
+                        formal = keyword.group(1).lower() if keyword else (formals[index] if index < len(formals) else '')
+                        if formal in signature['out']:
+                            mark(keyword.group(2) if keyword else actual)
+                intrinsic_outputs = {
+                    'random_number': ('harvest',), 'random_seed': ('size', 'get'),
+                    'move_alloc': ('from', 'to'),
+                    'execute_command_line': ('exitstat', 'cmdstat', 'cmdmsg'),
+                    'get_command_argument': ('value', 'length', 'status'),
+                }.get(callee, ())
+                intrinsic_formals = {
+                    'random_number': ('harvest',), 'random_seed': ('size', 'put', 'get'),
+                    'move_alloc': ('from', 'to', 'stat', 'errmsg'),
+                    'execute_command_line': ('command', 'wait', 'exitstat', 'cmdstat', 'cmdmsg'),
+                    'get_command_argument': ('number', 'value', 'length', 'status'),
+                }.get(callee, ())
+                for index, actual in enumerate(arguments):
+                    keyword = re.fullmatch(r'\s*(\w+)\s*=\s*(.+)', actual)
+                    formal = keyword.group(1).lower() if keyword else (intrinsic_formals[index] if index < len(intrinsic_formals) else '')
+                    if formal in intrinsic_outputs:
+                        mark(keyword.group(2) if keyword else actual)
+            # Unlike CALL, a function invocation may occur anywhere in an
+            # expression. Its scalar definitions still propagate to its caller.
+            expression_scan = re.sub(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"",
+                                     lambda match: ' ' * len(match.group()), statement)
+            for match in re.finditer(r'\b(\w+)\s*\(', expression_scan):
+                signature = signatures.get(match.group(1).lower())
+                if not signature or signature['kind'] != 'function' or not signature['out']:
+                    continue
+                opening = statement.find('(', match.start())
+                closing = find_matching_paren(statement, opening)
+                if closing < 0:
+                    continue
+                for index, actual in enumerate(split_args(statement[opening + 1:closing])):
+                    keyword = re.fullmatch(r'\s*(\w+)\s*=\s*(.+)', actual)
+                    formals = signature['args']
+                    formal = keyword.group(1).lower() if keyword else (formals[index] if index < len(formals) else '')
+                    if formal in signature['out']:
+                        mark(keyword.group(2) if keyword else actual)
+            io = re.match(r'(read|write|open|close|rewind)\s*\(', statement, re.I)
+            if io:
+                closing = find_matching_paren(statement, statement.find('('))
+                if closing < 0:
+                    continue
+                controls = split_args(statement[statement.find('(') + 1:closing])
+                if io.group(1).lower() == 'read':
+                    for target in split_args(statement[closing + 1:]):
+                        mark(target)
+                for index, control in enumerate(controls):
+                    keyword = re.fullmatch(r'\s*(\w+)\s*=\s*(.+)', control)
+                    if keyword and keyword.group(1).lower() in {'iostat', 'iomsg', 'newunit'}:
+                        mark(keyword.group(2))
+                    if io.group(1).lower() == 'write' and (index == 0 or (keyword and keyword.group(1).lower() == 'unit')):
+                        unit = (keyword.group(2) if keyword else control).strip().lower()
+                        if symbols.get(unit, {}).get('ftype') == 'character':
+                            mark(unit)
+        return written
+
+    def _function_scalar_copyback(self, source):
+        """Rewrite effectful function results/calls without eager evaluation.
+
+        Inline sequencing keeps calls inside conditions, loop tests and nested
+        expressions in their original evaluation position. Only changed source
+        spans are replaced, preserving the rest of the generated formatting.
+        """
+        signatures = {name: spec for name, spec in self._binding_targets.items()
+                      if spec['kind'] == 'function' and spec['out']}
+        if not signatures:
+            return source
+        tree = ast.parse(source)
+        edits = []
+        lines = source.splitlines(keepends=True)
+        offsets = [0]
+        for line in lines:
+            offsets.append(offsets[-1] + len(line))
+
+        def position(line, column):
+            # AST columns are UTF-8 byte offsets, not Unicode character offsets.
+            return offsets[line - 1] + len(lines[line - 1].encode('utf-8')[:column].decode('utf-8'))
+
+        def replace(node, value):
+            edits.append((position(node.lineno, node.col_offset),
+                          position(node.end_lineno, node.end_col_offset), value))
+
+        def fresh():
+            self._allocation_counter += 1
+            return _choose_fresh_identifier(source, f'_xf2p_func_{self._allocation_counter}')
+
+        class Calls(ast.NodeTransformer):
+            def visit_Call(visitor, node):
+                # Capture array-element/component destinations at call entry,
+                # rather than recomputing them after other outputs change.
+                spec = signatures.get(node.func.id) if isinstance(node.func, ast.Name) else None
+                if not spec:
+                    return visitor.generic_visit(node)
+                actuals = dict(zip(spec['args'], node.args))
+                actuals.update({kw.arg: kw.value for kw in node.keywords})
+                prefixes, setters = [], []
+                for index, formal in enumerate(spec['out'], 1):
+                    actual = actuals.get(formal)
+                    if actual is None:  # Omitted OPTIONAL dummy.
+                        continue
+                    if isinstance(actual, ast.Name):
+                        setters.append((index, f'{actual.id} := {{value}}'))
+                    elif isinstance(actual, (ast.Subscript, ast.Attribute)):
+                        base = fresh()
+                        prefixes.append(f'({base} := {ast.unparse(visitor.visit(actual.value))})')
+                        actual.value = ast.Name(id=base, ctx=ast.Load())
+                        if isinstance(actual, ast.Subscript):
+                            if isinstance(actual.slice, ast.Slice):
+                                raise ValueError('modified scalar function dummy requires a scalar actual, not an array section')
+                            key = fresh()
+                            prefixes.append(f'({key} := {ast.unparse(visitor.visit(actual.slice))})')
+                            actual.slice = ast.Name(id=key, ctx=ast.Load())
+                            setters.append((index, f'{base}.__setitem__({key}, {{value}})'))
+                        else:
+                            setters.append((index, f'setattr({base}, {actual.attr!r}, {{value}})'))
+                    else:
+                        raise ValueError(f'modified dummy argument of {node.func.id} requires a definable actual, not {ast.unparse(actual)}')
+                node = visitor.generic_visit(node)
+                result = fresh()
+                sequence = prefixes + [f'({result} := {ast.unparse(node)})']
+                sequence += ['(' + setter.format(value=f'{result}[{index}]') + ')'
+                             for index, setter in setters]
+                sequence.append(f'{result}[0]')
+                return ast.parse('(' + ', '.join(sequence) + ')[-1]', mode='eval').body
+
+        calls = Calls()
+
+        class Rewrite(ast.NodeVisitor):
+            function = None
+
+            def visit_FunctionDef(visitor, node):
+                previous = visitor.function
+                visitor.function = signatures.get(node.name)
+                for statement in node.body:
+                    visitor.visit(statement)
+                visitor.function = previous
+
+            def visit_Return(visitor, node):
+                if node.value is None:
+                    return
+                value = calls.visit(node.value)
+                if visitor.function:
+                    outputs = [ast.Name(id=name, ctx=ast.Load()) for name in visitor.function['out']]
+                    value = ast.Tuple(elts=[value] + outputs, ctx=ast.Load())
+                replace(node.value, ast.unparse(value))
+
+            def visit_Call(visitor, node):
+                # Transform an outer call only once, including all nested calls.
+                if any(isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+                       and child.func.id in signatures for child in ast.walk(node)):
+                    replace(node, ast.unparse(calls.visit(node)))
+                else:
+                    visitor.generic_visit(node)
+
+        Rewrite().visit(tree)
+        for start, stop, value in sorted(edits, reverse=True):
+            source = source[:start] + value + source[stop:]
+        return source
+
+    def _emit_procedure_return(self):
+        self._emit_save_sync()
+        if self._current_result_name:
+            self.emit(f'return {self._current_result_name}')
+        elif self._current_subroutine_outputs:
+            self.emit('return ' + ', '.join(self._current_subroutine_outputs))
+        else:
+            self.emit('return')
 
     def _scalar_otype_expr(self, ftype: str | None, type_name: str | None = None) -> str:
         if ftype == "integer":
@@ -3112,8 +3327,12 @@ class basic_f2p:
         if char_len_raw is not None:
             if char_len_raw == ":" and lhs_base in self._decl_pointer:
                 raise ValueError("deferred-length CHARACTER pointer assignment is not yet supported")
-            rhs_py = self._character_assignment_rhs(rhs_py, char_len_raw, arrays_1d,
-                                                    deferred_array=lhs_base in arrays_1d)
+            if char_len_raw == "*" and lhs_base not in arrays_1d:
+                # Assumed-length scalar dummies retain the actual argument's LEN.
+                rhs_py = f"_f_str_assign({rhs_py}, len({lhs_base}))"
+            else:
+                rhs_py = self._character_assignment_rhs(rhs_py, char_len_raw, arrays_1d,
+                                                        deferred_array=lhs_base in arrays_1d)
         mname = re.match(r"^\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(", lhs, re.I)
         idx_name = None
         idx = None
@@ -3167,11 +3386,7 @@ class basic_f2p:
             self.emit(f"raise RuntimeError({mm.group(1).strip()})")
             return
         if s.lower() == "return":
-            self._emit_save_sync()
-            if self._current_result_name:
-                self.emit(f"return {self._current_result_name}")
-            else:
-                self.emit("return")
+            self._emit_procedure_return()
             return
         if "=" in s and _find_top_level_double_colon(s) == -1:
             lhs, rhs = s.split("=", 1)
@@ -4519,8 +4734,16 @@ class basic_f2p:
                 for k, v in kwargs_py.items():
                     actual_by_formal[k] = v
                 out_actuals = [actual_by_formal.get(fm, "") for fm in out_formals]
-                if out_actuals and all(x != "" for x in out_actuals):
-                    self.emit(f"{', '.join(out_actuals)} = {cname}({', '.join(merged)})")
+                if out_actuals:
+                    targets = []
+                    for actual in out_actuals:
+                        if not actual:
+                            self._allocation_counter += 1
+                            actual = _choose_fresh_identifier(self._allocation_source, f'_xf2p_unused_output_{self._allocation_counter}')
+                        elif not isinstance(ast.parse(actual, mode='eval').body, (ast.Name, ast.Attribute, ast.Subscript)):
+                            raise ValueError(f'modified dummy argument of {cname} requires a definable actual, not {actual}')
+                        targets.append(actual)
+                    self.emit(f"{', '.join(targets)} = {cname}({', '.join(merged)})")
                     return True
             self.emit(f"{cname}({', '.join(merged)})")
             return True
@@ -4530,10 +4753,7 @@ class basic_f2p:
 
         # return
         if sl == "return":
-            if self._current_result_name:
-                self.emit(f"return {self._current_result_name}")
-            else:
-                self.emit("return")
+            self._emit_procedure_return()
             return True
         mm = re.fullmatch(r"(exit|cycle)(?:\s+([a-z_]\w*))?", s, re.I)
         if mm:
@@ -5226,6 +5446,17 @@ class basic_f2p:
                       and not sym[a].get('pointer') and 'allocatable' not in sym[a].get('attrs_l', '')]
         if contiguous:
             self.emit(f"@_f_contiguous_arguments({', '.join(repr(spec) for spec in contiguous)})")
+        function_outputs = self._binding_targets.get(fname.lower(), {}).get('out', [])
+        if function_outputs:
+            output_hints = []
+            for name in function_outputs:
+                info = sym.get(name, {})
+                hint = self._type_hint(info.get('ftype', 'integer'), info.get('type_name'),
+                                       is_array=bool(info.get('is_array')))
+                if 'optional' in info.get('attrs_l', ''):
+                    hint += ' | None'
+                output_hints.append(hint)
+            result_hint = f"tuple[{result_hint}, {', '.join(output_hints)}]"
         self.emit(f"def {fname}({', '.join(args_annot)}) -> {result_hint}:")
         self.indent += 1
         self._save_stack.append((save_dict_name, save_names))
@@ -5258,6 +5489,7 @@ class basic_f2p:
             local_scope.setdefault(arg, dict(ftype="integer", is_array=False))
         local_scope.setdefault(result_name, dict(ftype=result_ftype, is_array=not result_is_scalar))
         self._host_scopes.append((local_scope, "nonlocal"))
+        self._emit_value_dummy_copies(args, sym)
         if is_elemental:
             self._elemental_funcs.add(fname.lower())
             _xf2p_elem_guard = " or ".join(f"_xf2p_is_arraylike({a})" for a in args) if args else "False"
@@ -5817,12 +6049,11 @@ class basic_f2p:
         out_formals: list[str] = []
         pure_out_formals: list[str] = []
         out_otypes: list[str] = []
+        inferred_outputs = set(self._binding_targets.get(sname.lower(), {}).get('out', []))
         for a in args:
-            info = sym.get(a)
-            if not info:
-                continue
+            info = sym.get(a, {})
             attrs_l = re.sub(r"\s+", "", info.get("attrs_l", ""))
-            if "intent(out" in attrs_l or "intent(inout" in attrs_l:
+            if not self._has_value_attribute(attrs_l) and ("intent(out" in attrs_l or "intent(inout" in attrs_l or a.lower() in inferred_outputs):
                 out_formals.append(a)
                 out_otypes.append(self._scalar_otype_expr(cast(str, info.get("ftype")), cast(str | None, info.get("type_name"))))
             if "intent(out" in attrs_l and "intent(inout" not in attrs_l:
@@ -5862,6 +6093,8 @@ class basic_f2p:
             local_scope.setdefault(arg, dict(ftype="integer", is_array=False))
         self._host_scopes.append((local_scope, "nonlocal"))
 
+        self._emit_value_dummy_copies(args, sym)
+
         for kind, header, ibody in internals:
             if kind == "function":
                 self.transpile_function(header, ibody)
@@ -5899,6 +6132,8 @@ class basic_f2p:
         self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
         self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
 
+        previous_outputs = self._current_subroutine_outputs
+        self._current_subroutine_outputs = out_formals
         for code, comment in main_lines:
             s = code.strip()
             self.emit_comment(comment)
@@ -5914,6 +6149,8 @@ class basic_f2p:
                 self.emit(f"return {out_formals[0]}")
             else:
                 self.emit("return " + ", ".join(out_formals))
+
+        self._current_subroutine_outputs = previous_outputs
 
         self._host_scopes.pop()
         self._host_scopes.pop()  # procedure-local USE associations
@@ -6030,6 +6267,8 @@ class basic_f2p:
         # Bindings precede their implementations; collect signatures before
         # emitting dataclass forwarding methods and resolving bound CALLs.
         self._binding_targets = {}
+        inference_units = {}
+        self._subr_sigs = {}
         for i, (code, _comment) in enumerate(raw):
             header = re.search(r"\b(function|subroutine)\s+(\w+)\s*\(([^)]*)\)", code, re.I)
             if not header or re.match(r"\s*end\b", code, re.I):
@@ -6038,19 +6277,44 @@ class basic_f2p:
             args = [a.strip().lower() for a in split_args(header.group(3)) if a.strip()]
             body, _end = self._collect_subprogram_body(raw, i + 1, kind)
             main_lines, _internals = self._split_internal_subprograms(body)
-            outputs, optional = set(), set()
+            outputs, optional, symbols = set(), set(), {}
             for statement, _ in main_lines:
                 declaration = self._parse_decl_line(statement.strip())
                 if not declaration:
                     continue
                 _ftype, _type_name, attrs, items = declaration
                 for arg, _shape, _init in items:
-                    if re.search(r"intent\s*\(\s*(?:out|inout)\s*\)", attrs):
+                    symbols[arg.lower()] = dict(ftype=_ftype, type_name=_type_name,
+                        is_array=_shape is not None, attrs=attrs)
+                    if not self._has_value_attribute(attrs) and re.search(r"intent\s*\(\s*(?:out|inout)\s*\)", attrs):
                         outputs.add(arg.lower())
                     if "optional" in attrs:
                         optional.add(arg.lower())
             self._binding_targets[name] = {"kind": kind, "args": args,
                 "out": [a for a in args if a in outputs], "optional": optional}
+            eligible = {a for a in args if not re.search(r'intent\s*\(', symbols.get(a, {}).get('attrs', ''))
+                        and not self._has_value_attribute(symbols.get(a, {}).get('attrs', ''))
+                        and not symbols.get(a, {}).get('is_array')
+                        and symbols.get(a, {}).get('ftype') != 'type'}
+            inference_units[name] = (main_lines, eligible, symbols)
+        # CALL chains can define a dummy even when its own body has no assignment.
+        changed = True
+        while changed:
+            changed = False
+            for name, (lines, eligible, _symbols) in inference_units.items():
+                signature = self._binding_targets[name]
+                writes = set(signature['out']) | self._scalar_dummy_writes(lines, eligible, self._binding_targets, _symbols)
+                outputs = [a for a in signature['args'] if a in writes]
+                if outputs != signature['out']:
+                    signature['out'] = outputs
+                    changed = True
+        for name, (_lines, _eligible, symbols) in inference_units.items():
+            signature = self._binding_targets[name]
+            if signature['kind'] != 'subroutine':
+                continue
+            self._subr_sigs[name] = dict(args=list(signature['args']), out=list(signature['out']),
+                arg_specs=[{key: symbols.get(arg, {}).get(key, False if key == 'is_array' else None)
+                            for key in ('ftype', 'type_name', 'is_array')} for arg in signature['args']])
         self.seen_parameter = any(re.search(r"\bparameter\b", code, re.I) for code, _c in raw)
         self._seen_scipy_special = any(
             re.search(r"\b(?:gamma|log_gamma|erf|erfc|erfc_scaled|bessel_j0|bessel_j1|bessel_y0|bessel_y1|bessel_jn|bessel_yn)\s*\(",
@@ -6724,7 +6988,7 @@ class basic_f2p:
                 out_lines.append("")
             out_lines.append('if __name__ == "__main__":')
             out_lines.append("    main()")
-        return "\n".join(out_lines).rstrip() + "\n"
+        return self._function_scalar_copyback("\n".join(out_lines).rstrip() + "\n")
 
 
 def _report_run_diff(reference: str, actual: str, rtol: float = 1e-9,
