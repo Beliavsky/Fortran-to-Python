@@ -84,6 +84,17 @@ blocked, not_requested, match, mismatch, and not_compared. Summary 'pass'
 means all requested stages passed, not necessarily that outputs were compared.
 --run-diff is required to establish an output match.
 
+Use --failures-only for concise console output: successful case details are
+suppressed, but a short progress line remains for each case. Failures, timeouts,
+comparison mismatches, warnings, and library-only skips remain visible, followed
+by report locations, counts, and timings. Any nonempty stage stderr is retained
+as a diagnostic, even when the stage passes. Warning lines on stdout are also
+shown. With --verbose, full stage output is buffered and shown only for cases
+needing attention. JSON and text reports are unaffected by console filtering.
+
+Example:
+python xf2p_batch.py "tests/cases/features/*.f90" --run-diff --failures-only
+
 Library-only files are conservatively identified and skipped, not counted as
 translation failures. Ambiguous source proceeds through the normal stages.
 Compilation diagnostics for missing .mod files get a separate dependency

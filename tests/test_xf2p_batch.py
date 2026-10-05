@@ -134,3 +134,83 @@ def test_real_multifile_group(tmp_path):
     report = json.loads(next(destination.glob("*/results.json")).read_text())
     assert report["cases"][0]["stages"]["comparison"]["status"] == "match"
     assert not (tmp_path / "main_f.py").exists()
+
+
+@pytest.mark.parametrize('verbose', [False, True])
+def test_failures_only_keeps_diagnostics_and_complete_reports(tmp_path, monkeypatch, capsys, verbose):
+    import json
+    names = ['a_pass', 'b_fail', 'c_skip', 'd_warning', 'e_mismatch', 'f_timeout']
+    for name in names:
+        (tmp_path / f'{name}.f90').write_text('program p\nend program\n')
+
+    def fake_evaluate(sources, directory, args):
+        name = sources[0].stem
+        stages = {stage: {'status': 'not_requested'} for stage in
+                  ('compile', 'fortran_run', 'translate', 'python_run', 'comparison')}
+        stages['translate'] = {'status': 'pass', 'stdout': 'successful translation',
+                               'stderr': '', 'elapsed_seconds': 0.1}
+        stages['fortran_run'] = {'status': 'pass', 'stdout': 'reference output\n'}
+        stages['python_run'] = {'status': 'pass', 'stdout': 'python output\n'}
+        stages['comparison'] = {'status': 'match'}
+        outcome, classification = 'pass', 'program'
+        if name == 'b_fail':
+            stages['translate'].update(status='fail', stderr='translation error')
+            outcome = 'translate_fail'
+        elif name == 'c_skip':
+            outcome, classification = 'skipped_library', 'library_only'
+        elif name == 'd_warning':
+            stages['translate']['stderr'] = 'Warning: suspicious input'
+        elif name == 'e_mismatch':
+            stages['comparison'] = {'status': 'mismatch', 'detail': 'first mismatch line: 1'}
+            outcome = 'comparison_mismatch'
+        elif name == 'f_timeout':
+            stages['python_run'].update(status='timeout', stdout='partial output\n')
+            outcome = 'python_run_timeout'
+        if args.verbose:
+            print(f'VERBOSE {name}: successful translation; reference output; python output')
+            for stage in stages.values():
+                if stage.get('stderr'):
+                    print(stage['stderr'])
+        return {'sources': list(map(str, sources)), 'work_dir': str(directory),
+                'classification': classification, 'stages': stages, 'outcome': outcome}
+
+    monkeypatch.setattr(batch, 'evaluate', fake_evaluate)
+    destination = tmp_path / 'reports'
+    args = [str(tmp_path / '*.f90'), '--run-diff', '--failures-only', '--out-dir', str(destination)]
+    if verbose:
+        args.append('--verbose')
+    assert batch.main(args) == 1
+    printed = capsys.readouterr().out
+    assert '[1/6] Checking...' in printed
+    assert 'a_pass.f90' not in printed and 'VERBOSE a_pass' not in printed
+    for name in names[1:]:
+        assert f'{name}.f90' in printed
+    assert 'translation error' in printed and 'Warning: suspicious input' in printed
+    assert 'skipped_library' in printed and 'python_run_timeout' in printed
+    assert 'reference output' in printed and 'python output' in printed
+    if not verbose:
+        assert 'first mismatch line: 1' in printed and 'partial output' in printed
+    assert printed.splitlines()[-1].startswith('Time: total ')
+    report_path = next(destination.glob('*/results.json'))
+    report = json.loads(report_path.read_text())
+    assert report['complete'] and report['completed_cases'] == 6
+    assert report['options']['failures_only'] is True
+    assert report['cases'][0]['stages']['translate']['stdout'] == 'successful translation'
+    assert report['cases'][0]['stages']['comparison']['status'] == 'match'
+    assert 'a_pass.f90' in report_path.with_name('results.txt').read_text()
+
+
+def test_failures_only_retains_stdout_warnings(tmp_path, monkeypatch, capsys):
+    source = tmp_path / 'warn.f90'
+    source.write_text('program p\nend program\n')
+
+    def fake_stage(command, cwd, timeout):
+        Path(command[-1]).write_text('print(1)')
+        return {'status': 'pass', 'stdout': 'normal output\nWarning: review this\n',
+                'stderr': '', 'elapsed_seconds': 0.0}
+
+    monkeypatch.setattr(batch, 'stage', fake_stage)
+    assert batch.main([str(source), '--failures-only', '--out-dir', str(tmp_path / 'reports')]) == 0
+    printed = capsys.readouterr().out
+    assert 'warn.f90' in printed and 'Warning: review this' in printed
+    assert 'normal output' not in printed

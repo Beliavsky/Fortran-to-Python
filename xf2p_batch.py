@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 import glob
+import io
 import json
 import math
 import os
@@ -91,6 +93,8 @@ def evaluate(sources: list[Path], directory: Path, args) -> dict:
                                   *map(str, translation_sources), "--out", str(output)], py_dir)
     if stages["translate"]["status"] == "pass" and not output.exists():
         stages["translate"].update(status="fail", stderr="Translator did not create output")
+        if getattr(args, "verbose", False):
+            print("  Translation: fail (Translator did not create output)", flush=True)
     if args.run or args.run_both or args.run_diff:
         stages["python_run"] = {"status": "blocked"}
         if stages["translate"]["status"] == "pass":
@@ -136,6 +140,31 @@ def timing_summary(cases: list[dict], elapsed: float) -> str:
             f"other {other:.3f}s")
 
 
+def has_diagnostics(case: dict) -> bool:
+    return any(value.get("stderr", "").strip() or
+               re.search(r"^.*\bwarning\b.*$", value.get("stdout", ""), re.I | re.M)
+               for value in case["stages"].values())
+
+
+def print_case_diagnostics(case: dict) -> None:
+    """Show failure details and warnings without requiring verbose output."""
+    mismatch = case["stages"]["comparison"]["status"] == "mismatch"
+    for name, value in case["stages"].items():
+        failed = value["status"] in ("fail", "error", "timeout", "mismatch")
+        show_output = failed or (mismatch and name in ("fortran_run", "python_run"))
+        stdout = value.get("stdout", "")
+        if not show_output:
+            stdout = "\n".join(line for line in stdout.splitlines()
+                               if re.search(r"\bwarning\b", line, re.I))
+        if failed or stdout or value.get("stderr", "").strip():
+            print(f"  {name}: {value['status']}", flush=True)
+            for key, content in (("detail", value.get("detail", "")),
+                                 ("stdout", stdout), ("stderr", value.get("stderr", ""))):
+                if content:
+                    print(f"  {key}:", flush=True)
+                    print(content, end="" if content.endswith("\n") else "\n", flush=True)
+
+
 def report_text(report: dict) -> str:
     lines = ["Fortran-to-Python batch report", f"Started: {report['started_utc']}",
              f"Ended: {report['ended_utc']}", f"Elapsed: {report['elapsed_seconds']:.2f} seconds",
@@ -171,6 +200,8 @@ def main(argv=None) -> int:
     parser.add_argument("--diff-exact", action="store_true", help="Compare normalized stdout text exactly (implies --run-diff)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print commands, timings, and labeled output after each stage")
+    parser.add_argument("--failures-only", action="store_true",
+                        help="Suppress successful case details; keep progress, warnings, skips, and complete reports")
     parser.add_argument("--compiler", default="gfortran -O0 -g -fcheck=all -fbacktrace")
     parser.add_argument("--timeout", type=float, default=90, help="Seconds allowed per subprocess")
     parser.add_argument("--limit", type=int, help="Maximum number of cases")
@@ -221,10 +252,24 @@ def main(argv=None) -> int:
     for index, sources in enumerate(cases, 1):
         if index > 1:
             print(flush=True)
-        print(f"[{index}/{len(cases)}] {' + '.join(map(str, sources))}", flush=True)
-        result = evaluate(sources, directory / f"case_{index:04d}", args)
+        heading = f"[{index}/{len(cases)}] {' + '.join(map(str, sources))}"
+        if args.failures_only:
+            print(f"[{index}/{len(cases)}] Checking...", flush=True)
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                result = evaluate(sources, directory / f"case_{index:04d}", args)
+            if result["outcome"] != "pass" or has_diagnostics(result):
+                print(heading, flush=True)
+                print("  " + result["outcome"], flush=True)
+                if args.verbose:
+                    print(captured.getvalue(), end="", flush=True)
+                else:
+                    print_case_diagnostics(result)
+        else:
+            print(heading, flush=True)
+            result = evaluate(sources, directory / f"case_{index:04d}", args)
+            print("  " + result["outcome"], flush=True)
         results.append(result)
-        print("  " + result["outcome"], flush=True)
         # Save progress after every case so interrupted long surveys retain results.
         report = {"schema_version": 1, "started_utc": started,
                   "ended_utc": datetime.now(timezone.utc).isoformat(),
