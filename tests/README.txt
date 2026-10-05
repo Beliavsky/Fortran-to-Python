@@ -403,3 +403,11 @@ Messages identify the operation and available procedure names. Declarations are
 rejected even if unused; overload resolution is not implemented. CLI checks
 verify a nonzero exit and no generated Python rather than a later runtime error.
 Intrinsic operations and ordinary named generic interfaces remain supported.
+
+Vector subscripts
+-----------------
+tests/test_vector_subscripts.py and features/vector_subscripts.f90 cover
+Cartesian selection with multiple vector subscripts, mixtures of vectors,
+scalars and slices, axis order, nondefault lower bounds, reversed sections,
+empty and repeated vectors, indexed assignment and WHERE writeback.
+Ordinary scalar/slice sections continue to share storage with their arrays.

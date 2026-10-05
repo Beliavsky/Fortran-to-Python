@@ -2031,6 +2031,22 @@ class basic_f2p:
             stop = ""
         return f"{start}:{stop}"
 
+    def _cartesian_array_reference(self, name, parts, arrays_1d, bounds_name=None):
+        bounds_name = bounds_name or name
+        array_expr = self.translate_expr(bounds_name, arrays_1d) if bounds_name != name else name
+        indices = []
+        for axis, part in enumerate(parts):
+            if len(split_top_level(part, ':', preserve_empty=True)) > 1:
+                lo, hi = self._split_section(part)
+                section = self._slice_expr_from_decl_bounds(bounds_name, lo, hi, axis, arrays_1d)
+                endpoints = split_top_level(section, ':', preserve_empty=True)
+                if len(endpoints) == 2:
+                    section = f"slice({endpoints[0] or 'None'}, {endpoints[1] or 'None'})"
+                indices.append(section)
+            else:
+                indices.append(self._index_expr_from_decl_bounds(bounds_name, part, axis, arrays_1d))
+        return f"{name}[_f_array_indices({array_expr}, {', '.join(indices)})]"
+
     def _translate_bit_call(self, name, inner, arrays_1d):
         parameters, required = _INTRINSIC_ARGUMENTS[name]
         raw = _bind_intrinsic_arguments(name, inner, parameters, required)
@@ -2695,18 +2711,7 @@ class basic_f2p:
                         if name in arrays_1d or dotted_array_ref:
                             if "," in inner:
                                 parts = [p.strip() for p in split_args(inner)]
-                                idx_parts: list[str] = []
-                                for ptxt in parts:
-                                    if ptxt == ":":
-                                        idx_parts.append(":")
-                                    elif ":" in ptxt:
-                                        lo, hi = self._split_section(ptxt)
-                                        lo = lo.strip()
-                                        hi = hi.strip()
-                                        idx_parts.append(self._slice_expr_from_decl_bounds(full_name, lo, hi, len(idx_parts), arrays_1d))
-                                    else:
-                                        idx_parts.append(self._index_expr_from_decl_bounds(full_name, ptxt, len(idx_parts), arrays_1d))
-                                out.append(f"{name}[{', '.join(idx_parts)}]")
+                                out.append(self._cartesian_array_reference(name, parts, arrays_1d, full_name))
                                 i = pclose + 1
                                 continue
                             if ":" in inner:
@@ -2890,10 +2895,9 @@ class basic_f2p:
         if self._decl_types.get(base) != "integer":
             return rhs_py
         is_array = base in self._decl_array_types or base in arrays_1d
-        suffix = lhs[match.end():].strip()
-        if suffix.startswith("("):
-            # An indexed element is scalar; a section retains array rank.
-            is_array = is_array and ":" in suffix
+        # Indexed arrays may retain rank through vector subscripts even
+        # without a colon. NumPy's elementwise conversion also handles a
+        # scalar RHS for either scalar-element or section assignment.
         if is_array:
             return f"np.asarray({rhs_py}, dtype=int)"
         return f"int({rhs_py})"
@@ -2951,18 +2955,8 @@ class basic_f2p:
             if name in arrays_1d or dotted_array_ref:
                 if "," in idx:
                     parts = [p.strip() for p in split_args(idx)]
-                    idx_parts: list[str] = []
-                    for ptxt in parts:
-                        if ptxt == ":":
-                            idx_parts.append(":")
-                        elif ":" in ptxt:
-                            lo, hi = self._split_section(ptxt)
-                            lo = lo.strip()
-                            hi = hi.strip()
-                            idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
-                        else:
-                            idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
-                    self.emit(f"{name}[{', '.join(idx_parts)}] = {rhs_py}")
+                    target = self._cartesian_array_reference(name, parts, arrays_1d)
+                    self.emit(f"{target} = {rhs_py}")
                     return
                 if ":" in idx:
                     lo, hi = self._split_section(idx)
@@ -3421,27 +3415,11 @@ class basic_f2p:
                 if close_pos == len(lhs) - 1:
                     idx_name = name_try
                     idx = lhs[open_pos + 1 : close_pos].strip()
-        if idx_name is not None and idx is not None and (":" in idx or "," in idx):
+        if idx_name is not None and idx is not None and (
+                idx_name in arrays_1d or ":" in idx or "," in idx):
             name = idx_name
-            if "," in idx:
-                parts = [p.strip() for p in split_args(idx)]
-                idx_parts: list[str] = []
-                for ptxt in parts:
-                    if ptxt == ":":
-                        idx_parts.append(":")
-                    elif ":" in ptxt:
-                        lo, hi = self._split_section(ptxt)
-                        lo = lo.strip()
-                        hi = hi.strip()
-                        idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
-                    else:
-                        idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
-                target = f"{name}[{', '.join(idx_parts)}]"
-            else:
-                lo, hi = self._split_section(idx)
-                lo = lo.strip()
-                hi = hi.strip()
-                target = f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}]"
+            parts = [p.strip() for p in split_args(idx)]
+            target = self._cartesian_array_reference(name, parts, arrays_1d)
             self.emit(f"{target} = np.where({mask_expr}, {rhs_py}, {target})")
             return True
         is_array_target = (lhs in arrays_1d) or (lhs_base in self._decl_array_types)

@@ -32,7 +32,36 @@ def _reshape_with_pad(a, newshape, order="C", pad=None):
 
 np.reshape = _reshape_with_pad
 
+def _f_array_indices(array, *indices):
+    """Cartesian Fortran subscripts, with basic sections kept as views.
+
+    Inputs are zero-based. Return indices, not a copy of the selection,
+    so the same helper supports reads and assignment into the original.
+    """
+    if not any(not isinstance(i, slice) and np.ndim(i) > 0 for i in indices):
+        return tuple(indices)
+    if len(indices) != np.ndim(array):
+        raise ValueError("Fortran subscript count must match array rank")
+    selectors, retained = [], []
+    for axis, index in enumerate(indices):
+        if isinstance(index, slice):
+            index = np.arange(array.shape[axis])[index]
+        else:
+            index = np.asarray(index)
+            if index.ndim > 1 or index.dtype.kind not in "iu":
+                raise TypeError("Fortran subscripts must be scalar or rank-1 integers")
+            if np.any(index < 0) or np.any(index >= array.shape[axis]):
+                raise IndexError("Fortran array subscript out of bounds")
+        selectors.append(index)
+        if np.ndim(index) == 1:
+            retained.append(axis)
+    for axis, index in zip(retained, np.ix_(*(selectors[a] for a in retained))):
+        selectors[axis] = index
+    return tuple(selectors)
+
+
 __all__ = [
+    "_f_array_indices",
     "_f_elemental_subroutine",
     "_f_component_array", "_f_assign_component_array",
     "_f_product", "_f_unpack", "_f_cshift", "_f_eoshift", "_f_is_contiguous",
