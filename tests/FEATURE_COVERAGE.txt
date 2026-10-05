@@ -453,3 +453,15 @@ operator-overloading/defined-assignment diagnostics naming their implementation
 procedures. Named operators and type-bound GENERIC operator/assignment bindings
 are also rejected; intrinsic operations and ordinary named interfaces are not.
 This is an explicit limitation diagnostic, not overload-resolution support.
+
+Kind selection (2026-10-05)
+--------------------------
+SELECTED_INT_KIND, SELECTED_REAL_KIND and SELECTED_LOGICAL_KIND now use shared
+runtime helpers with keyword/optional argument binding and scalar INTEGER
+validation. Selection covers INTEGER/LOGICAL byte kinds 1,2,4,8 and IEEE REAL
+4,8, returning the standard failure codes for requests outside that model.
+This is not an installed-compiler query or extended-kind arithmetic emulation.
+The three established kind-selection fixtures are no longer expected failures.
+selected_kinds.f90 adds boundary, declaration, array, and model-inquiry checks;
+tests/test_selected_kinds.py also covers negative requests, unsupported radix,
+extended requests, malformed calls, and nested expressions.

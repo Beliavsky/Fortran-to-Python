@@ -167,6 +167,11 @@ Consult [feature coverage](tests/FEATURE_COVERAGE.txt) and
 
 ## Tests
 
+`SELECTED_INT_KIND`, `SELECTED_REAL_KIND` and `SELECTED_LOGICAL_KIND` use the
+runtime's supported kind model: integer/logical byte kinds 1, 2, 4, 8 and IEEE
+real kinds 4, 8. These do not query the installed compiler's extended kinds or
+add kind-dependent arithmetic emulation.
+
 List-directed complex output preserves component precision using Python float
 representations. Numerical output comparison checks standalone `(real,imaginary)`
 pairs component by component, using the same tolerances as real values, even

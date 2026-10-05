@@ -1129,6 +1129,9 @@ _LOCAL_RUNTIME_HELPERS = {
 }
 
 _INTRINSIC_ARGUMENTS = {
+    'selected_int_kind': (('r',), 1),
+    'selected_real_kind': (('p', 'r', 'radix'), 0),
+    'selected_logical_kind': (('bits',), 1),
     'maxval': (('array', 'dim', 'mask'), 1),
     'minval': (('array', 'dim', 'mask'), 1),
     'product': (('array', 'dim', 'mask'), 1),

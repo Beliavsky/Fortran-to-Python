@@ -231,6 +231,7 @@ __all__ = [
     "_f_tanpi",
     "_f_fraction", "_f_exponent", "_f_scale", "_f_set_exponent",
     "_f_nearest", "_f_spacing", "_f_rrspacing", "_f_numeric_model",
+    "_f_selected_int_kind", "_f_selected_real_kind", "_f_selected_logical_kind",
     "_f_dim", "_f_sign",
     "spread",
     "huge",
@@ -859,6 +860,49 @@ def _f_spacing(x):
 def _f_rrspacing(x):
     a = _f_real_array(x)
     return np.ldexp(np.abs(_f_fraction(a)), np.finfo(a.dtype).nmant + 1)
+
+
+def _f_kind_request(value, name):
+    """Kind selection arguments must be scalar integers, not rounded reals."""
+    value = np.asarray(value)
+    if value.ndim != 0 or value.dtype.kind not in 'iu':
+        raise TypeError(f'{name} requires a scalar INTEGER argument')
+    return int(value)
+
+
+def _f_selected_int_kind(r):
+    """Select among supported byte kinds 1, 2, 4, 8 (not a host compiler query)."""
+    r = _f_kind_request(r, 'SELECTED_INT_KIND R')
+    for kind, decimal_range in ((1, 2), (2, 4), (4, 9), (8, 18)):
+        if r <= decimal_range:
+            return kind
+    return -1
+
+
+def _f_selected_logical_kind(bits):
+    bits = _f_kind_request(bits, 'SELECTED_LOGICAL_KIND BITS')
+    return next((kind for kind in (1, 2, 4, 8) if 8 * kind >= bits), -1)
+
+
+def _f_selected_real_kind(p=0, r=0, radix=None):
+    """Select IEEE binary32/binary64; extended real kinds are not supported."""
+    p = _f_kind_request(p, 'SELECTED_REAL_KIND P')
+    r = _f_kind_request(r, 'SELECTED_REAL_KIND R')
+    if radix is not None and _f_kind_request(radix, 'SELECTED_REAL_KIND RADIX') != 2:
+        return -5
+    models = ((4, 6, 37), (8, 15, 307))
+    for kind, precision, decimal_range in models:
+        if p <= precision and r <= decimal_range:
+            return kind
+    precision_available = any(p <= precision for _, precision, _ in models)
+    range_available = any(r <= decimal_range for _, _, decimal_range in models)
+    if not precision_available and not range_available:
+        return -3
+    if not precision_available:
+        return -1
+    if not range_available:
+        return -2
+    return -4
 
 
 def _f_numeric_model(x, inquiry, *, integer_kind=None):

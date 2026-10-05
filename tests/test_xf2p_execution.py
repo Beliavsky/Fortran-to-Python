@@ -14,9 +14,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CASES = Path(__file__).parent / "cases"
 KNOWN_FAILURES = {
     "execute_command_line": "EXECUTE_COMMAND_LINE has no translated helper",
-    "selected_integer_kind": "SELECTED_INT_KIND has no translated helper",
-    "selected_logical_kind": "SELECTED_LOGICAL_KIND has no translated helper",
-    "selected_real_kind": "SELECTED_REAL_KIND has no translated helper",
     "type_extension": "parent component of an extended type is missing",
 }
 

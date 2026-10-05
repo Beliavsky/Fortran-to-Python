@@ -101,11 +101,9 @@ This is numerical-output validation, not byte-for-byte formatting validation.
 Original Fortran and translated Python run in separate directories, so file
 I/O cannot accidentally reuse files produced by the reference execution.
 
-Known failures (2026-10-04)
---------------------------
+Known failures
+--------------
 execute_command_line: missing EXECUTE_COMMAND_LINE helper.
-selected_integer_kind, selected_logical_kind, selected_real_kind: missing
-kind-selection intrinsic helpers.
 type_extension: missing parent component of an extended type.
 
 These cases are strict expected failures, not skipped. Their Fortran
@@ -444,6 +442,17 @@ array output, single/double precision, tiny and large components, signed zero,
 nonfinite values, Fortran element order, and separation from character output.
 tests/test_output_compare.py and tests/test_xf2p_run_diff.py cover tolerant
 component-wise comparisons and the unchanged exact-text mode in CLI/batch runs.
+
+Kind selection
+--------------
+tests/test_selected_kinds.py covers SELECTED_INT_KIND, SELECTED_REAL_KIND and
+SELECTED_LOGICAL_KIND, keyword/optional arguments, nested calls, boundaries,
+failure codes, and rejection of noninteger/nonscalar requests. The corresponding
+feature programs and selected_kinds.f90 compare declarations and model inquiries
+with native Fortran. These three cases are no longer expected failures.
+Selection uses the translator's byte-kind convention: INTEGER/LOGICAL 1,2,4,8
+and IEEE REAL 4,8. It is not a query of the installed compiler's extended kinds,
+nor does it add exact kind-dependent arithmetic/storage emulation.
 
 Integer enumerators
 -------------------

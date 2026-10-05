@@ -398,14 +398,21 @@ not a guarantee that every argument combination or context is supported.
 | `minloc`, `maxloc`, `findloc` | Runtime helpers for DIM, MASK, BACK, empty results, and one-based locations. |
 | `cshift`, `eoshift` | `_f_cshift`, `_f_eoshift`. |
 | Selected special functions | SciPy functions, imported only when needed. |
+| `selected_int_kind`, `selected_real_kind`, `selected_logical_kind` | Runtime selection helpers, including keyword arguments and failure codes. |
 
 Fortran reductions with MASK and DIM, logical matrix products, and location
 intrinsics should not be replaced blindly with the nearest NumPy spelling.
 For example, `np.argmin` returns a zero-based index and has different empty
 array and multidimensional-result rules from `MINLOC`.
 
-Some intrinsics remain unimplemented. In particular, support for declared
-numeric kinds does not imply support for every `SELECTED_*_KIND` inquiry.
+Kind selection uses the translator's kind-to-byte convention: INTEGER and
+LOGICAL kinds 1, 2, 4, 8 and IEEE REAL kinds 4, 8 (decimal precision/range
+6/37 and 15/307). Unsupported requests return failure codes, including -5
+for a nonbinary real radix. This describes the translated runtime, not the
+installed Fortran compiler: extended integer/real/logical kinds may differ.
+Selection does not add kind-dependent storage or arithmetic emulation; existing
+floating-point kind fidelity limitations still apply. Other intrinsics, such
+as `SELECTED_CHAR_KIND`, remain unimplemented.
 
 ## Output and validation
 
