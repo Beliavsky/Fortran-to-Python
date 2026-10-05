@@ -401,6 +401,24 @@ def find_matching_paren(text: str, open_pos: int) -> int:
     return -1
 
 
+def data_statements(lines: list[tuple[str, str]]):
+    """Yield DATA specifications, without confusing variables named DATA."""
+    for code, _comment in lines:
+        specifications = []
+        statements = split_top_level(code, ";")
+        for statement in statements:
+            statement = re.sub(r"^\s*\d+\s+", "", statement).strip()
+            match = re.match(r"data\s+(.+)$", statement, re.I)
+            if match is None or match.group(1).lstrip().startswith("="):
+                continue
+            if re.match(r"data\s*\([^)]*\)\s*=", statement, re.I):
+                continue
+            specifications.append((statement, match.group(1)))
+        if specifications and len(specifications) != len(statements):
+            raise ValueError("DATA statements sharing a line with other statements are not yet supported; split the line")
+        yield from specifications
+
+
 def split_args(s: str) -> list[str]:
     args: list[str] = []
     buf: list[str] = []
@@ -1364,6 +1382,79 @@ class basic_f2p:
             return m.group(1).strip()
         return None
 
+    def _apply_data_initializers(self, lines: list[tuple[str, str]], sym: dict[str, dict], args=()) -> None:
+        """Attach supported DATA values before normal initialization/SAVE analysis."""
+        names = {name.lower(): name for name in sym}
+        for statement, specification in data_statements(lines):
+            groups = split_top_level(specification, "/", preserve_empty=True)
+            if len(groups) < 3 or len(groups) % 2 != 1 or groups[-1].strip():
+                raise ValueError(f"malformed or unsupported DATA specification: {statement}")
+            for index in range(0, len(groups) - 1, 2):
+                objects = split_args(groups[index].strip().lstrip(",").strip())
+                values = []
+                for value in split_args(groups[index + 1]):
+                    repeated = split_top_level(value, "*")
+                    if len(repeated) == 1:
+                        values.append((value, 1))
+                    elif len(repeated) == 2 and re.fullmatch(r"\d+", repeated[0].strip()):
+                        values.append((repeated[1].strip(), int(repeated[0])))
+                    else:
+                        raise ValueError(f"DATA repeat count must be a literal nonnegative integer: {value}")
+                selected = []
+                for obj in objects:
+                    if not re.fullmatch(r"[a-z_]\w*", obj, re.I):
+                        raise ValueError(f"DATA currently supports whole declared variables, not partial objects or implied-DOs: {obj}")
+                    name = names.get(obj.lower())
+                    if name is None:
+                        raise ValueError(f"DATA requires an explicit declaration for '{obj}'")
+                    info = sym[name]
+                    if (info['ftype'] not in {'integer', 'real', 'complex', 'logical', 'character'}
+                            or info.get('alloc') or info.get('pointer') or info.get('target')
+                            or 'parameter' in info.get('attrs_l', '')
+                            or name.lower() in {a.lower() for a in args}
+                            or name in getattr(self, '_block_local_names', set())):
+                        raise ValueError(f"DATA initialization is not supported for '{obj}' in this context")
+                    if info.get('init') is not None:
+                        raise ValueError(f"duplicate initialization of DATA object '{obj}'")
+                    selected.append((name, info))
+                arrays = [info for _, info in selected if info.get('is_array')]
+                if arrays and len(selected) != 1:
+                    raise ValueError("DATA groups mixing arrays and other objects are not yet supported; use separate groups")
+                value_count = sum(count for _, count in values)
+                if not selected or (not arrays and value_count != len(selected)):
+                    raise ValueError(f"DATA object/value count mismatch: {statement}")
+                scalar_values = [value for value, count in values for _ in range(count)] if not arrays else []
+                for index, (name, info) in enumerate(selected):
+                    if arrays:
+                        if not value_count or not info.get('shape') or any(not hi for _, hi in self._shape_bounds(info['shape'])):
+                            raise ValueError(f"DATA requires a nonempty value list and explicit shape for '{name}'")
+                        info['init'] = '0'  # Non-None marks the implicit SAVE initialization.
+                        info['data_values'] = values
+                    else:
+                        info['init'] = scalar_values[index]
+                    info['data_initialized'] = True
+            self._data_handled_count += 1
+
+    def _data_init_expr(self, info: dict, arrays_1d: set[str]) -> str:
+        ftype = info['ftype']
+        if info.get('data_values'):
+            chunks = []
+            for value, count in info['data_values']:
+                value_py = self.translate_expr(value, arrays_1d)
+                if ftype == 'character' and info.get('char_len') is not None:
+                    length = self.translate_expr(str(info['char_len']), arrays_1d)
+                    value_py = f"_f_str_assign({value_py}, {length})"
+                chunks.append(f"np.full({count}, {value_py}, dtype={_type_dtype[ftype]})")
+            shape = self._shape_to_py(str(info['shape']), arrays_1d)
+            return f"np.concatenate([{', '.join(chunks)}]).reshape({shape}, order='F')"
+        rhs = self.translate_expr(str(info['init']), arrays_1d)
+        if ftype == 'character' and info.get('char_len') is not None:
+            length = self.translate_expr(str(info['char_len']), arrays_1d)
+            rhs = f"_f_str_assign({rhs}, {length})"
+        if ftype != 'character':
+            rhs = f"{_type_scalar_hint[ftype]}({rhs})"
+        return rhs
+
     def _collect_save_names(self, lines: list[tuple[str, str]], sym: dict[str, dict], args: list[str]) -> list[str]:
         save_names: set[str] = set()
         arg_set = {a.lower() for a in args}
@@ -1396,7 +1487,9 @@ class basic_f2p:
             ftype = info.get("ftype")
             is_array = bool(info.get("is_array"))
             init = info.get("init")
-            if (ftype == "character" and info.get("char_len") == ":"
+            if info.get('data_initialized'):
+                init_py = self._data_init_expr(info, arrays_1d)
+            elif (ftype == "character" and info.get("char_len") == ":"
                     and "allocatable" in info.get("attrs_l", "")):
                 init_py = "None"
             elif is_array:
@@ -2964,6 +3057,10 @@ class basic_f2p:
             is_ptr = bool(info.get("pointer")) or ("pointer" in attrs_l)
             is_tgt = bool(info.get("target")) or ("target" in attrs_l)
 
+            if info.get('data_initialized'):
+                self.emit(f"{name} = {self._data_init_expr(info, arrays_1d)}")
+                continue
+
             # Arrays
             if is_array:
                 # Pointer arrays: start disassociated (None) unless explicitly initialized.
@@ -3431,6 +3528,9 @@ class basic_f2p:
 
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
+        if next(data_statements([(s, '')]), None) is not None:
+            # DATA was applied in the specification pass, never at runtime.
+            return True
         if re.match(r"(?:[a-z_]\w*\s*:\s*)?select\s+rank\s*\(", s, re.I):
             raise ValueError("SELECT RANK is not yet supported; branch selection cannot be ignored safely")
         if s in getattr(self, "_lexical_block_entries", {}):
@@ -4763,6 +4863,7 @@ class basic_f2p:
             else:
                 args_annot.append(f"{a}: {hint}")
 
+        self._apply_data_initializers(main_lines, sym, args)
         save_names = self._collect_save_names(main_lines, sym, args)
         save_dict_name = f"_{fname}_save"
         self.emit(f"{save_dict_name} = {{}}")
@@ -4916,6 +5017,7 @@ class basic_f2p:
                 if is_array:
                     arrays_1d.add(name)
 
+        self._apply_data_initializers(body_lines, sym)
         # parameters
         parameter_names: set[str] = set()
         for code, _comment in body_lines:
@@ -5073,6 +5175,7 @@ class basic_f2p:
                 if is_array:
                     arrays_1d.add(name)
 
+        self._apply_data_initializers(decl_lines, sym)
         # Specification inquiries such as PARAMETER r=RANK(a) must see array
         # declarations even before their storage has been initialized.
         self._host_scopes.append(({**self._use_variable_symbols(decl_lines), **sym}, "global"))
@@ -5379,6 +5482,7 @@ class basic_f2p:
                 })
         self._subr_sigs[sname.lower()] = {"args": list(args), "out": list(out_formals), "arg_specs": arg_specs}
 
+        self._apply_data_initializers(main_lines, sym, args)
         save_names = self._collect_save_names(main_lines, sym, args)
         save_dict_name = f"_{sname}_save"
         self.emit(f"{save_dict_name} = {{}}")
@@ -5552,6 +5656,8 @@ class basic_f2p:
         raw = collapse_fortran_continuations(raw)
         reject_defined_operations(raw)
         reject_goto_statements(raw)
+        self._data_statement_count = sum(1 for _ in data_statements(raw))
+        self._data_handled_count = 0
         raw = self._lower_lexical_blocks(raw)
         self._type_bindings = {}
         self._type_components = {}
@@ -6233,6 +6339,8 @@ class basic_f2p:
             if any(code.strip() or comment.strip() for code, comment in loose_main):
                 self.transpile_program(loose_main)
 
+        if self._data_handled_count != self._data_statement_count:
+            raise ValueError("DATA initialization in an unrecognized or unsupported program unit cannot be translated safely")
         lines = "\n".join(self.out).rstrip().splitlines()
         lines = self._drop_unused_runtime(lines)
         out_lines: list[str] = []

@@ -28,6 +28,11 @@ type-bound procedures, labeled FORMAT, selected-kind intrinsics, and a
 controlled EXECUTE_COMMAND_LINE call. See FEATURE_COVERAGE.txt for results.
 array_component_initializers also verifies default component values and
 independent storage between objects and between derived-type array elements.
+data_initializers verifies DATA scalars, whole arrays in column-major order,
+literal repeat counts, character padding/truncation, and implicit SAVE of local
+scalar/array values across calls. Partial objects, implied-DOs, named repeat
+counts, mixed array/scalar groups, and unsupported DATA contexts are diagnosed
+explicitly rather than discarded. DATA does not execute as an assignment.
 location_intrinsics verifies MINLOC/MAXLOC/FINDLOC, DIM, MASK, BACK, KIND,
 Fortran array-element order, empty arrays, and character/logical searches.
 host_association checks host counter updates, module globals, an internal
