@@ -423,3 +423,14 @@ Established-suite run: 304 passed, six expected failures, 60 exploratory cases
 excluded, and one batch translation subprocess exited without output or a Python
 traceback (Windows return code 3221227274). A fresh rerun of all 12 batch tests
 passed, including that case. All eight new derived-array unit checks passed.
+
+Deferred-length character scalars (2026-10-04)
+--------------------------------------------
+The original test23_deferred_length_character retry reports Run diff: MATCH.
+CHARACTER(:), ALLOCATABLE scalar whole-variable assignment takes its length
+from the RHS instead of emitting ':' as a Python expression. A tracked fixture
+also covers shrinking/empty strings, trailing blanks, scalar derived components,
+saved locals, and deallocation/reassignment. Unit tests exercise BLOCK locals,
+function results, and rejection of unsupported named deferred-length array and
+pointer assignments. This does not add explicit deferred-length ALLOCATE or
+substring assignment support.

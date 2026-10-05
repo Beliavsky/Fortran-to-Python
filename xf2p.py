@@ -1340,7 +1340,10 @@ class basic_f2p:
             ftype = info.get("ftype")
             is_array = bool(info.get("is_array"))
             init = info.get("init")
-            if is_array:
+            if (ftype == "character" and info.get("char_len") == ":"
+                    and "allocatable" in info.get("attrs_l", "")):
+                init_py = "None"
+            elif is_array:
                 shape = info.get("shape")
                 if shape is None:
                     init_py = "None"
@@ -2739,6 +2742,14 @@ class basic_f2p:
             return f"np.asarray({rhs_py}, dtype=int)"
         return f"int({rhs_py})"
 
+    def _character_assignment_rhs(self, rhs_py: str, length: str, arrays_1d: set[str], *, deferred_array: bool = False) -> str:
+        if str(length).strip() == ":":
+            if deferred_array:
+                raise ValueError("deferred-length CHARACTER array assignment is not yet supported")
+            # Intrinsic assignment to an allocatable scalar acquires the RHS LEN.
+            return rhs_py
+        return f"_f_str_assign({rhs_py}, {self.translate_expr(str(length), arrays_1d)})"
+
     def transpile_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> None:
         if self._where_masked_assignment(lhs, rhs_py, arrays_1d):
             return
@@ -2752,7 +2763,8 @@ class basic_f2p:
             if spec and spec["ftype"] == "integer":
                 rhs_py = f"np.asarray({rhs_py}, dtype=int)" if whole_array or ":" in lhs else f"int({rhs_py})"
             if spec and spec.get("char_len") is not None:
-                rhs_py = f"_f_str_assign({rhs_py}, {self.translate_expr(spec['char_len'], arrays_1d)})"
+                rhs_py = self._character_assignment_rhs(rhs_py, spec['char_len'], arrays_1d,
+                                                        deferred_array=bool(spec.get('shape')))
             value = f"_f_assign_array({target}, {rhs_py})" if whole_array else f"_xf2p_copy_value({rhs_py})"
             self.emit(f"{target} = {value}")
             return
@@ -2761,8 +2773,10 @@ class basic_f2p:
         rhs_py = self._integer_assignment_rhs(lhs, rhs_py, arrays_1d)
         char_len_raw = self._decl_char_len.get(lhs_base)
         if char_len_raw is not None:
-            clen_py = self.translate_expr(str(char_len_raw), arrays_1d)
-            rhs_py = f"_f_str_assign({rhs_py}, {clen_py})"
+            if char_len_raw == ":" and lhs_base in self._decl_pointer:
+                raise ValueError("deferred-length CHARACTER pointer assignment is not yet supported")
+            rhs_py = self._character_assignment_rhs(rhs_py, char_len_raw, arrays_1d,
+                                                    deferred_array=lhs_base in arrays_1d)
         mname = re.match(r"^\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(", lhs, re.I)
         idx_name = None
         idx = None
@@ -3205,7 +3219,7 @@ class basic_f2p:
             if dtype and spec['ftype'] != 'character':
                 rhs_py = f'np.asarray({rhs_py}, dtype={dtype})'
             if spec.get('char_len') is not None:
-                rhs_py = f"_f_str_assign({rhs_py}, {self.translate_expr(spec['char_len'], arrays_1d)})"
+                rhs_py = self._character_assignment_rhs(rhs_py, spec['char_len'], arrays_1d)
         mask_argument = f', mask={mask}' if mask is not None else ''
         self.emit(f"_f_assign_component_array({match.group(1)}, {match.group(2)!r}, {rhs_py}{mask_argument})")
         return True
@@ -3223,7 +3237,8 @@ class basic_f2p:
             if spec and spec["ftype"] == "integer":
                 rhs_py = f"np.asarray({rhs_py}, dtype=int)"
             if spec and spec.get("char_len") is not None:
-                rhs_py = f"_f_str_assign({rhs_py}, {self.translate_expr(spec['char_len'], arrays_1d)})"
+                rhs_py = self._character_assignment_rhs(rhs_py, spec['char_len'], arrays_1d,
+                                                        deferred_array=bool(spec.get('shape')))
             value = f"np.where({mask_expr}, {rhs_py}, {target})"
             if spec and spec.get("shape") and not lhs.rstrip().endswith(")"):
                 value = f"_f_assign_array({target}, {value})"

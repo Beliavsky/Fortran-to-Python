@@ -356,3 +356,15 @@ support for pointer components, defined I/O, or component projections through
 arbitrary parent array sections. An array component of an unindexed array parent
 is rejected; use explicit subscripts rather than creating two ranked parts.
 Existing generated programs need a refreshed adjacent fortran_py_runtime.py.
+
+Deferred-length character scalars
+--------------------------------
+tests/test_deferred_character.py and features/deferred_length_character.f90
+cover whole-variable intrinsic assignment to CHARACTER(:), ALLOCATABLE scalars:
+initial allocation, growing/shrinking and empty strings, trailing blanks,
+fixed-length RHS values, concatenation, REPEAT, scalar derived components,
+saved locals, BLOCK locals, function results, and deallocation/reassignment.
+Fixed-length strings retain their padding/truncation rules. Deferred-length
+character array and pointer assignments are not supported; the covered named
+forms are rejected with a clear diagnostic. Explicit deferred-length ALLOCATE
+and character substring assignment are not covered by this feature.
