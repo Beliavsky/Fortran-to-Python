@@ -167,6 +167,12 @@ Consult [feature coverage](tests/FEATURE_COVERAGE.txt) and
 
 ## Tests
 
+List-directed complex output preserves component precision using Python float
+representations. Numerical output comparison checks standalone `(real,imaginary)`
+pairs component by component, using the same tolerances as real values, even
+when spaces or line wrapping separate the components. Use `--diff-exact` when
+the literal spelling matters (including character strings that look numeric).
+
 ```console
 pytest -q -rx
 ```

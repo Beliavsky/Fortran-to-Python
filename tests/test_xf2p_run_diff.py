@@ -31,6 +31,27 @@ def test_cli_and_batch_logical_diffs(tmp_path):
     assert xf2p_batch.main([*common, '--diff-exact']) == 1
 
 
+def test_cli_and_batch_complex_diffs(tmp_path):
+    compiler = shutil.which('gfortran')
+    if compiler is None:
+        pytest.skip('gfortran required')
+    pytest.importorskip('numpy')
+    source = tmp_path / 'complex_output.f90'
+    source.write_text('program demo\ncomplex(kind=kind(1d0)) :: z\n'
+                      'z=(1d0,2d0)\nprint *, z, exp(z)\nend program\n')
+    command = [sys.executable, str(Path(xf2p.__file__)), str(source),
+               '--compiler', f'"{compiler}" -O0', '--run-diff']
+    for options, expected in [([], 0), (['--diff-exact'], 1)]:
+        result = subprocess.run([*command, *options], cwd=tmp_path,
+                                capture_output=True, text=True, timeout=90)
+        assert result.returncode == expected, result.stdout + result.stderr
+        assert ('Run diff: MATCH' if expected == 0 else 'Run diff: DIFF') in result.stdout
+    common = [str(source), '--compiler', f'"{compiler}" -O0',
+              '--out-dir', str(tmp_path / 'batch_reports')]
+    assert xf2p_batch.main([*common, '--run-diff']) == 0
+    assert xf2p_batch.main([*common, '--diff-exact']) == 1
+
+
 @pytest.mark.parametrize('mode', ['single', 'each', 'group'])
 def test_cli_numeric_and_exact_diffs(tmp_path, mode):
     compiler = shutil.which('gfortran')

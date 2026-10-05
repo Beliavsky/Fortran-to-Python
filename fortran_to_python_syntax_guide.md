@@ -414,6 +414,14 @@ in Fortran element order. Python may print logical values as `True` and `False`
 rather than `T` and `F`. Formatting, whitespace, and default real precision can
 differ even when the numerical result is acceptable.
 
+List-directed complex output retains the `(real,imaginary)` notation, with
+each component using Python's precision-preserving float representation rather
+than a fixed decimal count. Numerical comparison checks components separately,
+including scientific/Fortran D exponents and whitespace within the pair.
+Standalone numeric-looking character output is indistinguishable from complex
+output to the comparer; use `--diff-exact` when spelling matters. Explicit
+formatted output still follows its supported edit descriptors.
+
 For sequential formatted external I/O, integer `UNIT` and negative `NEWUNIT`
 values resolve through a runtime table of Python file objects, shared across
 procedures. Named and scratch files, `REWIND`, and `CLOSE` are supported.

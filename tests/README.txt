@@ -91,6 +91,12 @@ Standalone logical tokens T/True and F/False are equivalent, matching the
 CLI's --run-diff behavior; opposite logical values still fail comparison.
 Integer tokens are compared exactly; real tokens use relative tolerance
 1e-9 and absolute tolerance 1e-11, accepting Fortran D exponents.
+Standalone complex pairs are tokenized as one value, accepting internal spaces
+and line wrapping, then compared component-wise at the same tolerances.
+Execution tests now use the shared CLI/batch comparer; matching NaNs and
+same-sign infinities also compare equal. Character output that looks like a
+logical/numeric value cannot be distinguished here; exact-text CLI comparison
+is available when its spelling matters.
 This is numerical-output validation, not byte-for-byte formatting validation.
 Original Fortran and translated Python run in separate directories, so file
 I/O cannot accidentally reuse files produced by the reference execution.
@@ -430,6 +436,14 @@ dummies and host/local scope. Model inquiries do not evaluate the integer value.
 This uses the existing kind-to-byte convention for kinds 1, 2, 4 and 8; it is
 not general integer-kind or overflow emulation. Unknown expression kinds and
 REAL/COMPLEX model inquiries still use their translated NumPy storage dtype.
+
+Complex output and comparison
+-----------------------------
+tests/test_complex_output.py and features/complex_output.f90 cover scalar and
+array output, single/double precision, tiny and large components, signed zero,
+nonfinite values, Fortran element order, and separation from character output.
+tests/test_output_compare.py and tests/test_xf2p_run_diff.py cover tolerant
+component-wise comparisons and the unchanged exact-text mode in CLI/batch runs.
 
 Integer enumerators
 -------------------

@@ -87,3 +87,46 @@ def test_invalid_tolerances(value):
         validate_tolerances(value, 0)
     with pytest.raises(ValueError):
         validate_tolerances(0, value)
+
+
+@pytest.mark.parametrize('reference,actual', [
+    ('(1.0000000000000000,2.0000000000000000)', '(1.0,2.0)'),
+    ('( 1D0,\n -2d-1 )', '(1.0,-0.2)'),
+    ('(1,2)', '(1.0000000001,2.0)'),
+    ('(nan,Infinity) (-Infinity,-0.0)', '(NaN,inf) (-inf,0.0)'),
+    ('z (1.0, 2.0) (3.0, 4.0) done', 'z (1,2)\n(3,4) done'),
+])
+def test_complex_components_compare_numerically(reference, actual):
+    assert compare_outputs(reference, actual)['status'] == 'match'
+    assert compare_outputs(actual, reference)['status'] == 'match'
+    assert compare_outputs(reference, actual, exact=True)['status'] == 'mismatch'
+
+
+@pytest.mark.parametrize('reference,actual', [
+    ('(1.0,2.0)', '(1.01,2.0)'), ('(1.0,2.0)', '(1.0,2.01)'),
+    ('(inf,2)', '(-inf,2)'), ('(nan,2)', '(1,2)'),
+    ('(1,2)', '1 2'), ('(1,2)', '(1+2j)'),
+    ('z=(1.0,2.0)', 'z=(1,2)'), ('"(1.0,2.0)"', '"(1,2)"'),
+    ('(1,2,3)', '(1.0,2.0,3.0)'), ('(1,word)', '(1.0,word)'),
+    ('(1,2)(3,4)', '(1.0,2.0)(3.0,4.0)'),
+])
+def test_complex_mismatches_and_nonstandalone_text(reference, actual):
+    assert compare_outputs(reference, actual)['status'] == 'mismatch'
+
+
+def test_complex_tolerances_are_component_wise():
+    assert compare_outputs('(1e20,0)', '(1e20,1e-4)')['status'] == 'mismatch'
+    assert compare_outputs('(1,0)', '(1,1e-12)', atol=1e-11)['status'] == 'match'
+    assert compare_outputs('(1,0)', '(1,1e-12)', atol=0)['status'] == 'mismatch'
+    assert compare_outputs('(1,2)', '(1.001,2)', rtol=.01)['status'] == 'match'
+    assert compare_outputs('19 (1,2)', '18 (1,2)', rtol=1, atol=1)['status'] == 'mismatch'
+
+
+def test_complex_first_mismatch_preserves_line_information():
+    result = compare_outputs('header\n(1D0, 2D0)\n(3, 4)',
+                             'header\n(1,2)\n(3,5)')
+    assert result['status'] == 'mismatch'
+    assert result['token'] == 3
+    assert result['reference_line'] == result['actual_line'] == 3
+    assert result['reference_text'] == '(3, 4)'
+    assert '(3,5)' in result['detail']

@@ -1,20 +1,17 @@
 """Compile original Fortran and compare it with independently executed Python."""
 from __future__ import annotations
 
-import math
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
 
 import pytest
+from fortran_output_compare import compare_outputs
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = Path(__file__).parent / "cases"
-NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?$")
-LOGICAL = {"T": True, "True": True, "F": False, "False": False}
 KNOWN_FAILURES = {
     "execute_command_line": "EXECUTE_COMMAND_LINE has no translated helper",
     "selected_integer_kind": "SELECTED_INT_KIND has no translated helper",
@@ -34,20 +31,8 @@ def require_success(result: subprocess.CompletedProcess[str]) -> None:
 
 def compare_output(reference: str, actual: str) -> None:
     """Ignore whitespace, not labels, token counts, or integer differences."""
-    expected_tokens, actual_tokens = reference.split(), actual.split()
-    assert len(expected_tokens) == len(actual_tokens), (reference, actual)
-    for index, (expected, observed) in enumerate(zip(expected_tokens, actual_tokens)):
-        if expected in LOGICAL and observed in LOGICAL:
-            assert LOGICAL[expected] == LOGICAL[observed], (index, expected, observed)
-        elif NUMBER.fullmatch(expected) and NUMBER.fullmatch(observed):
-            if re.fullmatch(r"[+-]?\d+", expected) and re.fullmatch(r"[+-]?\d+", observed):
-                assert int(expected) == int(observed), (index, expected, observed)
-            else:
-                assert math.isclose(float(expected.replace("D", "e").replace("d", "e")),
-                                    float(observed.replace("D", "e").replace("d", "e")),
-                                    rel_tol=1e-9, abs_tol=1e-11), (index, expected, observed)
-        else:
-            assert expected == observed, (index, expected, observed)
+    result = compare_outputs(reference, actual)
+    assert result['status'] == 'match', (result, reference, actual)
 
 
 def execution_sources(cases: Path, include_exploratory: bool = False) -> list[Path]:

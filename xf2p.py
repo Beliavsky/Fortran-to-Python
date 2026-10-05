@@ -6207,6 +6207,11 @@ class basic_f2p:
         self.emit("return np.conj(x)")
         self.indent -= 1
         self.emit("")
+        self.emit("class _xf2p_complex_text(str):")
+        self.indent += 1
+        self.emit('"""Numeric output text, distinct from Fortran CHARACTER values."""')
+        self.indent -= 1
+        self.emit("")
         self.emit("def _xf2p_io_scalar(x):")
         self.indent += 1
         self.emit('"""Format one scalar for Fortran-like list-directed output."""')
@@ -6216,7 +6221,7 @@ class basic_f2p:
         self.indent -= 1
         self.emit("if isinstance(x, (complex, np.complexfloating)):")
         self.indent += 1
-        self.emit("return f'({float(np.real(x)):.8f},{float(np.imag(x)):.8f})'")
+        self.emit("return _xf2p_complex_text(f'({float(np.real(x))!r},{float(np.imag(x))!r})')")
         self.indent -= 1
         self.emit("return x")
         self.indent -= 1
@@ -6370,7 +6375,7 @@ class basic_f2p:
         self.emit("print(file=file)")
         self.emit("return")
         self.indent -= 1
-        self.emit("if all(isinstance(x, str) for x in items):")
+        self.emit("if all(isinstance(x, str) and not isinstance(x, _xf2p_complex_text) for x in items):")
         self.indent += 1
         self.emit("print(''.join(str(x) for x in items), file=file)")
         self.emit("return")
@@ -6390,7 +6395,7 @@ class basic_f2p:
         self.indent += 1
         self.emit("return ''")
         self.indent -= 1
-        self.emit("if all(isinstance(x, str) for x in items):")
+        self.emit("if all(isinstance(x, str) and not isinstance(x, _xf2p_complex_text) for x in items):")
         self.indent += 1
         self.emit("return ''.join(str(x) for x in items)")
         self.indent -= 1

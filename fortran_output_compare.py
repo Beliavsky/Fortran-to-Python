@@ -8,6 +8,11 @@ NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?$")
 INTEGER = re.compile(r"^[+-]?\d+$")
 SPECIAL = re.compile(r"^[+-]?(?:inf(?:inity)?|nan)$", re.I)
 LOGICAL = {"T": True, "True": True, "F": False, "False": False}
+REAL_TEXT = rf"(?:{NUMBER.pattern[1:-1]}|{SPECIAL.pattern[1:-1]})"
+COMPLEX = re.compile(rf"^\(\s*({REAL_TEXT})\s*,\s*({REAL_TEXT})\s*\)$", re.I)
+# A standalone complex pair is one value, even if its components are separated
+# by spaces or line wrapping. Embedded labels and malformed pairs remain text.
+OUTPUT_TOKEN = re.compile(rf"(?<!\S)\(\s*{REAL_TEXT}\s*,\s*{REAL_TEXT}\s*\)(?!\S)|\S+", re.I)
 
 
 def validate_tolerances(rtol: float, atol: float) -> None:
@@ -23,6 +28,13 @@ def normalized_lines(output: str) -> list[str]:
     return lines
 
 
+def _equal_real(a: str, b: str, rtol: float, atol: float) -> bool:
+    x, y = (float(token.lower().replace("d", "e")) for token in (a, b))
+    if math.isnan(x) or math.isnan(y):
+        return math.isnan(x) and math.isnan(y)
+    return math.isclose(x, y, rel_tol=rtol, abs_tol=atol)
+
+
 def _equal_token(a: str, b: str, rtol: float, atol: float) -> bool:
     if a == b:
         return True
@@ -30,23 +42,24 @@ def _equal_token(a: str, b: str, rtol: float, atol: float) -> bool:
         return LOGICAL[a] == LOGICAL[b]
     if INTEGER.fullmatch(a) and INTEGER.fullmatch(b):
         return int(a) == int(b)
+    left, right = COMPLEX.fullmatch(a), COMPLEX.fullmatch(b)
+    if left and right:
+        return all(_equal_real(x, y, rtol, atol) for x, y in zip(left.groups(), right.groups()))
     if (NUMBER.fullmatch(a) or SPECIAL.fullmatch(a)) and (NUMBER.fullmatch(b) or SPECIAL.fullmatch(b)):
-        x, y = (float(token.lower().replace("d", "e")) for token in (a, b))
-        if math.isnan(x) or math.isnan(y):
-            return math.isnan(x) and math.isnan(y)
-        return math.isclose(x, y, rel_tol=rtol, abs_tol=atol)
+        return _equal_real(a, b, rtol, atol)
     return False
 
 
 def compare_outputs(reference: str, actual: str, rtol: float = 1e-9,
                     atol: float = 1e-11, *, exact: bool = False) -> dict:
-    """Real tokens are tolerant; standalone T/True and F/False are equivalent.
+    """Real and complex components are tolerant; T/True and F/False equivalent.
 
     Default mode ignores whitespace, including line wrapping. Exact mode uses
     normalized lines (the CLI's former behavior), not byte-for-byte equality.
     Matching NaNs and same-sign infinities compare equal.
     Other integers/text are exact. Logical-looking character output cannot be
     distinguished from logical values; use exact=True when spelling matters.
+    Likewise, standalone numeric '(real,imaginary)' text is treated as complex.
     """
     validate_tolerances(rtol, atol)
     reference = reference.replace("\r\n", "\n").replace("\r", "\n")
@@ -61,8 +74,8 @@ def compare_outputs(reference: str, actual: str, rtol: float = 1e-9,
                             reference_line=i + 1, actual_line=i + 1,
                             reference_text=a, actual_text=b)
         return {"status": "match"}
-    ref_tokens = list(re.finditer(r"\S+", reference))
-    actual_tokens = list(re.finditer(r"\S+", actual))
+    ref_tokens = list(OUTPUT_TOKEN.finditer(reference))
+    actual_tokens = list(OUTPUT_TOKEN.finditer(actual))
     for index in range(max(len(ref_tokens), len(actual_tokens))):
         a = ref_tokens[index] if index < len(ref_tokens) else None
         b = actual_tokens[index] if index < len(actual_tokens) else None
