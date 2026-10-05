@@ -554,3 +554,8 @@ including early RETURN, reallocation, scalar/function and character cases.
 INTENT(INOUT) allocations are retained.
 Optional allocatable outputs retain PRESENT even when initially unallocated;
 omitted arguments remain absent.
+
+literal_only_print.f90 and test_literal_only_print.py check literal formatted
+PRINT without an item list: both quote styles, escaped quotes, nested repeats,
+spacing, blank records, colon/data-descriptor termination, conditional PRINT,
+and an explicit diagnostic for unsupported itemless formats.

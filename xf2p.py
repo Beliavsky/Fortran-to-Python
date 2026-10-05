@@ -4860,6 +4860,16 @@ class basic_f2p:
             self.emit(f"_xf2p_print_star({', '.join(args2)})")
             return True
 
+        # A formatted PRINT with no output list still executes literal and
+        # control edit descriptors. Do not silently discard the statement.
+        mm = re.fullmatch(r"print\s*((?:\"(?:[^\"]|\"\")*\"|'(?:[^']|'')*'))\s*", s, re.I)
+        if mm:
+            fmt_expr = _fortran_format_expr(mm.group(1), [])
+            if fmt_expr is None:
+                raise ValueError(f'unsupported itemless PRINT format: {mm.group(1)}')
+            self.emit(f'print({fmt_expr})')
+            return True
+
         # print "fmt", ...
         mm = re.match(r"print\s*((\"|').*?\2)\s*,\s*(.+)$", s, re.I)
         if mm:

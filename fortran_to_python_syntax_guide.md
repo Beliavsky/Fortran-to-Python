@@ -486,6 +486,13 @@ Standalone numeric-looking character output is indistinguishable from complex
 output to the comparer; use `--diff-exact` when spelling matters. Explicit
 formatted output still follows its supported edit descriptors.
 
+A literal formatted `PRINT` without an output-item list still executes its
+literal and control descriptors: `print "('hello')"` becomes `print('hello')`.
+Supported literals, repeats, spacing and record breaks are preserved; `:` or
+a data descriptor terminates processing when no items remain. An unsupported
+descriptor in this itemless form is diagnosed rather than silently omitting
+the statement.
+
 For sequential formatted external I/O, integer `UNIT` and negative `NEWUNIT`
 values resolve through a runtime table of Python file objects, shared across
 procedures. Named and scratch files, `REWIND`, and `CLOSE` are supported.
