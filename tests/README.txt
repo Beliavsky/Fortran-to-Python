@@ -101,15 +101,13 @@ This is numerical-output validation, not byte-for-byte formatting validation.
 Original Fortran and translated Python run in separate directories, so file
 I/O cannot accidentally reuse files produced by the reference execution.
 
-Known failures
---------------
-execute_command_line: missing EXECUTE_COMMAND_LINE helper.
-
-These cases are strict expected failures, not skipped. Their Fortran
-references must still compile and execute successfully. Unexpected success
-fails the suite so that obsolete expectations are removed after a fix.
-Other assertion failures inside a known-failing translation may also count
-as expected failures; inspect their tracebacks when changing the translator.
+Expected-failure handling
+-------------------------
+There are currently no entries in the established suite's KNOWN_FAILURES map.
+The mechanism remains available for explicitly confirmed failures: references
+must still compile and execute successfully; strict unexpected success forces
+removal of obsolete expectations. Other assertion failures inside a known-
+failing translation may also count as expected failures, so inspect tracebacks.
 
 To investigate without expected-failure masking:
 
@@ -467,6 +465,20 @@ parent type and excludes extension fields. Unknown parents and redeclared
 inherited fields are diagnosed. type_extension is no longer an expected failure.
 This does not add general SELECT TYPE/polymorphic allocation, parameterized
 derived types, deferred/generic bindings or finalization support.
+
+Synchronous command execution
+-----------------------------
+tests/test_execute_command_line.py and features/execute_command_line.f90 plus
+features/execute_command_status.f90 cover EXECUTE_COMMAND_LINE positional and
+keyword arguments, default/synchronous WAIT, status outputs, unchanged messages
+on success, launch failure with/without CMDSTAT, padding/truncation, array-element
+and component outputs, host-variable updates, and output ordering. Launch errors
+are simulated without depending on the installed shell being missing. Native
+comparisons use portable echo/exit shell builtins. WAIT=.FALSE. and CMDMSG
+substrings are explicitly rejected. A completed shell's nonzero exit, including
+its command-not-found exit code, is reported through EXITSTAT; shell-launch
+failures give CMDSTAT=1 or raise without CMDSTAT. Exact processor-specific
+CMDSTAT codes/messages are not emulated. The former expected failure is removed.
 
 Integer enumerators
 -------------------

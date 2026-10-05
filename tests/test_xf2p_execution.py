@@ -12,9 +12,7 @@ from fortran_output_compare import compare_outputs
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = Path(__file__).parent / "cases"
-KNOWN_FAILURES = {
-    "execute_command_line": "EXECUTE_COMMAND_LINE has no translated helper",
-}
+KNOWN_FAILURES = {}
 
 
 def run(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:

@@ -11,6 +11,7 @@ import functools
 import inspect
 import os
 import tempfile
+import subprocess
 import numpy as np
 
 _np_reshape_orig = np.reshape
@@ -201,6 +202,7 @@ __all__ = [
     "_f_product", "_f_unpack", "_f_cshift", "_f_eoshift", "_f_is_contiguous",
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
+    "_f_execute_command_line",
     "_reshape_with_pad",
     "_f_size",
     "_f_shape",
@@ -476,6 +478,33 @@ def _f_contiguous_arguments(*specifications):
                     original[...] = temporary
         return wrapped
     return decorate
+
+
+def _f_execute_command_line(command, wait=True, *, has_cmdstat=False):
+    """Execute a synchronous shell command with inherited standard streams.
+
+    Return (EXITSTAT, CMDSTAT, CMDMSG); None means do not change that output.
+    CMDSTAT=1 denotes a Python shell-launch failure; codes/messages are not
+    compiler-independent. A completed shell command's nonzero exit is not a
+    shell-launch failure.
+    """
+    command_array = np.asarray(command)
+    logical_wait = np.asarray(wait)
+    if command_array.ndim != 0 or command_array.dtype.kind != 'U':
+        raise TypeError('EXECUTE_COMMAND_LINE COMMAND requires scalar CHARACTER')
+    if logical_wait.ndim != 0 or logical_wait.dtype.kind != 'b':
+        raise TypeError('EXECUTE_COMMAND_LINE WAIT requires scalar LOGICAL')
+    if not bool(logical_wait):
+        raise NotImplementedError('asynchronous EXECUTE_COMMAND_LINE (WAIT=.FALSE.) is not supported')
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        result = subprocess.run(str(command_array.item()).rstrip(' '), shell=True, check=False)
+    except (OSError, ValueError) as error:
+        if not has_cmdstat:
+            raise RuntimeError(f'EXECUTE_COMMAND_LINE could not launch shell: {error}') from error
+        return None, 1, str(error)
+    return result.returncode, 0, None
 
 
 def _f_command_argument_count():

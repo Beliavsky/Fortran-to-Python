@@ -424,6 +424,20 @@ as `SELECTED_CHAR_KIND`, remain unimplemented.
 
 ## Output and validation
 
+`CALL EXECUTE_COMMAND_LINE` supports synchronous execution (default WAIT or
+`WAIT=.TRUE.`) through the platform shell, with inherited stdin/stdout/stderr.
+`EXITSTAT` receives a completed shell command's exit code; `CMDSTAT` is zero
+for completed commands, including nonzero exits. A shell-launch failure gives
+nonzero `CMDSTAT` and assigns/truncates/pads `CMDMSG`, without changing `EXITSTAT`.
+If `CMDSTAT` is absent, a launch failure raises `RuntimeError`. On success,
+`CMDMSG` remains unchanged. Status codes/messages are platform-dependent: the
+runtime reports shell-launch failures as CMDSTAT=1 and does not separately
+classify a shell's command-not-found exit code, unlike some compiler runtimes.
+`WAIT=.FALSE.` is rejected; a dynamically false WAIT raises before launching.
+Scalar output variables, components and array elements are supported, but
+CMDMSG substring actuals are currently rejected. Commands run with the user's
+permissions, so never execute untrusted translated programs.
+
 `PRINT *, ...` becomes Python output machinery, including flattening arrays
 in Fortran element order. Python may print logical values as `True` and `False`
 rather than `T` and `F`. Formatting, whitespace, and default real precision can

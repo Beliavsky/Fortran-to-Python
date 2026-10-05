@@ -139,6 +139,12 @@ Other tested intrinsics include `PRODUCT`, `UNPACK`, `CSHIFT`/`EOSHIFT`,
 Named allocatable variables support `MOVE_ALLOC`; command-argument intrinsics
 use Python's command line (argument zero names the Python script).
 
+Synchronous `EXECUTE_COMMAND_LINE` runs through the platform shell with
+inherited standard streams, supports `EXITSTAT`, `CMDSTAT` and fixed-length
+`CMDMSG`, and preserves an unchanged message on success. `WAIT=.FALSE.` is
+explicitly unsupported. Shell commands run with the user's permissions; do
+not execute untrusted translated programs.
+
 Sequential formatted file I/O supports integer `UNIT`/`NEWUNIT` connections,
 named and scratch files, `REWIND`, and `CLOSE`. External `READ` supports numeric
 and logical list-directed input and scalar character `'(a)'` input, with

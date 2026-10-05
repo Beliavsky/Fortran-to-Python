@@ -479,3 +479,17 @@ binding calls use the parent receiver. Unknown parents/redeclared fields are
 diagnosed. type_extension is no longer an expected failure.
 General polymorphism, parameterized derived types, deferred/generic bindings,
 and finalization remain outside this change.
+
+Synchronous EXECUTE_COMMAND_LINE (2026-10-05)
+------------------------------------------
+Commands run through the platform shell with inherited standard streams and
+flushing before child output. Positional/keyword arguments, default/true WAIT,
+EXITSTAT, CMDSTAT, CMDMSG, fixed-length message assignment, scalar component
+and array-element outputs, and host-associated output writes are tested.
+Shell-launch failure gives CMDSTAT=1 and an error message, or raises when
+CMDSTAT is absent. A completed shell's exit code (including nonzero status) is
+reported through EXITSTAT with CMDSTAT=0; command-not-found codes are not
+separately classified. CMDMSG and EXITSTAT remain unchanged when no assignment
+is specified by the outcome. Async WAIT and CMDMSG substrings are rejected.
+The original execute_command_line expected failure is removed; the established
+KNOWN_FAILURES map is now empty, not a claim of complete Fortran support.

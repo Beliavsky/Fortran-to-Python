@@ -4327,6 +4327,54 @@ class basic_f2p:
                 if 'stat' in raw:
                     self.emit(f"{self.translate_expr(raw['stat'], arrays_1d)} = 0")
                 return True
+            if cname_l == 'execute_command_line':
+                raw = _bind_intrinsic_arguments(cname_l, argtxt,
+                    ('command', 'wait', 'exitstat', 'cmdstat', 'cmdmsg'), 1)
+                wait = self.translate_expr(raw.get('wait', '.true.'), arrays_1d)
+                wait_node = ast.parse(wait, mode='eval').body
+                if isinstance(wait_node, ast.Constant) and wait_node.value is False:
+                    raise ValueError('asynchronous EXECUTE_COMMAND_LINE (WAIT=.FALSE.) is not supported')
+                targets = {}
+                for key in ('exitstat', 'cmdstat', 'cmdmsg'):
+                    if key not in raw:
+                        continue
+                    target = self.translate_expr(raw[key], arrays_1d)
+                    node = ast.parse(target, mode='eval').body
+                    if not isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)) or ':' in raw[key]:
+                        raise ValueError(f'EXECUTE_COMMAND_LINE {key.upper()} requires a scalar variable, component or array element')
+                    base = re.match(r'[a-z_]\w*', raw[key], re.I)
+                    name = base.group().lower() if base else ''
+                    spec = self._component_spec(raw[key]) if '%' in raw[key] else None
+                    ftype = spec['ftype'] if spec else self._decl_types.get(name)
+                    expected = 'character' if key == 'cmdmsg' else 'integer'
+                    if ftype is not None and ftype != expected:
+                        raise ValueError(f'EXECUTE_COMMAND_LINE {key.upper()} requires {expected.upper()}')
+                    if ((isinstance(node, ast.Name) and name in arrays_1d)
+                            or (spec and spec.get('shape') and not raw[key].rstrip().endswith(')'))):
+                        raise ValueError(f'EXECUTE_COMMAND_LINE {key.upper()} requires a scalar output')
+                    targets[key] = target
+                self._allocation_counter += 1
+                temporary = _choose_fresh_identifier(self._allocation_source, f'_xf2p_execute_{self._allocation_counter}')
+                command = self.translate_expr(raw['command'], arrays_1d)
+                self.emit(f'{temporary} = _f_execute_command_line({command}, wait={wait}, has_cmdstat={"cmdstat" in raw})')
+                for index, key in enumerate(('exitstat', 'cmdstat', 'cmdmsg')):
+                    if key not in targets:
+                        continue
+                    if key != 'cmdstat':
+                        self.emit(f'if {temporary}[{index}] is not None:')
+                        self.indent += 1
+                    if key == 'cmdmsg':
+                        spec = self._component_spec(raw[key])
+                        base = re.match(r'[a-z_]\w*', raw[key], re.I).group().lower()
+                        length = spec.get('char_len') if spec else self._decl_char_len.get(base)
+                        length_py = (self.translate_expr(str(length), arrays_1d)
+                                     if length not in (None, ':', '*') else f'len({targets[key]})')
+                        self.emit(f'{targets[key]} = _f_str_assign({temporary}[{index}], {length_py})')
+                    else:
+                        self.transpile_assignment(raw[key], f'{temporary}[{index}]', arrays_1d)
+                    if key != 'cmdstat':
+                        self.indent -= 1
+                return True
             if cname_l == 'get_command_argument':
                 raw = _bind_intrinsic_arguments(cname_l, argtxt, ('number', 'value', 'length', 'status'), 1)
                 number = self.translate_expr(raw['number'], arrays_1d)
