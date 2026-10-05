@@ -3564,7 +3564,7 @@ class basic_f2p:
             self._block_code_start.append(self._code_emit_count)
             return True
 
-        mm = re.match(r"else\s+if\s*\(\s*(.+)\s*\)\s*then$", s, re.I)
+        mm = re.match(r"else\s*if\s*\(\s*(.+)\s*\)\s*then$", s, re.I)
         if mm:
             cond = self.translate_expr(mm.group(1), arrays_1d)
             self.indent = max(0, self.indent - 1)
@@ -3578,7 +3578,7 @@ class basic_f2p:
             self.indent += 1
             return True
 
-        if sl.startswith("end if"):
+        if re.match(r"end\s*if\b", s, re.I):
             if self._block_code_start:
                 start = self._block_code_start.pop()
                 if self._code_emit_count == start:
@@ -3633,9 +3633,9 @@ class basic_f2p:
                                      "post_assign": f"{var} = {hi_tmp} + {step_tmp}"}, mm.group(1))
                 return True
 
-        if re.match(r"end\s+do(?:\s+[a-z_]\w*)?$", s, re.I):
+        if re.match(r"end\s*do(?:\s+[a-z_]\w*)?$", s, re.I):
             entry = self._do_stack.pop() if self._do_stack else 1
-            end_name = re.fullmatch(r"end\s+do\s+([a-z_]\w*)", s, re.I)
+            end_name = re.fullmatch(r"end\s*do\s+([a-z_]\w*)", s, re.I)
             if end_name and (not isinstance(entry, dict) or entry.get("name") != end_name.group(1).lower()):
                 raise ValueError(f"END DO construct name does not match active loop: {s}")
             if isinstance(entry, dict) and entry.get("kind") in {"fortran_do", "while"}:
