@@ -1062,6 +1062,8 @@ _LOCAL_RUNTIME_HELPERS = {
 }
 
 _INTRINSIC_ARGUMENTS = {
+    'maxval': (('array', 'dim', 'mask'), 1),
+    'minval': (('array', 'dim', 'mask'), 1),
     'product': (('array', 'dim', 'mask'), 1),
     'unpack': (('vector', 'mask', 'field'), 3),
     'cshift': (('array', 'shift', 'dim'), 2),
@@ -2137,6 +2139,9 @@ class basic_f2p:
                 left, right = (infer(arg) for arg in node.args)
                 if left and right:
                     return f"max({left}, {right})"
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in {"_f_maxval", "_f_minval"}:
+                explicit = next((kw.value for kw in node.keywords if kw.arg == "integer_kind"), None)
+                return ast.unparse(explicit) if explicit is not None else infer(node.args[0])
             return None
         return infer(tree)
 
@@ -2341,8 +2346,6 @@ class basic_f2p:
         s = re.sub(r"\bspread\s*\(", "_f_spread(", s, flags=re.I)
         s = re.sub(r"\bmodulo\s*\(", "_xf2p_modulo(", s, flags=re.I)
         s = re.sub(r"\bmod\s*\(", "_xf2p_mod(", s, flags=re.I)
-        s = re.sub(r"\bmaxval\s*\(", "np.max(", s, flags=re.I)
-        s = re.sub(r"\bminval\s*\(", "np.min(", s, flags=re.I)
         for intrinsic in ("minloc", "maxloc", "findloc"):
             s = re.sub(rf"\b{intrinsic}\s*\(", f"_f_{intrinsic}(", s, flags=re.I)
         s = re.sub(r"\bcount\s*\(", "np.count_nonzero(", s, flags=re.I)
@@ -2502,6 +2505,13 @@ class basic_f2p:
                 parameters, required = _INTRINSIC_ARGUMENTS[lname]
                 raw = _bind_intrinsic_arguments(lname, inner, parameters, required)
                 bound = {k: self.translate_expr(v, arrays_1d) for k, v in raw.items()}
+                if lname in {"maxval", "minval"}:
+                    arguments = [bound["array"]]
+                    arguments.extend(f"{k}={bound[k]}" for k in ("dim", "mask") if k in bound)
+                    kind = self._integer_model_kind(raw["array"], arrays_1d)
+                    if kind is not None:
+                        arguments.append(f"integer_kind={kind}")
+                    return f"_f_{lname}({', '.join(arguments)})"
                 if lname in _BIT_INTRINSICS:
                     return self._translate_bit_call(lname, inner, arrays_1d)
                 return f"_f_{lname}({', '.join(f'{k}={v}' for k, v in bound.items())})"

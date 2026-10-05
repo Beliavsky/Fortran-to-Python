@@ -87,6 +87,7 @@ __all__ = [
     "count",
     "maxval",
     "minval",
+    "_f_maxval", "_f_minval",
     "_f_minloc",
     "_f_maxloc",
     "_f_findloc",
@@ -631,20 +632,55 @@ def count(x):
     return int(np.count_nonzero(np.asarray(x)))
 
 
-def maxval(x, dim=None):
-    """Fortran MAXVAL equivalent with 1-based dim."""
+def _f_extreme(x, dim, mask, *, minimum, integer_kind):
+    name = "MINVAL" if minimum else "MAXVAL"
     a = np.asarray(x)
-    if dim is None:
-        return np.max(a)
-    return np.max(a, axis=int(dim) - 1)
+    if a.ndim == 0 or a.dtype.kind not in "iuf":
+        raise TypeError(f"{name} currently requires an INTEGER or REAL array")
+    # MAXVAL/MINVAL(ARRAY, MASK) is an alternative positional form.
+    if dim is not None and np.asarray(dim).dtype.kind == "b":
+        if mask is not None:
+            raise ValueError(f"{name} MASK specified twice")
+        mask, dim = dim, None
+    axis = None
+    if dim is not None:
+        dimension = np.asarray(dim)
+        if dimension.ndim or dimension.dtype.kind not in "iu" or not 1 <= int(dim) <= a.ndim:
+            raise ValueError(f"{name} DIM must be a scalar integer between 1 and array rank")
+        axis = int(dim) - 1
+    selected = np.asarray(True if mask is None else mask)
+    if selected.dtype.kind != "b" or (selected.ndim and selected.shape != a.shape):
+        raise ValueError(f"{name} MASK must be logical and scalar or conformable")
+    selected = np.broadcast_to(selected, a.shape)
+    if a.dtype.kind in "iu":
+        info = np.iinfo(a.dtype)
+        identity = info.max if minimum else info.min
+        huge_value = (_f_numeric_model(None, "huge", integer_kind=integer_kind)
+                      if integer_kind is not None else info.max)
+        empty_value = huge_value if minimum else (0 if a.dtype.kind == "u" else -huge_value)
+    else:
+        identity = np.inf if minimum else -np.inf
+        empty_value = np.finfo(a.dtype).max * (1 if minimum else -1)
+    reduction = np.min if minimum else np.max
+    result = reduction(a, axis=axis, where=selected, initial=identity)
+    # Finite +/-HUGE is the Fortran empty result, but it must not hide
+    # selected infinities or the most-negative representable integer.
+    result = np.where(np.any(selected, axis=axis), result, empty_value).astype(a.dtype)
+    return result[()] if result.ndim == 0 else result
 
 
-def minval(x, dim=None):
-    """Fortran MINVAL equivalent with 1-based dim."""
-    a = np.asarray(x)
-    if dim is None:
-        return np.min(a)
-    return np.min(a, axis=int(dim) - 1)
+def maxval(x, dim=None, mask=None, *, integer_kind=None):
+    """Fortran numeric MAXVAL with one-based DIM and conformable MASK."""
+    return _f_extreme(x, dim, mask, minimum=False, integer_kind=integer_kind)
+
+
+def minval(x, dim=None, mask=None, *, integer_kind=None):
+    """Fortran numeric MINVAL with one-based DIM and conformable MASK."""
+    return _f_extreme(x, dim, mask, minimum=True, integer_kind=integer_kind)
+
+
+_f_maxval = maxval
+_f_minval = minval
 
 
 def _f_real_array(x):

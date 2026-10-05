@@ -423,3 +423,23 @@ dummies and host/local scope. Model inquiries do not evaluate the integer value.
 This uses the existing kind-to-byte convention for kinds 1, 2, 4 and 8; it is
 not general integer-kind or overflow emulation. Unknown expression kinds and
 REAL/COMPLEX model inquiries still use their translated NumPy storage dtype.
+
+Extreme reductions
+------------------
+tests/test_extreme_reductions.py and features/extreme_reductions.f90 cover
+numeric MAXVAL/MINVAL with positional and keyword DIM/MASK, positional-mask
+overloads, dynamic dimensions, matrix and nested reductions, repeated lowering,
+conformability, empty arrays/slices and all-false masks. Runtime helpers reject
+nonlogical or nonconformable masks and invalid dimensions. Integer empty results
+use declared kind metadata; ordinary results preserve the array's storage dtype.
+REAL empty sentinels follow NumPy storage dtype; default REAL/kind fidelity
+remains a limitation, rather than being implemented by this reduction fix.
+CHARACTER MAXVAL/MINVAL are not implemented by these numeric runtime helpers.
+
+Empty MAXVAL follows the documented -HUGE rule, including integer input:
+https://gcc.gnu.org/onlinedocs/gfortran/MAXVAL.html
+The local gfortran instead returns the most-negative integer for empty/masked
+integer MAXVAL. Native comparisons check an explicit sentinel-range invariant
+for those cases; runtime unit tests require exactly -HUGE. Other fixture outputs
+are compared normally, including a selected most-negative integer. Infinities
+have separate runtime tests.
