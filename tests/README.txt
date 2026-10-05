@@ -39,6 +39,9 @@ of initialized derived scalars in functions and subroutines.
 nested_sum_dimensions checks dimensional and masked SUM inside other calls,
 nested reductions, and the column standard-deviation expression using SPREAD.
 Already-lowered NumPy axes must survive recursive expression translation.
+merge_shapes tests elemental MERGE with scalar masks/sources, both source
+orders, higher-rank and empty arrays, and logical/complex/character values.
+Array arguments must conform; NumPy's extra broadcasting is not accepted.
 location_intrinsics verifies MINLOC/MAXLOC/FINDLOC, DIM, MASK, BACK, KIND,
 Fortran array-element order, empty arrays, and character/logical searches.
 host_association checks host counter updates, module globals, an internal

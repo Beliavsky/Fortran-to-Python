@@ -529,10 +529,13 @@ def _f_assign_array(lhs, rhs):
 
 
 def merge(tsource, fsource, mask):
-    """Fortran MERGE equivalent for scalar/array masks."""
+    """Elemental MERGE: all array arguments conform; scalars expand to that shape."""
     m = np.asarray(mask)
-    if m.ndim == 0:
+    shapes = [a.shape for a in (np.asarray(tsource), np.asarray(fsource), m) if a.ndim]
+    if not shapes:
         return tsource if bool(m) else fsource
+    if any(shape != shapes[0] for shape in shapes[1:]):
+        raise ValueError('MERGE array arguments must be conformable')
     return np.where(m, tsource, fsource)
 
 
