@@ -565,3 +565,8 @@ simultaneous FORALL assignments, overlapping RHS values and LHS selectors,
 array sections, multiple indices, frozen masks, index scope, descending/empty
 ranges, and the distinction from sequential DO loops. Nested FORALL/WHERE
 bodies and pointer assignments are diagnosed rather than lowered incorrectly.
+
+where_semantics.f90 and test_where_semantics.py check named/nested WHERE,
+ELSEWHERE and ELSE WHERE spellings, branch-name validation, frozen logical
+array masks, scalar logical assignments, and masked ELSEWHERE evaluated after
+preceding assignments without reselecting previously matched elements.

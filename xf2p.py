@@ -3414,7 +3414,7 @@ class basic_f2p:
             lhs, rhs = s.split("=", 1)
             lhs = lhs.strip()
             rhs_py = self.translate_expr(rhs, arrays_1d)
-            if lhs in arrays_1d and rhs_py in ("True", "False"):
+            if lhs in arrays_1d and rhs_py in ("True", "False") and not self._where_stack:
                 self.emit(f"{lhs}[:] = {rhs_py}")
                 return
             self.transpile_assignment(lhs, rhs_py, arrays_1d)
@@ -3744,23 +3744,29 @@ class basic_f2p:
         parts = [frame["active"] for frame in self._where_stack]
         return " & ".join(f"({p})" for p in parts)
 
-    def _start_where_block(self, cond_raw: str, arrays_1d: set[str]) -> None:
+    def _start_where_block(self, cond_raw: str, arrays_1d: set[str], name: str | None = None) -> None:
         cond_py = self.translate_expr(cond_raw, arrays_1d)
         tag = f"{len(self._where_stack) + 1}_{self._code_emit_count + 1}"
-        active_name = f"_xf2p_where_mask_{tag}"
-        matched_name = f"_xf2p_where_matched_{tag}"
+        active_name = _choose_fresh_identifier(self._allocation_source, f"_xf2p_where_mask_{tag}")
+        matched_name = _choose_fresh_identifier(self._allocation_source, f"_xf2p_where_matched_{tag}")
         outer = self._where_current_mask_expr()
         if outer is None:
             active_expr = f"np.asarray({cond_py}, dtype=bool)"
         else:
             active_expr = f"(np.asarray({outer}, dtype=bool) & np.asarray({cond_py}, dtype=bool))"
-        self.emit(f"{active_name} = np.asarray({active_expr}, dtype=bool)")
+        self.emit(f"{active_name} = np.array({active_expr}, dtype=bool, copy=True)")
         self.emit(f"{matched_name} = np.array({active_name}, copy=True)")
-        self._where_stack.append({"active": active_name, "matched": matched_name})
+        self._where_stack.append({"active": active_name, "matched": matched_name, "name": name or ''})
+
+    def _validate_where_name(self, name: str | None = None) -> None:
+        if not self._where_stack:
+            raise ValueError('ELSEWHERE/END WHERE without an active WHERE construct')
+        if name is not None and name.lower() != self._where_stack[-1]['name'].lower():
+            raise ValueError(f'WHERE construct name mismatch: {name}')
 
     def _where_elsewhere(self, cond_raw: str | None, arrays_1d: set[str]) -> None:
         if not self._where_stack:
-            return
+            raise ValueError('ELSEWHERE without an active WHERE construct')
         frame = self._where_stack[-1]
         active_name = frame["active"]
         matched_name = frame["matched"]
@@ -4293,6 +4299,11 @@ class basic_f2p:
             self.emit_var_inits_from_sym(symbols, arrays_1d, parameters, block_entry=True)
             return True
 
+        where_name = None
+        named_where = re.match(r'^([a-z_]\w*)\s*:\s*(where\b.*)$', s, re.I)
+        if named_where:
+            where_name, s = named_where.groups()
+            sl = s.lower()
         pwhere = None
         if sl.startswith("where"):
             p0 = s.lower().find("where") + len("where")
@@ -4348,17 +4359,16 @@ class basic_f2p:
             self._end_associate_block(arrays_1d)
             return True
 
-        if re.match(r"end\s+where", s, re.I):
+        mm = re.fullmatch(r"end\s*where(?:\s+([a-z_]\w*))?", s, re.I)
+        if mm:
+            self._validate_where_name(mm.group(1))
             self._end_where_block()
             return True
 
-        mm = re.match(r"elsewhere\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        mm = re.fullmatch(r"else\s*where\s*(?:\(\s*(.+)\s*\))?(?:\s+([a-z_]\w*))?", s, re.I)
         if mm:
+            self._validate_where_name(mm.group(2))
             self._where_elsewhere(mm.group(1), arrays_1d)
-            return True
-
-        if re.match(r"elsewhere\s*$", s, re.I):
-            self._where_elsewhere(None, arrays_1d)
             return True
 
         if pwhere is not None:
@@ -4366,11 +4376,11 @@ class basic_f2p:
             cond_raw = s[p0 + 1 : p1].strip()
             tail = s[p1 + 1 :].strip()
             if tail:
-                self._start_where_block(cond_raw, arrays_1d)
+                self._start_where_block(cond_raw, arrays_1d, where_name)
                 self.transpile_simple_stmt(tail, arrays_1d)
                 self._end_where_block()
             else:
-                self._start_where_block(cond_raw, arrays_1d)
+                self._start_where_block(cond_raw, arrays_1d, where_name)
             return True
 
         if re.match(r"end\s+forall", s, re.I):
@@ -5446,7 +5456,7 @@ class basic_f2p:
             lhs = lhs.strip()
             rhs_py = self.translate_expr(rhs, arrays_1d)
             # Boolean scalar to whole array (common pattern)
-            if lhs in arrays_1d and rhs_py in ("True", "False"):
+            if lhs in arrays_1d and rhs_py in ("True", "False") and not self._where_stack:
                 self.emit(f"{lhs}[:] = {rhs_py}")
                 return True
             # Defer to transpile_assignment so POINTER/TARGET aliasing is preserved.
@@ -6388,6 +6398,7 @@ class basic_f2p:
     def transpile(self, src: str) -> str:
         self._host_scopes = []
         self._forall_stack = []
+        self._where_stack = []
         self._optional_out_presence = {}
         self._optional_absent_name = _choose_fresh_identifier(src, '_xf2p_absent_allocatable_out')
         self._module_variable_symbols: dict[str, dict[str, dict]] = {}
@@ -7141,6 +7152,8 @@ class basic_f2p:
             out_lines.append("    main()")
         if self._forall_stack:
             raise ValueError('FORALL construct without END FORALL')
+        if self._where_stack:
+            raise ValueError('WHERE construct without END WHERE')
         return self._function_scalar_copyback("\n".join(out_lines).rstrip() + "\n")
 
 

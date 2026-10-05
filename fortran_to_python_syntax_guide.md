@@ -266,9 +266,17 @@ a[a < 0] = 0
 
 That is an idiomatic equivalent of this simple case. Generated `WHERE` code
 uses operations such as `np.where(mask, new_values, old_values)` and assignment
-helpers. A WHERE construct's mask must retain its Fortran evaluation semantics
-across its assignments; an arbitrary sequence of reevaluated Python conditions
-is not necessarily equivalent.
+helpers. The controlling mask is copied on entry and retained across the
+construct's assignments, even if the original logical array or values used
+to form it change. ELSEWHERE excludes previously matched elements; a masked
+ELSEWHERE evaluates its new condition when that branch is reached. Nested
+constructs remain restricted by their saved parent mask.
+
+Named WHERE constructs and both `ELSEWHERE` and `ELSE WHERE` spellings are
+supported, including names on branch/end statements. Mismatched names and
+unmatched branch/end statements are diagnosed. Scalar logical assignments
+inside WHERE are masked too, rather than updating the whole destination array.
+An arbitrary sequence of reevaluated Python conditions is not equivalent.
 
 For scalar logic, `.and.`, `.or.`, and `.not.` resemble `and`, `or`, and `not`.
 For NumPy arrays, use `np.logical_and`, `np.logical_or`, and `np.logical_not`,
