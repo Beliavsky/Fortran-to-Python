@@ -547,3 +547,10 @@ RETURN, keyword/optional actuals, array elements, and reevaluated loop tests.
 value_arguments.f90 and test_value_arguments.py check that VALUE dummies in
 functions and subroutines are not copied back, including mixed VALUE/reference
 arguments, expression actuals, and local copies of derived-type components.
+
+allocatable_out.f90 and test_allocatable_out.py check automatic deallocation of
+ALLOCATABLE INTENT(OUT) dummies on entry and copy-back of their final state,
+including early RETURN, reallocation, scalar/function and character cases.
+INTENT(INOUT) allocations are retained.
+Optional allocatable outputs retain PRESENT even when initially unallocated;
+omitted arguments remain absent.

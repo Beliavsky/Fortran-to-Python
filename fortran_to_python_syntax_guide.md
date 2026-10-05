@@ -342,6 +342,16 @@ copy-back, and derived-type values are copied on entry so component assignments
 also remain local. A procedure with both `VALUE` and ordinary modified dummies
 copies back only the latter. Expressions are valid actuals for `VALUE` dummies.
 
+An `ALLOCATABLE, INTENT(OUT)` dummy is automatically deallocated on procedure
+entry. Its translation starts with `None`, so `ALLOCATED` is false before any
+body statements execute. Returning without reallocating leaves the caller's
+actual unallocated; allocating or assigning a new value in the procedure
+returns that replacement to the caller. `INTENT(INOUT)` retains the incoming
+allocation. This applies to both functions and subroutines.
+For optional allocatable outputs, argument presence is tracked independently:
+an unallocated actual is still present, and resetting the allocation must not
+change `PRESENT` to false.
+
 This is not a complete alias or side-effect analysis: writes through unknown
 procedures and complicated argument aliasing need manual review. Array and derived-type
 arguments also need appropriate value, mutation, and copying behavior.

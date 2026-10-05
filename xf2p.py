@@ -1349,6 +1349,7 @@ class basic_f2p:
         self._func_sigs: dict[str, dict] = {}
         self._current_result_name: str | None = None
         self._current_subroutine_outputs: list[str] = []
+        self._optional_out_presence = {}
         self._derived_types: set[str] = set()
         self._type_bindings: dict[str, dict[str, dict]] = {}
         self._type_components: dict[str, dict[str, str]] = {}
@@ -1683,6 +1684,24 @@ class basic_f2p:
             info = symbols.get(name, {})
             if self._has_value_attribute(info.get('attrs_l', '')):
                 self.emit(f'{name} = _xf2p_copy_value({name})')
+
+    def _emit_allocatable_out_reset(self, args, symbols):
+        # Fortran deallocates an ALLOCATABLE INTENT(OUT) actual on entry,
+        # before executing even the first statement of the procedure body.
+        for name in args:
+            attrs = re.sub(r'\s+', '', symbols.get(name, {}).get('attrs_l', '')).lower()
+            if 'allocatable' in split_args(attrs) and 'intent(out)' in split_args(attrs):
+                if 'optional' in split_args(attrs):
+                    flag = _choose_fresh_identifier(self._allocation_source, f'_xf2p_present_{name}')
+                    self.emit(f'{flag} = {name} is not {self._optional_absent_name}')
+                    self._optional_out_presence[name.lower()] = flag
+                self.emit(f'{name} = None')
+
+    def _optional_dummy_default(self, info):
+        attrs = re.sub(r'\s+', '', info.get('attrs_l', '')).lower()
+        if 'allocatable' in split_args(attrs) and 'intent(out)' in split_args(attrs):
+            return self._optional_absent_name
+        return 'None'
 
     def _scalar_dummy_writes(self, lines, eligible, signatures, symbols):
         """Find direct scalar definitions and copy-back through known CALLs."""
@@ -2080,7 +2099,8 @@ class basic_f2p:
                     outputs = [a for a in spec["out"] if a != passed]
                     bindings[name] = {"args": args, "out": outputs, "kind": spec["kind"]}
                     object_arg = _choose_fresh_identifier(" ".join(spec["args"]), "_xf2p_object")
-                    formals = [object_arg] + [a + ("=None" if a in spec["optional"] else "") for a in args]
+                    formals = [object_arg] + [a + ('=' + (self._optional_absent_name if a in spec.get('optional_allocatable_out', set()) else 'None')
+                                                   if a in spec['optional'] else '') for a in args]
                     self.emit(f"def {name}({', '.join(formals)}):")
                     self.indent += 1
                     actuals = [f"{a}={object_arg if a == passed else a}" for a in spec["args"]]
@@ -2660,7 +2680,9 @@ class basic_f2p:
             flags=re.I,
         )
         s = re.sub(r"\ballocated\s*\(\s*([^)]+?)\s*\)", r"(\1 is not None)", s, flags=re.I)
-        s = re.sub(r"\bpresent\s*\(\s*([a-z_]\w*)\s*\)", r"(\1 is not None)", s, flags=re.I)
+        s = re.sub(r"\bpresent\s*\(\s*([a-z_]\w*)\s*\)",
+                   lambda match: '(' + self._optional_out_presence.get(match.group(1).lower(),
+                                       match.group(1) + ' is not None') + ')', s, flags=re.I)
         s = re.sub(r"\bassociated\s*\(\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\)", r"(\1 is not None)", s, flags=re.I)
         s = re.sub(r"\bnull\s*\(\s*\)", "None", s, flags=re.I)
         s = s.replace("np.np.", "np.")
@@ -5432,7 +5454,7 @@ class basic_f2p:
             if info and "optional" in info.get("attrs_l", ""):
                 default_none = True
             if default_none:
-                args_annot.append(f"{a}: {hint} = None")
+                args_annot.append(f"{a}: {hint} = {self._optional_dummy_default(info)}")
             else:
                 args_annot.append(f"{a}: {hint}")
 
@@ -5490,6 +5512,9 @@ class basic_f2p:
         local_scope.setdefault(result_name, dict(ftype=result_ftype, is_array=not result_is_scalar))
         self._host_scopes.append((local_scope, "nonlocal"))
         self._emit_value_dummy_copies(args, sym)
+        previous_presence = self._optional_out_presence
+        self._optional_out_presence = {name: flag for name, flag in previous_presence.items() if name not in sym}
+        self._emit_allocatable_out_reset(args, sym)
         if is_elemental:
             self._elemental_funcs.add(fname.lower())
             _xf2p_elem_guard = " or ".join(f"_xf2p_is_arraylike({a})" for a in args) if args else "False"
@@ -5561,6 +5586,7 @@ class basic_f2p:
         self._emit_save_sync()
         self.emit(f"return {result_name}")
         self._current_result_name = prev_result_name
+        self._optional_out_presence = previous_presence
         self._host_scopes.pop()
         self._host_scopes.pop()  # procedure-local USE associations
         if self._save_stack:
@@ -6043,7 +6069,7 @@ class basic_f2p:
             if info and "optional" in info.get("attrs_l", ""):
                 default_none = True
             if default_none:
-                args_annot.append(f"{a}: {hint} = None")
+                args_annot.append(f"{a}: {hint} = {self._optional_dummy_default(info)}")
             else:
                 args_annot.append(f"{a}: {hint}")
         out_formals: list[str] = []
@@ -6094,6 +6120,9 @@ class basic_f2p:
         self._host_scopes.append((local_scope, "nonlocal"))
 
         self._emit_value_dummy_copies(args, sym)
+        previous_presence = self._optional_out_presence
+        self._optional_out_presence = {name: flag for name, flag in previous_presence.items() if name not in sym}
+        self._emit_allocatable_out_reset(args, sym)
 
         for kind, header, ibody in internals:
             if kind == "function":
@@ -6151,6 +6180,7 @@ class basic_f2p:
                 self.emit("return " + ", ".join(out_formals))
 
         self._current_subroutine_outputs = previous_outputs
+        self._optional_out_presence = previous_presence
 
         self._host_scopes.pop()
         self._host_scopes.pop()  # procedure-local USE associations
@@ -6245,6 +6275,8 @@ class basic_f2p:
 
     def transpile(self, src: str) -> str:
         self._host_scopes = []
+        self._optional_out_presence = {}
+        self._optional_absent_name = _choose_fresh_identifier(src, '_xf2p_absent_allocatable_out')
         self._module_variable_symbols: dict[str, dict[str, dict]] = {}
         self._module_storage_owners: dict[str, str] = {}
         raw = [split_fortran_comment(l) for l in src.splitlines()]
@@ -6291,7 +6323,10 @@ class basic_f2p:
                     if "optional" in attrs:
                         optional.add(arg.lower())
             self._binding_targets[name] = {"kind": kind, "args": args,
-                "out": [a for a in args if a in outputs], "optional": optional}
+                "out": [a for a in args if a in outputs], "optional": optional,
+                "optional_allocatable_out": {a for a in args if a in optional
+                    and 'allocatable' in split_args(re.sub(r'\s+', '', symbols.get(a, {}).get('attrs', '')))
+                    and re.search(r'intent\s*\(\s*out\s*\)', symbols.get(a, {}).get('attrs', ''))}}
             eligible = {a for a in args if not re.search(r'intent\s*\(', symbols.get(a, {}).get('attrs', ''))
                         and not self._has_value_attribute(symbols.get(a, {}).get('attrs', ''))
                         and not symbols.get(a, {}).get('is_array')
@@ -6331,6 +6366,9 @@ class basic_f2p:
         self._loop_counter = 0
 
         self.emit("import numpy as np")
+        if any('allocatable' in statement.lower() and 'optional' in statement.lower()
+               and re.search(r'intent\s*\(\s*out\s*\)', statement, re.I) for statement, _ in raw):
+            self.emit(f'{self._optional_absent_name} = object()')
         self.emit("import numpy.typing as npt")
         self.emit("from dataclasses import dataclass, field")
         self.emit("from types import SimpleNamespace")
