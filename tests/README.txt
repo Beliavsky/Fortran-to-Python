@@ -21,6 +21,11 @@ and SciPy-specific unit test skip explicitly when SciPy is unavailable.
 Each subprocess has a 90-second timeout. Compiler commands use argument lists,
 so Windows paths with spaces work without shell quoting.
 
+internal_formatted_read checks fixed-width internal input against gfortran,
+including date fields, implied decimals/exponents, logical/character fields,
+record padding and IOSTAT/IOMSG errors. test_internal_formatted_read.py also
+checks scalar components/elements and explicit unsupported-format diagnostics.
+
 Corpus (48 programs)
 --------------------
 handwritten/: 18 small deterministic programs exercising scalars, loops,

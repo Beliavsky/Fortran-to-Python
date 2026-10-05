@@ -136,6 +136,103 @@ def _f_file_read(unit, counts, kinds):
     return result
 
 
+def _f_internal_read_parts(text, character_targets=None):
+    """Tokenize basic internal list-directed input without dropping null fields.
+
+    Commas and whitespace separate values. Quoted character values preserve
+    embedded commas/spaces and doubled quotes. Repeats, null values and slash
+    termination require additional assignment semantics and are rejected.
+    """
+    if not isinstance(text, str):
+        raise ValueError('Internal READ requires a scalar character record')
+    result, position, comma_allowed = [], 0, False
+    while position < len(text):
+        if character_targets is not None and len(result) == len(character_targets):
+            break  # The remainder of the record is not part of this READ.
+        if text[position].isspace():
+            position += 1
+            continue
+        if text[position] == ',':
+            if not comma_allowed:
+                raise ValueError('Null list-directed input values are not supported')
+            comma_allowed = False
+            position += 1
+            continue
+        if text[position] in "'\"":
+            if character_targets is not None and not character_targets[len(result)]:
+                raise ValueError('Quoted list-directed input requires a character target')
+            quote = text[position]
+            position += 1
+            value = []
+            while position < len(text):
+                char = text[position]
+                position += 1
+                if char == quote:
+                    if position < len(text) and text[position] == quote:
+                        value.append(quote)
+                        position += 1
+                        continue
+                    break
+                value.append(char)
+            else:
+                raise ValueError('Unterminated quoted list-directed input value')
+            if position < len(text) and not (text[position].isspace() or text[position] == ','):
+                raise ValueError('Missing separator after quoted list-directed input value')
+            token = ''.join(value)
+        else:
+            start = position
+            while position < len(text) and not (text[position].isspace() or text[position] == ','):
+                position += 1
+            token = text[start:position]
+            if '/' in token or '*' in token:
+                raise ValueError('List-directed repeats and slash termination are not supported')
+        result.append(token)
+        comma_allowed = True
+    return result
+
+
+def _f_internal_read(text, descriptors, lengths):
+    """Read scalar fixed-width fields from one padded internal record.
+
+    Descriptors are validated by the translator. Reversion, record changes,
+    scale/blank controls and whole-array targets are intentionally unsupported.
+    """
+    if not isinstance(text, str):
+        raise ValueError('Internal READ requires a scalar character record')
+    result, position = [], 0
+    for code, width, decimals in descriptors:
+        if len(result) == len(lengths):
+            break
+        if code == 'x':
+            position += width
+            continue
+        length = lengths[len(result)]
+        width = length if width is None else width
+        field = text[position:position + width].ljust(width)
+        position += width
+        token = field.replace(' ', '')  # Default BN: embedded blanks are ignored.
+        if code == 'a':
+            value = _f_str_assign(field[-length:] if length else '', length)
+        elif code == 'i':
+            if token and not re.fullmatch(r'[+-]?\d+', token):
+                raise ValueError(f'Invalid integer input field: {field!r}')
+            value = int(token or '0')
+        elif code == 'l':
+            match = re.match(r'\.?([tf])', token, re.I)
+            if not match:
+                raise ValueError(f'Invalid logical input field: {field!r}')
+            value = match.group(1).lower() == 't'
+        else:
+            token = token.replace('D', 'e').replace('d', 'e')
+            # Fortran also permits an exponent sign without E/D.
+            token = re.sub(r'(?<=[\d.])([+-]\d+)$', r'e\1', token)
+            value = float(token or '0')
+            if '.' not in token and token:
+                value *= 10.0 ** -decimals
+        result.append(value)
+    return result
+
+
 def _f_file_read_assign(target, values):
     array = np.asarray(target)
     result = np.asarray(values, dtype=array.dtype).reshape(array.shape, order="F")
@@ -194,7 +291,7 @@ def _f_array_indices(array, *indices):
 
 __all__ = [
     "_f_file", "_f_file_open", "_f_file_close", "_f_file_rewind",
-    "_f_file_read", "_f_file_read_assign",
+    "_f_file_read", "_f_file_read_assign", "_f_internal_read", "_f_internal_read_parts",
     "_f_array_indices",
     "_f_elemental_subroutine",
     "_f_component_array", "_f_assign_component_array",

@@ -152,6 +152,13 @@ and logical list-directed input and scalar character `'(a)'` input, with
 Fortran I/O implementation; other input formats, direct/unformatted access,
 and advanced list-directed input syntax remain unsupported.
 
+Formatted internal `READ` from a scalar character record supports literal
+formats with `I`, `F`, `E`, `D`, `G`, `L`, `A`, `nX`, and flat repeat counts,
+with scalar/element/component targets and `IOSTAT`/`IOMSG` handling. Unsupported
+formats and READ control specifiers are diagnosed, not silently omitted.
+Nested groups, format reversion, multiple records, whole-array targets and
+blank/scale controls are not yet supported for formatted internal input.
+
 Supported derived-type extension keeps inherited fields and the explicit
 parent component in one storage object. Multi-level access, value copies,
 structure constructors and explicit inherited/overridden bindings have tests;

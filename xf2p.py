@@ -3692,6 +3692,98 @@ class basic_f2p:
             self.emit("break")
             self.indent -= 2
 
+    def _formatted_internal_read(self, spec: dict[str, str], rest: str, arrays_1d: set[str]) -> bool:
+        fmt = spec.get('fmt')
+        if fmt is None:
+            raise ValueError('Internal READ requires FMT')
+        if fmt == '*':
+            if 'iomsg' in spec:
+                raise ValueError('List-directed internal READ with IOMSG is not yet supported')
+            if not rest:
+                raise ValueError('Internal READ without an input list is not yet supported')
+            return False  # Existing list-directed lowering.
+        if not _is_fortran_string_literal(fmt):
+            raise ValueError('Formatted internal READ currently requires a literal format')
+        format_text = _fortran_unquote(fmt).strip().lower()
+        if not (format_text.startswith('(') and format_text.endswith(')')):
+            raise ValueError('Formatted internal READ requires a parenthesized format')
+        descriptors = []
+        for part in split_args(format_text[1:-1]):
+            match = re.fullmatch(r'(\d*)([ifedglax])(\d*)(?:\.(\d+))?', part.replace(' ', ''))
+            if not match:
+                raise ValueError(f'unsupported internal READ format descriptor: {part}')
+            repeat, code, width, decimals = match.groups()
+            repeat = int(repeat or 1)
+            width = int(width) if width else None
+            if repeat < 1 or repeat > 10000:
+                raise ValueError('unsupported internal READ format repeat count')
+            if code == 'x':
+                if width is not None or decimals is not None:
+                    raise ValueError(f'unsupported internal READ format descriptor: {part}')
+                descriptors.append(('x', repeat, None))
+                continue
+            if ((code != 'a' and width is None) or (width is not None and width < 1)
+                    or (code in 'fedg' and decimals is None)
+                    or (code in 'al' and decimals is not None)):
+                raise ValueError(f'unsupported internal READ format descriptor: {part}')
+            descriptors.extend([(code, width, int(decimals) if decimals is not None else None)] * repeat)
+        targets = [target.strip() for target in split_args(rest) if target.strip()]
+        fields = [item for item in descriptors if item[0] != 'x']
+        if not targets or len(targets) > len(fields):
+            raise ValueError('Internal READ format reversion/empty input lists are not yet supported')
+        unit_raw = spec['unit']
+        unit_py = self.translate_expr(unit_raw, arrays_1d)
+        base = re.match(r'[a-z_]\w*', unit_raw, re.I)
+        unit_name = base.group().lower() if base else ''
+        source_component = self._component_spec(unit_raw) if '%' in unit_raw else None
+        source_array = bool(source_component.get('shape')) if source_component else unit_name in self._decl_array_types
+        if source_array and (not isinstance(ast.parse(unit_py, mode='eval').body, ast.Subscript)
+                             or ':' in unit_raw):
+            raise ValueError('Formatted internal READ currently requires a scalar character source')
+        target_exprs, lengths = [], []
+        for target, (code, width, decimals) in zip(targets, fields):
+            expr = self.translate_expr(target, arrays_1d)
+            node = ast.parse(expr, mode='eval').body
+            base = re.match(r'[a-z_]\w*', target, re.I)
+            name = base.group().lower() if base else ''
+            component = self._component_spec(target) if '%' in target else None
+            kind = component['ftype'] if component else self._decl_types.get(name, self._decl_array_types.get(name))
+            expected = {'i': 'integer', 'f': 'real', 'e': 'real', 'd': 'real', 'g': 'real', 'l': 'logical', 'a': 'character'}[code]
+            array = bool(component.get('shape')) if component else name in self._decl_array_types
+            if (not isinstance(node, (ast.Name, ast.Attribute, ast.Subscript))
+                    or (array and not isinstance(node, ast.Subscript))
+                    or any(isinstance(item, ast.Slice) for item in ast.walk(node))
+                    or (isinstance(node, ast.Subscript) and any(
+                        isinstance(item, (ast.List, ast.ListComp))
+                        or (isinstance(item, ast.Name) and item.id in self._decl_array_types)
+                        for item in ast.walk(node.slice)))
+                    or kind != expected):
+                raise ValueError(f'Internal READ {code.upper()} descriptor currently requires a scalar {expected} target: {target}')
+            target_exprs.append(expr)
+            lengths.append(f'len({expr})' if kind == 'character' else 'None')
+        self._allocation_counter += 1
+        temporary = _choose_fresh_identifier(self._allocation_source, f'_xf2p_internal_read_{self._allocation_counter}')
+        ios = self.translate_expr(spec['iostat'], arrays_1d) if 'iostat' in spec else None
+        message = self.translate_expr(spec['iomsg'], arrays_1d) if 'iomsg' in spec else None
+        if message is not None and ios is None:
+            raise ValueError('Internal READ IOMSG currently requires IOSTAT')
+        if ios is not None:
+            self.emit('try:')
+            self.indent += 1
+        self.emit(f'{temporary} = _f_internal_read({unit_py}, {descriptors!r}, [{", ".join(lengths)}])')
+        for index, expr in enumerate(target_exprs):
+            self.emit(f'{expr} = {temporary}[{index}]')
+        if ios is not None:
+            self.emit(f'{ios} = 0')
+            self.indent -= 1
+            self.emit('except (ValueError, OverflowError) as _xf2p_io_error:')
+            self.indent += 1
+            self.emit(f'{ios} = 1')
+            if message is not None:
+                self.emit(f'{message} = _f_str_assign(str(_xf2p_io_error), len({message}))')
+            self.indent -= 1
+        return True
+
     def _external_file_io(self, s: str, arrays_1d: set[str]) -> bool:
         match = re.match(r"(open|close|rewind|read)\b", s, re.I)
         if not match:
@@ -3721,8 +3813,13 @@ class basic_f2p:
         if operation == "read":
             base = re.match(r"[a-z_]\w*", unit_raw, re.I)
             name = base.group().lower() if base else ""
-            if self._decl_types.get(name) == "character" or self._decl_array_types.get(name) == "character":
-                return False  # Existing internal-file input lowering.
+            source_component = self._component_spec(unit_raw) if '%' in unit_raw else None
+            if (self._decl_types.get(name) == "character" or self._decl_array_types.get(name) == "character"
+                    or (source_component and source_component['ftype'] == 'character')):
+                unknown = set(spec) - {'unit', 'fmt', 'iostat', 'iomsg'}
+                if unknown:
+                    raise ValueError(f"unsupported internal READ specifier(s): {', '.join(sorted(unknown))}")
+                return self._formatted_internal_read(spec, rest, arrays_1d)
             if "fmt" not in spec:
                 raise ValueError("Unformatted READ is not yet supported")
         allowed = {
@@ -4211,7 +4308,7 @@ class basic_f2p:
 
 
         # read(unit, "(a)", iostat=ios) text
-        if sl.startswith("read"):
+        if re.match(r'read\b', sl):
             p0 = s.find("(")
             if p0 != -1:
                 p1 = find_matching_paren(s, p0)
@@ -4238,9 +4335,14 @@ class basic_f2p:
                         if fmt == "*" and internal_char_source and rest:
                             ios_var = kws.get("iostat")
                             items = [a.strip() for a in split_args(rest) if a.strip()]
-                            self.emit(f"__xf2p_read_parts = str({unit_py}).split()")
+                            character_targets = []
+                            for tgt in items:
+                                base = re.match(r'^([a-z_]\w*)', tgt, re.I)
+                                name = base.group(1).lower() if base else ''
+                                character_targets.append(self._decl_types.get(name, self._decl_array_types.get(name, '')) == 'character')
                             self.emit("try:")
                             self.indent += 1
+                            self.emit(f"__xf2p_read_parts = _f_internal_read_parts({unit_py}, {character_targets!r})")
                             for i, tgt in enumerate(items):
                                 lhs = self.translate_expr(tgt, arrays_1d)
                                 base = re.match(r"^([a-z_]\w*)", tgt, re.I)
@@ -4282,6 +4384,8 @@ class basic_f2p:
                                     self.emit(f"{ios_var} = 0 if __xf2p_line != '' else -1")
                                 self.emit(f"{lhs} = __xf2p_line.rstrip('\\n')")
                                 return True
+
+            raise ValueError(f'unsupported READ statement: {s}')
 
 
         # call foo(...)

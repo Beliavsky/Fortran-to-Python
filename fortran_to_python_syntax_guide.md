@@ -459,6 +459,28 @@ character `'(a)'` reads, including `IOSTAT`/`IOMSG` handling. Other input format
 direct/unformatted access, and advanced list-directed syntax remain unsupported;
 this is not a complete emulation of Fortran records or file connections.
 
+Formatted internal input can read fixed-width fields from a scalar character
+record, for example:
+
+```fortran
+read(text, '(i4,1x,i2,1x,i2)') year, month, day
+```
+
+Literal formats support `I`, `F`, `E`, `D`, `G`, `L`, `A`, `nX` and flat repeats
+such as `3I2`. Targets must be compatible scalars, array elements or scalar
+components. Short records are padded with blanks; integer/real blank fields
+become zero. Real fields without a decimal point use the format's implied
+decimal places. Character fields preserve the target's declared length.
+`IOSTAT`/`IOMSG` are supported for these formatted reads; error codes and message
+text are not intended to reproduce a particular compiler's spelling.
+Unsupported descriptors, format variables/labels, nested groups, format
+reversion, whole-array targets and record changes produce an explicit error.
+The older list-directed internal input path remains separate and does not
+support `IOMSG`. It accepts comma/whitespace separators and quoted character
+fields (including embedded separators and doubled quotes). Null values,
+repeat syntax and slash termination are diagnosed rather than silently
+discarded; quoted numeric input is rejected.
+
 Validate against the original program:
 
 ```console
