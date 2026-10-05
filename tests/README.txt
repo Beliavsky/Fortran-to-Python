@@ -431,6 +431,18 @@ This uses the existing kind-to-byte convention for kinds 1, 2, 4 and 8; it is
 not general integer-kind or overflow emulation. Unknown expression kinds and
 REAL/COMPLEX model inquiries still use their translated NumPy storage dtype.
 
+Integer enumerators
+-------------------
+tests/test_enumerators.py and features/enumerators.f90 cover ENUM, BIND(C),
+explicit and implicit values, zero-based resets, negative and repeated values,
+integer arithmetic and array bounds, SELECT CASE, continuations, semicolons,
+procedure/host/BLOCK scopes, PUBLIC/PRIVATE and USE ONLY visibility, model
+inquiries, malformed declarations, and reused translator instances. ENUM is
+lowered to ordinary INTEGER, PARAMETER declarations before scoping analysis;
+generated Python uses Final[int], not Enum objects. This does not implement
+C ABI bindings or newer named enumeration types. Renamed USE imports and
+colliding names in different flattened modules have explicit diagnostics.
+
 Sequential formatted file units
 -------------------------------
 tests/test_file_units.py and features/file_units.f90 cover integer UNIT and

@@ -121,6 +121,12 @@ output is displayed only for cases needing attention. Saved reports remain compl
 
 ## Supported features and limitations
 
+`ENUM, BIND(C)` enumerators become integer named constants, not Python enum
+objects. Explicit values and implicit numbering (starting at zero) are supported,
+including procedure, host, module, and `BLOCK` scopes. This does not add C ABI
+bindings or support Fortran's newer named enumeration types. The existing
+restrictions on renamed `USE` imports and colliding module namespaces apply.
+
 Tested examples cover scalar arithmetic, loops and branches, array constructors
 and sections, allocation with `SOURCE`/`MOLD`, masks and `WHERE`, matrix operations,
 many numerical intrinsics, procedures, optional and keyword arguments, internal

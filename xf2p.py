@@ -322,6 +322,73 @@ def collapse_fortran_continuations(raw_lines: list[tuple[str, str]]) -> list[tup
     return out
 
 
+def lower_enum_declarations(lines: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], dict[str, set[str]]]:
+    """Lower ENUM, BIND(C) before the ordinary parameter and scoping passes."""
+    output = []
+    module_enumerators: dict[str, set[str]] = {}
+    module, module_specification = None, False
+    active, previous = False, None
+    names: set[str] = set()
+    for code, comment in lines:
+        statements = split_top_level(code, ";")
+        enum_line = active or any(re.match(r"\s*(?:enum\b|enumerator\b|end\s*enum\b)", statement, re.I)
+                                  for statement in statements)
+        for statement in statements if enum_line else [code]:
+            text = statement.strip()
+            start_module = re.fullmatch(r"module\s+([a-z_]\w*)", text, re.I)
+            if start_module:
+                module, module_specification = start_module.group(1).lower(), True
+            elif re.match(r"end\s*module\b", text, re.I):
+                module, module_specification = None, False
+            elif re.fullmatch(r"contains", text, re.I):
+                module_specification = False
+            if re.match(r"enum\b", text, re.I) and len(split_top_level(text, "=")) == 1:
+                if active:
+                    raise ValueError("nested ENUM declarations are not supported")
+                if not re.fullmatch(r"enum\s*,\s*bind\s*\(\s*c\s*\)", text, re.I):
+                    raise ValueError("Only anonymous ENUM, BIND(C) declarations are supported")
+                active, previous, names = True, None, set()
+                output.append(("", comment))
+                continue
+            if re.fullmatch(r"end\s*enum", text, re.I):
+                if not active:
+                    raise ValueError("END ENUM without ENUM, BIND(C)")
+                if not names:
+                    raise ValueError("ENUM requires at least one ENUMERATOR")
+                active = False
+                output.append(("", comment))
+                continue
+            enumerator = re.match(r"enumerator\b(?!\s*[(%=])\s*(?:::)?\s*(.*)", text, re.I)
+            if enumerator:
+                if not active:
+                    raise ValueError("ENUMERATOR outside ENUM, BIND(C)")
+                items = split_args(enumerator.group(1))
+                if not items:
+                    raise ValueError("empty ENUMERATOR declaration")
+                for item in items:
+                    entry = re.fullmatch(r"([a-z_]\w*)\s*(?:=\s*(.+))?", item.strip(), re.I)
+                    if not entry:
+                        raise ValueError(f"malformed ENUMERATOR: {item}")
+                    name, explicit = entry.group(1).lower(), entry.group(2)
+                    if name in names:
+                        raise ValueError(f"duplicate ENUMERATOR: {name}")
+                    value = explicit if explicit is not None else ("0" if previous is None else f"{previous} + 1")
+                    output.append((f"integer, parameter :: {name} = {value}", comment))
+                    if module is not None and module_specification:
+                        module_enumerators.setdefault(module, set()).add(name)
+                    names.add(name)
+                    previous = name
+                continue
+            if active and text:
+                if re.match(r"end\b", text, re.I):
+                    raise ValueError("ENUM without END ENUM")
+                raise ValueError(f"unsupported statement within ENUM: {text}")
+            output.append((statement, comment))
+    if active:
+        raise ValueError("ENUM without END ENUM")
+    return output, module_enumerators
+
+
 def reject_defined_operations(lines: list[tuple[str, str]]) -> None:
     """Reject declarations whose dispatch/assignment semantics we cannot preserve."""
     for index, (code, _comment) in enumerate(lines):
@@ -5310,7 +5377,12 @@ class basic_f2p:
             self.emit("")
 
         module_name = re.fullmatch(r"module\s+([a-z_]\w*)", header.strip(), re.I).group(1).lower()
+        enum_names = set().union(*self._module_enum_names.values()) if self._module_enum_names else set()
         for name, info in sym.items():
+            if name.lower() in enum_names:
+                owner = self._module_enum_storage_owners.setdefault(name.lower(), module_name)
+                if owner != module_name:
+                    raise ValueError(f"enumerator/module name '{name}' is declared in both {owner} and {module_name}; separate module namespaces are not yet supported")
             if "parameter" in info["attrs_l"]:
                 continue
             owner = self._module_storage_owners.setdefault(name.lower(), module_name)
@@ -5767,6 +5839,8 @@ class basic_f2p:
         self._module_storage_owners: dict[str, str] = {}
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
+        raw, self._module_enum_names = lower_enum_declarations(raw)
+        self._module_enum_storage_owners: dict[str, str] = {}
         reject_defined_operations(raw)
         reject_goto_statements(raw)
         self._data_statement_count = sum(1 for _ in data_statements(raw))

@@ -40,6 +40,24 @@ Fortran numeric kinds, integer overflow, and floating-point rounding are not
 fully preserved. A successful numerical comparison at one problem size does
 not establish equivalence for every value or kind.
 
+## Enumerators
+
+`ENUM, BIND(C)` declares integer constants, not a separate Python enum class:
+
+```fortran
+enum, bind(c)
+   enumerator :: red, green, blue = 10, next_color
+end enum
+```
+
+The values are `red = 0`, `green = 1`, `blue = 10`, and `next_color = 11`.
+Generated bindings use `Final[int]`, like ordinary integer parameters; Python
+does not enforce their immutability. Numbering restarts for each enumeration,
+and omitted values increment the preceding enumerator even after a negative
+explicit value. This supports ordinary scopes and module visibility, not C ABI
+bindings or newer named enumeration types. Renamed `USE` imports and duplicate
+names in different flattened modules remain explicitly restricted.
+
 ## Branches and loops
 
 ```fortran
