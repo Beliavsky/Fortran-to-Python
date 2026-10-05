@@ -163,10 +163,17 @@ against independently compiled Fortran. Execution tests skip when their required
 compiler or dependencies are unavailable. Known failures are marked explicitly;
 strict expected-failure checks expose unexpected passes.
 
-Local exploratory cases may live under `tests/cases/more/` without being part
-of the tracked test corpus. Adding Fortran files beneath `tests/cases/` can
-add execution cases to pytest;
-`tests/cases/stash/` is excluded from discovery.
+Local exploratory cases under `tests/cases/more/` are excluded by default.
+To include them (with ordinary failure reporting), run:
+
+```console
+pytest -q --include-exploratory
+```
+
+For a survey independent of pytest, use
+`python xf2p_batch.py "tests/cases/more/*.f90" --run-diff --failures-only`.
+Other Fortran files beneath `tests/cases/` are discovered normally;
+`tests/cases/stash/` is always excluded, even with `--include-exploratory`.
 
 ## Related tools
 
@@ -174,4 +181,3 @@ add execution cases to pytest;
 operations. It is an optional preparation tool, not a required translation step
 or a general optimizer. Its supporting scanner and transformation scripts are
 included in this repository. Run `python xarray.py --help` for its options.
-

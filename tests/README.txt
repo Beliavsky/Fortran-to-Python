@@ -6,6 +6,12 @@ Run from the repository root:
     python -m pip install numpy scipy pytest
     pytest -q -rx
 
+Local exploratory programs in cases/more/ are excluded by default. Include
+them with pytest -q --include-exploratory; unsupported translations and genuine
+output mismatches still fail normally. cases/stash/ is always excluded.
+For one exploratory case, for example:
+    pytest -q --include-exploratory tests/test_xf2p_execution.py -k test18_move_alloc
+
 Requirements: Python, NumPy, pytest, and gfortran on PATH. Execution tests
 skip explicitly if gfortran or NumPy is missing; they do not pretend to pass.
 SciPy is optional for the translator/runtime and ordinary translated programs;
@@ -81,6 +87,8 @@ Round-trip cases additionally execute the original Python and compare its
 output against the Fortran reference before testing xf2p.py.
 
 Ignore whitespace, but require equal token counts and textual labels.
+Standalone logical tokens T/True and F/False are equivalent, matching the
+CLI's --run-diff behavior; opposite logical values still fail comparison.
 Integer tokens are compared exactly; real tokens use relative tolerance
 1e-9 and absolute tolerance 1e-11, accepting Fortran D exponents.
 This is numerical-output validation, not byte-for-byte formatting validation.
