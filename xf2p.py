@@ -1362,7 +1362,7 @@ class basic_f2p:
         self._select_case_stack: list[dict[str, object]] = []
         self._associate_stack: list[dict[str, object]] = []
         self._where_stack: list[dict[str, str]] = []
-        self._forall_stack: list[int] = []
+        self._forall_stack: list[dict] = []
         self._do_stack: list[dict[str, object] | int] = []
         self._loop_counter = 0
         self._seen_scipy_special = False
@@ -3896,6 +3896,105 @@ class basic_f2p:
                     self.emit("pass")
             self.indent = max(0, self.indent - 1)
 
+    def _emit_simultaneous_forall(self, header, statements, arrays_1d):
+        """Freeze the iteration set, then gather/apply each assignment separately."""
+        loops, mask = self._parse_forall_header(header, arrays_1d)
+        if not loops:
+            raise ValueError('FORALL requires an index triplet')
+
+        def fresh(label):
+            self._allocation_counter += 1
+            return _choose_fresh_identifier(self._allocation_source,
+                                           f'_xf2p_forall_{label}_{self._allocation_counter}')
+
+        indices = {name: fresh(name) for name, _lo, _hi, _step in loops}
+        if len(indices) != len(loops):
+            raise ValueError('duplicate FORALL index')
+
+        class RenameIndices(ast.NodeTransformer):
+            def visit_Name(visitor, node):
+                if node.id in indices:
+                    return ast.copy_location(ast.Name(id=indices[node.id], ctx=node.ctx), node)
+                return node
+
+        def mapped(expression):
+            return ast.unparse(RenameIndices().visit(ast.parse(expression, mode='eval').body))
+
+        ranges = []
+        for name, lo, hi, step in loops:
+            step = step or '1'
+            if any(isinstance(node, ast.Name) and node.id in indices
+                   for expression in (lo, hi, step) for node in ast.walk(ast.parse(expression, mode='eval'))):
+                raise ValueError('FORALL triplet bounds cannot depend on a FORALL index')
+            low, high, stride, iteration_range = (fresh(part) for part in ('lo', 'hi', 'step', 'range'))
+            self.emit(f'{low}, {high}, {stride} = {lo}, {hi}, {step}')
+            self.emit(f'{iteration_range} = range({low}, {high} + (1 if {stride} > 0 else -1), {stride})')
+            ranges.append(iteration_range)
+
+        selected = fresh('indices')
+        self.emit(f'{selected} = []')
+        for name, iteration_range in zip(indices.values(), ranges):
+            self.emit(f'for {name} in {iteration_range}:')
+            self.indent += 1
+        if mask is not None:
+            self.emit(f'if {mapped(mask)}:')
+            self.indent += 1
+        tuple_indices = ', '.join(indices.values()) + (',' if len(indices) == 1 else '')
+        self.emit(f'{selected}.append(({tuple_indices}))')
+        self.indent -= len(indices) + (mask is not None)
+
+        def index_value(node):
+            if isinstance(node, ast.Slice):
+                parts = [ast.unparse(part) if part is not None else 'None'
+                         for part in (node.lower, node.upper, node.step)]
+                return f"slice({', '.join(parts)})"
+            if isinstance(node, ast.Tuple):
+                return '(' + ', '.join(index_value(item) for item in node.elts) + ',)'
+            return f'_xf2p_copy_value({ast.unparse(node)})'
+
+        for statement in statements:
+            assignment = split_top_level(statement, '=')
+            if len(assignment) != 2 or assignment[1].lstrip().startswith('>') or re.match(r'(?:forall|where)\b', statement, re.I):
+                raise ValueError(f'unsupported FORALL body statement: {statement}; only intrinsic assignments are supported')
+            lhs, rhs = assignment
+            # Reuse normal assignment conversion/indexing, without emitting the
+            # actual writes until all values and destination selectors are saved.
+            original_out, original_count = self.out, self._code_emit_count
+            self.out = []
+            try:
+                self.transpile_assignment(lhs.strip(), self.translate_expr(rhs.strip(), arrays_1d), arrays_1d)
+                translated = '\n'.join(line.strip() for line in self.out)
+            finally:
+                self.out, self._code_emit_count = original_out, original_count
+            nodes = ast.parse(translated).body
+            if len(nodes) != 1 or not isinstance(nodes[0], ast.Assign) or len(nodes[0].targets) != 1:
+                raise ValueError(f'unsupported FORALL assignment target: {lhs.strip()}')
+            node = RenameIndices().visit(nodes[0])
+            target, value = node.targets[0], ast.unparse(node.value)
+            pending, obj, key, item = (fresh(part) for part in ('pending', 'object', 'key', 'value'))
+            self.emit(f'{pending} = []')
+            self.emit(f'for {tuple_indices} in {selected}:')
+            self.indent += 1
+            if isinstance(target, ast.Subscript):
+                self.emit(f'{pending}.append(({ast.unparse(target.value)}, {index_value(target.slice)}, _xf2p_copy_value({value})))')
+                writeback = f'{obj}[{key}] = {item}'
+                unpack = f'{obj}, {key}, {item}'
+            elif isinstance(target, ast.Attribute):
+                self.emit(f'{pending}.append(({ast.unparse(target.value)}, _xf2p_copy_value({value})))')
+                writeback = f'{obj}.{target.attr} = {item}'
+                unpack = f'{obj}, {item}'
+            elif isinstance(target, ast.Name):
+                self.emit(f'{pending}.append(_xf2p_copy_value({value}))')
+                writeback = f'{target.id} = {item}'
+                unpack = item
+            else:
+                raise ValueError(f'unsupported FORALL assignment target: {lhs.strip()}')
+            self.indent -= 1
+            self.emit(f'for {unpack} in {pending}:')
+            self.indent += 1
+            self.emit(writeback)
+            self.indent -= 1
+
     def _enter_do_loop(self, entry: dict[str, object], name: str | None) -> None:
         """Wrap named loop iterations so outer transfers can unwind inner loops."""
         entry["name"] = name.lower() if name else None
@@ -4141,6 +4240,13 @@ class basic_f2p:
         return True
 
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
+        if self._forall_stack:
+            if re.fullmatch(r'end\s*forall(?:\s+\w+)?', s.strip(), re.I):
+                context = self._forall_stack.pop()
+                self._emit_simultaneous_forall(context['header'], context['body'], arrays_1d)
+            else:
+                self._forall_stack[-1]['body'].append(s)
+            return True
         sl = s.lower()
         if re.match(r"(open|close|rewind|read|write)\b", s, re.I) and len(split_top_level(s, "=")) > 1:
             parts = split_top_level(s, "=")
@@ -4268,20 +4374,16 @@ class basic_f2p:
             return True
 
         if re.match(r"end\s+forall", s, re.I):
-            levels = self._forall_stack.pop() if self._forall_stack else 0
-            self._emit_forall_block_end(levels)
-            return True
+            raise ValueError('END FORALL without an active FORALL construct')
 
         if pforall is not None:
             p0, p1 = pforall
             header_raw = s[p0 + 1 : p1].strip()
             tail = s[p1 + 1 :].strip()
-            levels = self._emit_forall_block_start(header_raw, arrays_1d)
             if tail:
-                self.transpile_simple_stmt(tail, arrays_1d)
-                self._emit_forall_block_end(levels)
+                self._emit_simultaneous_forall(header_raw, [tail], arrays_1d)
             else:
-                self._forall_stack.append(levels)
+                self._forall_stack.append({'header': header_raw, 'body': []})
             return True
 
         if pdo_concurrent is not None:
@@ -6285,6 +6387,7 @@ class basic_f2p:
 
     def transpile(self, src: str) -> str:
         self._host_scopes = []
+        self._forall_stack = []
         self._optional_out_presence = {}
         self._optional_absent_name = _choose_fresh_identifier(src, '_xf2p_absent_allocatable_out')
         self._module_variable_symbols: dict[str, dict[str, dict]] = {}
@@ -7036,6 +7139,8 @@ class basic_f2p:
                 out_lines.append("")
             out_lines.append('if __name__ == "__main__":')
             out_lines.append("    main()")
+        if self._forall_stack:
+            raise ValueError('FORALL construct without END FORALL')
         return self._function_scalar_copyback("\n".join(out_lines).rstrip() + "\n")
 
 

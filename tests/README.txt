@@ -559,3 +559,9 @@ literal_only_print.f90 and test_literal_only_print.py check literal formatted
 PRINT without an item list: both quote styles, escaped quotes, nested repeats,
 spacing, blank records, colon/data-descriptor termination, conditional PRINT,
 and an explicit diagnostic for unsupported itemless formats.
+
+forall_semantics.f90 and test_forall_semantics.py check statement-wise
+simultaneous FORALL assignments, overlapping RHS values and LHS selectors,
+array sections, multiple indices, frozen masks, index scope, descending/empty
+ranges, and the distinction from sequential DO loops. Nested FORALL/WHERE
+bodies and pointer assignments are diagnosed rather than lowered incorrectly.

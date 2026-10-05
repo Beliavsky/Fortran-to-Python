@@ -283,6 +283,30 @@ conditional expression when any argument is an array. The runtime `merge`
 helper supports scalar expansion and checks array conformability; general
 NumPy broadcasting is not a substitute for Fortran conformability rules.
 
+### FORALL is not a sequential loop
+
+```fortran
+forall (i=2:8)
+   a(i) = a(i-1)
+end forall
+```
+
+Unlike an ordinary `DO`, this assignment reads the original values before any
+destinations are updated. With `a=[1,2,3,4,5,6,7,8]`, it produces
+`[1,1,2,3,4,5,6,7]`, not eight ones.
+
+The translation freezes the triplet ranges and mask, gathers copies of each
+assignment's values and destination selectors, then applies that assignment.
+A subsequent assignment in the same block sees the completed earlier
+assignment, but uses the original controlling mask. Fresh Python index names
+preserve variables outside the construct. Multiple indices, descending steps,
+empty ranges and array-section assignments are supported. These temporary
+lists can use significant memory for large iteration spaces.
+
+Nested FORALL/WHERE bodies and pointer assignments are not yet supported and
+are diagnosed explicitly. Ordinary `DO` loops retain sequential behavior;
+`DO CONCURRENT` is a distinct construct, not given FORALL snapshot semantics.
+
 ## Functions, subroutines, and arguments
 
 ```fortran
