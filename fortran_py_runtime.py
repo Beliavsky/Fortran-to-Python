@@ -692,8 +692,16 @@ def _f_rrspacing(x):
     return np.ldexp(np.abs(_f_fraction(a)), np.finfo(a.dtype).nmant + 1)
 
 
-def _f_numeric_model(x, inquiry):
-    dtype = np.asarray(x).dtype
+def _f_numeric_model(x, inquiry, *, integer_kind=None):
+    # Model inquiries depend on the declared type/kind, not the value.
+    # Plain Python integers and initialized ndarray storage can lose that
+    # information; the translator supplies it when it is known.
+    if integer_kind is not None:
+        if integer_kind not in (1, 2, 4, 8):
+            raise ValueError(f"unsupported Fortran integer kind for {inquiry.upper()}: {integer_kind}")
+        dtype = np.dtype(f"int{8 * int(integer_kind)}")
+    else:
+        dtype = np.asarray(x).dtype
     if dtype.kind in "iu":
         info = np.iinfo(dtype)
         if inquiry == "huge":

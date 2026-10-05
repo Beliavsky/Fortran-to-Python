@@ -411,3 +411,15 @@ Cartesian selection with multiple vector subscripts, mixtures of vectors,
 scalars and slices, axis order, nondefault lower bounds, reversed sections,
 empty and repeated vectors, indexed assignment and WHERE writeback.
 Ordinary scalar/slice sections continue to share storage with their arrays.
+
+Integer model kinds
+-------------------
+tests/test_integer_model_kinds.py and features/integer_model_kinds.f90 cover
+HUGE, DIGITS, RANGE and RADIX using declared INTEGER kind metadata rather than
+Python storage dtype. Coverage includes default and legacy declarations,
+ISO_FORTRAN_ENV kinds and aliases, kind parameters, scalar/array arguments,
+unallocated arrays, derived components, literal kinds, arithmetic, procedure
+dummies and host/local scope. Model inquiries do not evaluate the integer value.
+This uses the existing kind-to-byte convention for kinds 1, 2, 4 and 8; it is
+not general integer-kind or overflow emulation. Unknown expression kinds and
+REAL/COMPLEX model inquiries still use their translated NumPy storage dtype.

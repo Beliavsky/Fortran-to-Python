@@ -1812,6 +1812,7 @@ class basic_f2p:
             for name, shape, init in items:
                 component_specs[name.lower()] = {"ftype": ftype, "shape": shape,
                     "type_name": type_name.lower() if type_name else None,
+                    "attrs_l": attrs_l,
                     "char_len": self._parse_character_len(s) if ftype == "character" else None}
                 if type_name:
                     components[name.lower()] = type_name.lower()
@@ -2070,15 +2071,91 @@ class basic_f2p:
         arguments.append(f'bits={bits}')
         return f"_f_bits({', '.join(arguments)})"
 
+    def _integer_model_kind(self, expr: str, arrays_1d: set[str]) -> str | None:
+        """Recover INTEGER model kind without evaluating the argument value."""
+        raw = expr.strip()
+        literal = re.fullmatch(r"[+-]?\d+(?:_([a-z_]\w*|\d+))?", raw, re.I)
+        if literal:
+            return self.translate_expr(literal.group(1), arrays_1d) if literal.group(1) else "4"
+
+        def declared_kind(reference):
+            if "." in reference or "%" in reference:
+                info = self._component_spec(reference)
+            else:
+                name = reference.lower()
+                info = next((symbols[name] for symbols, _ in reversed(self._host_scopes)
+                             if name in symbols), None)
+            if not info or info.get("ftype") != "integer":
+                return None
+            attrs = info.get("attrs_l", "").strip()
+            if attrs.startswith("("):
+                closing = find_matching_paren(attrs, 0)
+                selector = attrs[1:closing].strip()
+                selector = re.sub(r"^kind\s*=\s*", "", selector, flags=re.I)
+                return self.translate_expr(selector, arrays_1d)
+            legacy = re.match(r"\*\s*(\d+)", attrs)
+            return legacy.group(1) if legacy else "4"
+
+        # Retain kind suffixes inside arithmetic rather than letting expression
+        # translation discard them. Placeholders are private to this analysis.
+        kinds = {}
+        def typed_literal(match):
+            name = f"_xf2p_model_literal_{len(kinds)}"
+            kinds[name] = self.translate_expr(match.group(1), arrays_1d)
+            return name
+        prepared = re.sub(r"(?<![\w.])\d+_([a-z_]\w*|\d+)\b", typed_literal, raw, flags=re.I)
+        try:
+            tree = ast.parse(self.translate_expr(prepared, arrays_1d), mode="eval").body
+        except SyntaxError:
+            return None
+
+        def reference_name(node):
+            if isinstance(node, ast.Name):
+                return node.id
+            if isinstance(node, ast.Attribute):
+                parent = reference_name(node.value)
+                return f"{parent}.{node.attr}" if parent else None
+            if isinstance(node, ast.Subscript):
+                return reference_name(node.value)
+            return None
+
+        def infer(node):
+            if isinstance(node, ast.Name):
+                return kinds.get(node.id) or declared_kind(node.id)
+            if isinstance(node, ast.Constant):
+                return "4" if type(node.value) is int else None
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+                return infer(node.operand)
+            if isinstance(node, (ast.Subscript, ast.Attribute)):
+                reference = reference_name(node)
+                return declared_kind(reference) if reference else None
+            if isinstance(node, ast.BinOp):
+                left, right = infer(node.left), infer(node.right)
+                if left and right:
+                    return f"max({left}, {right})"
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "_xf2p_div":
+                left, right = (infer(arg) for arg in node.args)
+                if left and right:
+                    return f"max({left}, {right})"
+            return None
+        return infer(tree)
+
+    def _translate_model_inquiry(self, name, inner, arrays_1d):
+        argument = _bind_intrinsic_arguments(name, inner, ("x",), 1)["x"]
+        kind = self._integer_model_kind(argument, arrays_1d)
+        if kind is not None:
+            return f"_f_numeric_model(None, {name!r}, integer_kind={kind})"
+        return f"_f_numeric_model({self.translate_expr(argument, arrays_1d)}, {name!r})"
+
     def translate_expr(self, expr: str, arrays_1d: set[str]) -> str:
         s = expr.strip()
         keyword = re.match(r"^([a-z_]\w*)\s*=(?!=)\s*(.+)$", s, re.I)
         if keyword:
             return f"{keyword.group(1)}={self.translate_expr(keyword.group(2), arrays_1d)}"
-        # Bit widths must be recovered before ordinary numeric-kind suffixes
+        # Bit widths and integer models must be recovered before kind suffixes
         # are removed. Scan nested calls too, without matching string contents.
         bit_pattern = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|"
-            r"\b(btest|ibset|ibclr|ibits|iand|ior|ieor|shiftl|shiftr)\s*\(", re.I)
+            r"\b(btest|ibset|ibclr|ibits|iand|ior|ieor|shiftl|shiftr|huge|digits|range|radix)\s*\(", re.I)
         out, cursor = [], 0
         while match := bit_pattern.search(s, cursor):
             out.append(s[cursor:match.start()])
@@ -2086,8 +2163,10 @@ class basic_f2p:
                 opening = s.find('(', match.start())
                 closing = find_matching_paren(s, opening)
                 if closing < 0:
-                    raise ValueError('unbalanced bit intrinsic call')
-                out.append(self._translate_bit_call(match.group(1).lower(), s[opening + 1:closing], arrays_1d))
+                    raise ValueError('unbalanced intrinsic call')
+                name = match.group(1).lower()
+                translator = self._translate_model_inquiry if name in {"huge", "digits", "range", "radix"} else self._translate_bit_call
+                out.append(translator(name, s[opening + 1:closing], arrays_1d))
                 cursor = closing + 1
             else:
                 out.append(match.group())
