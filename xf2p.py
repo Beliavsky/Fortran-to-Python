@@ -1818,6 +1818,7 @@ class basic_f2p:
                             mark(keyword.group(2) if keyword else actual)
                 intrinsic_outputs = {
                     'cpu_time': ('time',) if signature is None and callee not in self._generic_names else (),
+                    'system_clock': ('count', 'count_rate', 'count_max') if signature is None and callee not in self._generic_names else (),
                     'random_number': ('harvest',), 'random_seed': ('size', 'get'),
                     'move_alloc': ('from', 'to'),
                     'execute_command_line': ('exitstat', 'cmdstat', 'cmdmsg'),
@@ -1825,6 +1826,7 @@ class basic_f2p:
                 }.get(callee, ())
                 intrinsic_formals = {
                     'cpu_time': ('time',),
+                    'system_clock': ('count', 'count_rate', 'count_max'),
                     'random_number': ('harvest',), 'random_seed': ('size', 'put', 'get'),
                     'move_alloc': ('from', 'to', 'stat', 'errmsg'),
                     'execute_command_line': ('command', 'wait', 'exitstat', 'cmdstat', 'cmdmsg'),
@@ -5441,6 +5443,46 @@ class basic_f2p:
             cname = re.sub(r"\s*%\s*", ".", mm.group(1))
             cname_l = cname.lower()
             argtxt = (mm.group(2) or "").strip()
+            if (cname_l == 'system_clock' and cname_l not in self._binding_targets
+                    and cname_l not in self._generic_names):
+                formals = ('count', 'count_rate', 'count_max')
+                outputs = _bind_intrinsic_arguments(cname_l, argtxt, formals, 0)
+                prepared, kinds = [], []
+                for formal, output in outputs.items():
+                    target = self.translate_expr(output, arrays_1d)
+                    node = ast.parse(target, mode='eval').body
+                    if not isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)) or ':' in output or '[' in output:
+                        raise ValueError('SYSTEM_CLOCK requires scalar output variables, components or array elements')
+                    base = re.match(r'[a-z_]\w*', output, re.I)
+                    name = base.group().lower() if base else ''
+                    spec = self._component_spec(output) if '%' in output else None
+                    ftype = spec['ftype'] if spec else self._decl_types.get(name)
+                    if ftype != 'integer' and not (formal == 'count_rate' and ftype == 'real'):
+                        raise ValueError(f'SYSTEM_CLOCK {formal.upper()} requires INTEGER' +
+                                         (' or REAL' if formal == 'count_rate' else '') + ' output')
+                    if ((isinstance(node, ast.Name) and name in arrays_1d)
+                            or (spec and spec.get('shape') and not output.rstrip().endswith(')'))
+                            or (spec and name in arrays_1d and re.match(r'\w+\s*%', output))):
+                        raise ValueError('SYSTEM_CLOCK requires scalar outputs')
+                    if ftype == 'integer':
+                        kind = self._integer_model_kind(output, arrays_1d)
+                        if kind is None:
+                            raise ValueError('SYSTEM_CLOCK cannot determine integer output kind')
+                        kinds.append(kind)
+                    prepared.append((formal, output, target, spec, ftype))
+                self._allocation_counter += 1
+                result = _choose_fresh_identifier(self._allocation_source,
+                                                  f'_xf2p_clock_{self._allocation_counter}')
+                self.emit(f"{result} = _f_system_clock([{', '.join(kinds)}])")
+                for formal, output, target, spec, ftype in prepared:
+                    value = f'{result}[{formals.index(formal)}]'
+                    if ftype == 'real':
+                        value = f'float({value})'
+                    if spec and 'pointer' in spec.get('attrs_l', '') and not spec.get('shape'):
+                        self.emit(f'{target}[...] = {value}')
+                    else:
+                        self.transpile_assignment(output, value, arrays_1d)
+                return True
             if (cname_l == 'cpu_time' and cname_l not in self._binding_targets
                     and cname_l not in self._generic_names):
                 output = _bind_intrinsic_arguments(cname_l, argtxt, ('time',), 1)['time']

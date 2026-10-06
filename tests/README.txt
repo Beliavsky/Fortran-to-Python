@@ -674,6 +674,12 @@ complex-part assignments, cross-element dependencies, frozen masks, statement
 order, multidimensional indices, copied section RHS values, derived components,
 captured destination selectors, descending triplets and empty iteration sets.
 
+system_clock.f90 and test_system_clock.py check positional/keyword and optional
+clock outputs, integer/real rates, integer kinds and wrapping, unavailable-clock
+sentinels, one sample per call, components, array elements, pointers, scalar dummy
+copy-back, host updates, user procedure shadowing and invalid output diagnostics.
+Native/Python comparisons use clock properties rather than exact timestamps.
+
 projected_complex_parts.f90 and test_projected_complex_parts.py check explicit
 write-back through whole derived-array projections, scalar expansion, conformable
 vector/matrix RHS values, nested scalar components and WHERE/ELSEWHERE masks.

@@ -604,6 +604,22 @@ An unavailable process clock returns a negative value. CPU timings naturally
 differ between independently executed Fortran and Python programs; comparisons
 should test timing properties rather than equality of the measured seconds.
 
+`CALL SYSTEM_CLOCK([count, count_rate, count_max])` uses Python's monotonic
+nanosecond clock. All outputs are optional and may use positional or keyword
+arguments. `COUNT` and `COUNT_MAX` require scalar INTEGER outputs;
+`COUNT_RATE` also accepts scalar REAL. Array elements, scalar components,
+associated scalar pointers, and scalar dummy/host variable updates are supported.
+One clock sample supplies all requested outputs.
+
+The translation chooses a rate of 1,000 ticks/second for integer kinds below 8,
+or 1,000,000,000 ticks/second for kind 8 and above. With mixed integer output
+kinds, the narrowest controls the clock, and the rate is capped to fit it.
+`COUNT_MAX` is that kind's largest positive integer; counts wrap after reaching
+it. If the clock is unavailable, count is negative and rate/maximum are zero.
+These are translation clock choices, not an emulation of a particular Fortran
+compiler's resolution, epoch or wrap period. Compare timing properties rather
+than exact timestamps across independently executed programs.
+
 `DPROD(x,y)` is translated to an elemental helper that converts both real
 operands to double precision before multiplying. Scalar operands may expand
 over an array; two array operands must have the same shape, rather than relying

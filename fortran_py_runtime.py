@@ -302,7 +302,7 @@ __all__ = [
     "_f_associated", "_f_pointer_target", "_f_pointer_associate",
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
-    "_f_execute_command_line", "_f_cpu_time",
+    "_f_execute_command_line", "_f_cpu_time", "_f_system_clock",
     "_f_set_complex_part", "_f_assign_complex_part", "_f_assign_complex_part_attribute",
     "_f_assign_component_complex_part",
     "_reshape_with_pad",
@@ -701,6 +701,22 @@ def _f_assign_complex_part(array, index, rhs, part, mask=None):
 
 def _f_assign_complex_part_attribute(obj, attribute, rhs, part, mask=None):
     setattr(obj, attribute, _f_set_complex_part(getattr(obj, attribute), rhs, part, mask))
+
+
+def _f_system_clock(integer_kinds=()):
+    """Return a bounded monotonic tick count, ticks/second and wrap maximum.
+
+    Clock resolution is a translation choice, not an emulation of a particular
+    Fortran compiler's clock. Use the narrowest integer output to avoid overflow.
+    """
+    kind = min(integer_kinds, default=4)
+    maximum = (1 << (_f_bit_size(kind) - 1)) - 1
+    rate = min(maximum, 1_000_000_000 if kind >= 8 else 1_000)
+    try:
+        ticks = time.monotonic_ns() * rate // 1_000_000_000
+    except (AttributeError, OSError, NotImplementedError):
+        return -maximum, 0, 0
+    return ticks % (maximum + 1), rate, maximum
 
 
 def _f_cpu_time():
