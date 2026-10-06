@@ -1235,7 +1235,46 @@ def parse_decl(line: str):
     s = line.strip()
     pos = _find_top_level_double_colon(s)
     if pos == -1:
-        return None
+        # Without attributes/initialization, :: is optional. Parse a complete
+        # type specification and validate the entity list, rather than treating
+        # every statement beginning with REAL/INTEGER/etc. as a declaration.
+        type_match = re.match(r'^(double\s+precision|double\s+complex|integer|real|logical|complex|character)\b', s, re.I)
+        if not type_match:
+            return None
+        cursor = type_match.end()
+        while cursor < len(s) and s[cursor].isspace():
+            cursor += 1
+        if cursor < len(s) and s[cursor] == '(':
+            closing = find_matching_paren(s, cursor)
+            if closing < 0:
+                return None
+            cursor = closing + 1
+        elif cursor < len(s) and s[cursor] == '*':
+            cursor += 1
+            while cursor < len(s) and s[cursor].isspace():
+                cursor += 1
+            if cursor < len(s) and s[cursor] == '(':
+                closing = find_matching_paren(s, cursor)
+                if closing < 0:
+                    return None
+                cursor = closing + 1
+            else:
+                length = re.match(r'\d+', s[cursor:])
+                if not length:
+                    return None
+                cursor += length.end()
+        rest = s[cursor:].strip()
+        if not rest:
+            return None
+        for entity in split_args(rest):
+            entity = entity.strip()
+            name = re.match(r'^[a-z_]\w*', entity, re.I)
+            if not name:
+                return None
+            tail = entity[name.end():].strip()
+            if tail and not (tail.startswith('(') and find_matching_paren(tail, 0) == len(tail) - 1):
+                return None
+        return parse_decl(s[:cursor].strip() + ' :: ' + rest)
     lhs = s[:pos].strip()
     rest = s[pos + 2 :].strip()
     m = _decl_re.match(lhs)

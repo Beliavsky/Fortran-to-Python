@@ -616,3 +616,9 @@ numeric storage or precision.
 double_types.f90 and test_double_types.py check DOUBLE PRECISION and
 DOUBLE COMPLEX declarations, attributes, arrays, parameters, components,
 dummy arguments, typed function headers and KIND inquiries.
+
+declarations_without_colons.f90 and test_declarations_without_colons.py check
+intrinsic declarations without ::, including kind selectors, legacy star
+selectors, nested array bounds, character lengths, multiple entities and
+dummy arguments. Executable assignments/calls and typed procedure headers
+must not be mistaken for declarations.

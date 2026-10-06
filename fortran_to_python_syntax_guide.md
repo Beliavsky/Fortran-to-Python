@@ -565,6 +565,10 @@ as `SELECTED_CHAR_KIND`, remain unimplemented.
 declared variables, including arrays, elements, sections and components.
 `DOUBLE PRECISION` and the `DOUBLE COMPLEX` extension are normalized to
 `REAL(KIND=8)` and `COMPLEX(KIND=8)`, including typed function headers.
+Intrinsic type declarations can omit `::` when no attributes or initialization
+require it, for example `INTEGER(8) i,j`, `REAL a(-2:2)`, and
+`CHARACTER*(3) text`. Type/kind selectors, array bounds and character lengths
+retain the same meaning as in the corresponding declarations with `::`.
 Arithmetic and supported intrinsic results (for example `MATMUL`, `DOT_PRODUCT`,
 reductions and conversions with explicit KIND selectors), and functions with
 known result declarations, retain their result-kind metadata. An inquiry can
