@@ -3642,89 +3642,158 @@ class basic_f2p:
         name_raw = mm.group(1).strip()
         idx_raw = mm.group(2).strip()
         root = name_raw.split("%", 1)[0].lower()
-        if root not in arrays_1d:
+        component = self._component_spec(name_raw)
+        if root not in arrays_1d and not (component and component.get('shape')):
             return None
-        if "," in idx_raw or ":" in idx_raw:
+        if ":" in idx_raw:
             return None
         name_py = name_raw.replace("%", ".")
-        idx_py = self.translate_expr(idx_raw, arrays_1d)
-        return f"{name_py}[(({idx_py}) - 1):((({idx_py}) - 1) + 1)].reshape(())"
+        parts = []
+        for axis, index in enumerate(split_args(idx_raw)):
+            index_py = self._index_expr_from_decl_bounds(name_py, index, axis, arrays_1d)
+            parts.append(f'({index_py}):(({index_py}) + 1)')
+        return f"{name_py}[{', '.join(parts)}].reshape(())"
 
     def _associate_alias_metadata(self, selector: str, arrays_1d: set[str]) -> tuple[bool, bool, str | None]:
         sel = selector.strip()
         mm_name = re.fullmatch(r"[a-z_]\w*(?:%[a-z_]\w*)*", sel, re.I)
         if mm_name:
             root = sel.split("%", 1)[0].lower()
-            is_array = root in arrays_1d
+            component = self._component_spec(sel)
+            is_array = root in arrays_1d or bool(component and component.get('shape'))
             return True, is_array, root
         mm = re.match(r"^([a-z_]\w*(?:%[a-z_]\w*)*)\s*\((.*)\)\s*$", sel, re.I)
         if mm:
             root = mm.group(1).split("%", 1)[0].lower()
-            if root not in arrays_1d:
+            component = self._component_spec(mm.group(1))
+            if root not in arrays_1d and not (component and component.get('shape')):
                 return False, False, None
             idx = mm.group(2).strip()
-            is_array = (":" in idx) or ("," in idx)
+            is_array = any(':' in part or part.strip().lower() in arrays_1d
+                           for part in split_args(idx))
             return True, is_array, root
         return False, False, None
+
+    def _associate_expression_array_type(self, expression):
+        """Recognize array-valued arithmetic selectors without making aliases."""
+        def infer(node):
+            if isinstance(node, ast.Name):
+                return self._decl_array_types.get(node.id.lower())
+            if isinstance(node, ast.Attribute):
+                component = self._component_spec(ast.unparse(node))
+                return component['ftype'] if component and component.get('shape') else None
+            if isinstance(node, ast.BinOp):
+                return infer(node.left) or infer(node.right)
+            if isinstance(node, ast.UnaryOp):
+                return infer(node.operand)
+            if isinstance(node, ast.Subscript) and any(isinstance(child, ast.Slice) for child in ast.walk(node.slice)):
+                return infer(node.value)
+            return None
+        node = ast.parse(expression, mode='eval').body
+        result = infer(node)
+        if result == 'integer' and any(isinstance(child, ast.Constant) and isinstance(child.value, float) for child in ast.walk(node)):
+            result = 'real'
+        return result
 
     def _start_associate_block(self, raw: str, arrays_1d: set[str]) -> None:
         self.emit("if True:")
         self.indent += 1
         frame: dict[str, object] = {
-            "added_decl_pointer": set(),
-            "added_decl_types": {},
-            "added_decl_array_types": {},
-            "added_arrays_1d": set(),
             "code_start": self._code_emit_count,
+            "names": set(),
+            "saved_bindings": {},
+            "saved_arrays": set(arrays_1d),
+            "saved_pointer": set(self._decl_pointer),
+            "saved_maps": {attr: dict(getattr(self, attr)) for attr in
+                           ('_decl_types', '_decl_array_types', '_decl_type_names',
+                            '_decl_lbounds', '_decl_ubounds')},
         }
+        selected = []
+        # Every selector is evaluated in the enclosing scope, before any
+        # associate name can shadow a variable used by a subsequent selector.
         for assoc_name, selector in self._associate_bindings(raw):
-            assoc_l = assoc_name.lower()
             can_alias, is_array_alias, root = self._associate_alias_metadata(selector, arrays_1d)
-            if can_alias:
-                if is_array_alias:
+            component = self._component_spec(selector) if can_alias else None
+            expression_type = None
+            if can_alias and not is_array_alias:
+                rhs_py = self._associate_array_element_ref(selector, arrays_1d)
+                if rhs_py is None:
                     rhs_py = self.translate_expr(selector, arrays_1d)
-                else:
-                    rhs_py = self._associate_array_element_ref(selector, arrays_1d)
-                    if rhs_py is None:
-                        selector_py = self.translate_expr(selector, arrays_1d)
-                        if re.fullmatch(r"[a-z_]\w*", selector.strip(), re.I):
-                            self.emit(f"if not isinstance({selector_py}, np.ndarray):")
-                            self.indent += 1
-                            self.emit(f"{selector_py} = np.asarray({selector_py})")
-                            self.indent -= 1
-                        rhs_py = selector_py
-                self.emit(f"{assoc_name} = {rhs_py}")
-                self._decl_pointer.add(assoc_l)
-                cast(set[str], frame["added_decl_pointer"]).add(assoc_l)
-                if is_array_alias:
-                    base_type = self._decl_array_types.get(root or "", self._decl_types.get(root or "", "real"))
-                    self._decl_array_types[assoc_l] = base_type
-                    cast(dict[str, str], frame["added_decl_array_types"])[assoc_l] = base_type
-                    arrays_1d.add(assoc_l)
-                    cast(set[str], frame["added_arrays_1d"]).add(assoc_l)
-                else:
-                    base_type = self._decl_types.get(root or "", "real")
-                    self._decl_types[assoc_l] = base_type
-                    cast(dict[str, str], frame["added_decl_types"])[assoc_l] = base_type
+                    if re.fullmatch(r'[a-z_]\w*', selector.strip(), re.I):
+                        self.emit(f'if not isinstance({rhs_py}, np.ndarray):')
+                        self.indent += 1
+                        self.emit(f'{rhs_py} = np.asarray({rhs_py})')
+                        self.indent -= 1
             else:
                 rhs_py = self.translate_expr(selector, arrays_1d)
-                self.emit(f"{assoc_name} = _xf2p_copy_value({rhs_py})")
-                if assoc_l in arrays_1d:
-                    cast(set[str], frame["added_arrays_1d"]).add(assoc_l)
+                if not can_alias:
+                    expression_type = self._associate_expression_array_type(rhs_py)
+                if not can_alias:
+                    rhs_py = f'_xf2p_copy_value({rhs_py})'
+            self._allocation_counter += 1
+            temporary = _choose_fresh_identifier(self._allocation_source, f'_xf2p_associate_selector_{self._allocation_counter}')
+            self.emit(f'{temporary} = {rhs_py}')
+            base_type = component['ftype'] if component else self._decl_array_types.get(root or '', self._decl_types.get(root or '', 'real'))
+            type_name = component.get('type_name') if component else self._decl_type_names.get(root or '')
+            selected.append((assoc_name, selector, can_alias, is_array_alias, root, component, temporary, base_type, type_name,
+                             expression_type if not can_alias else None))
+        for assoc_name, selector, can_alias, is_array_alias, root, component, temporary, base_type, type_name, expression_type in selected:
+            assoc_l = assoc_name.lower()
+            if assoc_l in self._decl_types or any(assoc_l in outer['names'] for outer in self._associate_stack):
+                self._allocation_counter += 1
+                saved = _choose_fresh_identifier(self._allocation_source, f'_xf2p_associate_saved_{self._allocation_counter}')
+                self.emit(f'{saved} = {assoc_name}')
+                frame['saved_bindings'][assoc_name] = saved
+            frame['names'].add(assoc_l)
+            arrays_1d.discard(assoc_l)
+            self._decl_pointer.discard(assoc_l)
+            for attr in frame['saved_maps']:
+                getattr(self, attr).pop(assoc_l, None)
+            if can_alias:
+                self.emit(f"{assoc_name} = {temporary}")
+                self._decl_pointer.add(assoc_l)
+                self._decl_types[assoc_l] = base_type
+                if type_name:
+                    self._decl_type_names[assoc_l] = type_name
+                if is_array_alias:
+                    self._decl_array_types[assoc_l] = base_type
+                    arrays_1d.add(assoc_l)
+                    # Section associate names have unit lower bounds, even if
+                    # a shadowed outer variable had different declared bounds.
+                    section = re.fullmatch(r'[a-z_]\w*(?:%[a-z_]\w*)*\s*\((.*)\)', selector, re.I)
+                    if section:
+                        rank = sum(':' in part or part.strip().lower() in frame['saved_arrays']
+                                   for part in split_args(section.group(1)))
+                        self._decl_lbounds[assoc_l] = ['1'] * rank
+                        self._decl_ubounds[assoc_l] = [''] * rank
+                    elif component and component.get('shape'):
+                        bounds = self._shape_bounds(component['shape'])
+                        self._decl_lbounds[assoc_l] = [lo for lo, _hi in bounds]
+                        self._decl_ubounds[assoc_l] = [hi for _lo, hi in bounds]
+                    else:
+                        self._decl_lbounds[assoc_l] = list(frame['saved_maps']['_decl_lbounds'].get(root, []))
+                        self._decl_ubounds[assoc_l] = list(frame['saved_maps']['_decl_ubounds'].get(root, []))
+                else:
+                    self._decl_types[assoc_l] = base_type
+            else:
+                self.emit(f"{assoc_name} = {temporary}")
+                if expression_type:
+                    arrays_1d.add(assoc_l)
+                    self._decl_types[assoc_l] = expression_type
+                    self._decl_array_types[assoc_l] = expression_type
         self._associate_stack.append(frame)
 
     def _end_associate_block(self, arrays_1d: set[str]) -> None:
         if not self._associate_stack:
             return
         frame = self._associate_stack.pop()
-        for name in cast(set[str], frame.get("added_decl_pointer", set())):
-            self._decl_pointer.discard(name)
-        for name in cast(dict[str, str], frame.get("added_decl_types", {})).keys():
-            self._decl_types.pop(name, None)
-        for name in cast(dict[str, str], frame.get("added_decl_array_types", {})).keys():
-            self._decl_array_types.pop(name, None)
-        for name in cast(set[str], frame.get("added_arrays_1d", set())):
-            arrays_1d.discard(name)
+        for name, saved in frame['saved_bindings'].items():
+            self.emit(f'{name} = {saved}')
+        self._decl_pointer = frame['saved_pointer']
+        for attr, values in frame['saved_maps'].items():
+            setattr(self, attr, values)
+        arrays_1d.clear()
+        arrays_1d.update(frame['saved_arrays'])
         start = int(frame.get("code_start", self._code_emit_count))
         if self._code_emit_count == start:
             self.emit("pass")

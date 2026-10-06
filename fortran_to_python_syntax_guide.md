@@ -315,6 +315,30 @@ Nested FORALL/WHERE bodies and pointer assignments are not yet supported and
 are diagnosed explicitly. Ordinary `DO` loops retain sequential behavior;
 `DO CONCURRENT` is a distinct construct, not given FORALL snapshot semantics.
 
+### ASSOCIATE selectors: aliases versus expression values
+
+```fortran
+associate (a => x%v(2:4:2))
+   a = a * 10
+end associate
+```
+
+For numeric array components and basic sections, the translation retains a
+NumPy view and assigns through it in place. This updates the selected elements
+of `x%v`, rather than replacing the Python association name with a new array.
+Scalar array elements use a zero-dimensional view. Component element types
+and declared bounds are used when translating indexing and integer conversion.
+
+An expression selector such as `a => x%v * 2` is different: its value is copied
+on entry, so subsequent changes to `x%v` do not change `a`. Simple array-valued
+arithmetic selectors retain metadata needed for indexing the temporary value.
+All selectors are evaluated in the enclosing scope before binding associate
+names. Shadowed bindings and their metadata are restored at `END ASSOCIATE`.
+
+This is not complete association support. Whole derived-type/scalar-component
+aliases, vector-subscripted selectors, pointer reassociation and scalar aliases
+passed to procedures with rewritten output arguments still need manual review.
+
 ## Functions, subroutines, and arguments
 
 ```fortran

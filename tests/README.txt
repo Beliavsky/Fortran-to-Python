@@ -570,3 +570,8 @@ where_semantics.f90 and test_where_semantics.py check named/nested WHERE,
 ELSEWHERE and ELSE WHERE spellings, branch-name validation, frozen logical
 array masks, scalar logical assignments, and masked ELSEWHERE evaluated after
 preceding assignments without reselecting previously matched elements.
+
+associate_components.f90 and test_associate_components.py check write-through
+aliases to numeric component arrays, strided sections and scalar elements,
+matrix sections, declared component bounds, integer conversion, expression
+snapshots, enclosing-scope selector evaluation and nested/shadowed bindings.
