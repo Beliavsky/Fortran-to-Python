@@ -433,6 +433,19 @@ variables. Cross-file mutable state and renamed imports have explicit
 restrictions. The batch tool's `--group` supplies dependencies in order but
 does not discover them automatically.
 
+Within one translation unit, procedures and generic interfaces that share a
+name across modules receive distinct generated names, such as
+`xf2p_strings_mod_helper`. Calls follow module-local, host, and `USE`
+association, including `ONLY`, procedure renames, and re-exports. Local variables
+and internal procedures shadow imported names. Type-bound member names remain
+unchanged even when their implementation is qualified. Referencing an ambiguous
+imported procedure is diagnosed rather than resolved arbitrarily.
+Unambiguous definitions keep their original names. This does not provide
+separate namespaces for same-named module variables or derived types.
+Importing a qualified procedure across separately generated Python files is
+currently diagnosed; combine the Fortran modules and program into one input
+file to use this resolution path.
+
 Internal procedures can become nested Python functions. Host-variable writes
 may require `nonlocal`; module-variable writes may require `global`. A local
 declaration that shadows a host name must remain independent of it.

@@ -585,3 +585,9 @@ optional_allocatable.f90 and test_optional_allocatable.py check PRESENT
 independently of ALLOCATED for scalars and arrays, all intents and no INTENT,
 functions, component actuals and type-bound calls. They also check allocation
 changes and forwarding omitted/unallocated actuals to optional allocatables.
+
+module_procedure_names.f90 and test_module_procedure_names.py check same-source
+module procedure collisions, implicit/explicit results, module-local calls,
+ONLY and renamed USE association, re-exports, private helpers, lexical shadowing,
+generic and type-bound calls, scalar copyback, and ambiguity diagnostics.
+Separate-file imports of qualified procedures are explicitly diagnosed.

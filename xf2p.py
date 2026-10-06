@@ -6482,6 +6482,168 @@ class basic_f2p:
                 self._lexical_block_entries[marker].append((rewritten, comment))
         return result
 
+    def _resolve_module_procedure_names(self, lines):
+        """Resolve same-source procedure USE/host association before flattening.
+
+        Only colliding module definitions need new Python names. Resolve bare
+        references lexically, not component names, strings, or keyword labels.
+        """
+        root = dict(kind='file', name='', parent=None, locals=set(), procedures={}, uses=[], access=[], children=[])
+        stack, owners, scopes, modules = [root], [], [root], {}
+        for index, (code, _comment) in enumerate(lines):
+            s = code.strip()
+            end = re.match(r'^end\s*(module|program|function|subroutine|type|interface|block)\b', s, re.I)
+            if end or s.lower() == 'end':
+                owners.append(stack[-1])
+                if len(stack) > 1:
+                    stack.pop()
+                continue
+            kind, name, args, result = None, '', [], None
+            module = re.fullmatch(r'module\s+([a-z_]\w*)', s, re.I)
+            program = re.match(r'^program\s+([a-z_]\w*)', s, re.I)
+            procedure = re.search(r'\b(function|subroutine)\s+([a-z_]\w*)\s*\(([^)]*)\)', s, re.I)
+            derived = re.match(r'^type\b(?!\s*\()(?:\s*,[^:]*)?(?:\s*::\s*|\s+)([a-z_]\w*)\s*$', s, re.I)
+            interface = re.fullmatch(r'(?:abstract\s+)?interface(?:\s+([a-z_]\w*))?', s, re.I)
+            if module:
+                kind, name = 'module', module.group(1).lower()
+            elif program:
+                kind, name = 'program', program.group(1).lower()
+            elif derived:
+                kind, name = 'type', derived.group(1).lower()
+            elif interface:
+                kind, name = 'interface', (interface.group(1) or '').lower()
+                if name and stack[-1]['kind'] == 'module':
+                    stack[-1]['procedures'][name] = name
+            elif s.lower() == 'block':
+                kind, name = 'block', ''
+            elif procedure and stack[-1]['kind'] != 'type' and (self._is_function_header(s) or self._is_subroutine_header(s)):
+                kind, name = procedure.group(1).lower(), procedure.group(2).lower()
+                args = [a.strip().lower() for a in split_args(procedure.group(3))]
+                res = re.search(r'\bresult\s*\(\s*(\w+)\s*\)', s, re.I)
+                result = res.group(1).lower() if res else (name if kind == 'function' else None)
+                stack[-1]['procedures'][name] = name
+            if kind:
+                scope = dict(kind=kind, name=name, parent=stack[-1], locals=set(args) | ({result} if result else set()),
+                             result=result, procedures={}, uses=[], access=[], children=[])
+                stack[-1]['children'].append(scope)
+                scopes.append(scope)
+                stack.append(scope)
+                if kind == 'module':
+                    modules[name] = scope
+            owners.append(stack[-1])
+            scope = stack[-1]
+            declaration = self._parse_decl_line(s)
+            if declaration:
+                scope['locals'].update(name.lower() for name, _shape, _init in declaration[3])
+            use = re.fullmatch(r'use\s*(?:,\s*(intrinsic|non_intrinsic)\s*)?(?:::)?\s*(\w+)\s*(.*)', s, re.I)
+            if use and (use.group(1) or '').lower() != 'intrinsic':
+                scope['uses'].append((use.group(2).lower(), use.group(3)))
+            if scope['kind'] == 'module':
+                access = re.fullmatch(r'(public|private)(?:\s*(?:::)?\s+(.+))?', s, re.I)
+                if access:
+                    scope['access'].append((access.group(1).lower(), access.group(2)))
+
+        definitions = {}
+        for scope in scopes:
+            if scope['kind'] in ('module', 'file'):
+                for name in scope['procedures']:
+                    definitions.setdefault(name, []).append(scope)
+        source = '\n'.join(code for code, _ in lines)
+        for name, providers in definitions.items():
+            if len(providers) > 1:
+                for scope in providers:
+                    if scope['kind'] == 'module':
+                        canonical = _choose_fresh_identifier(source, f'xf2p_{scope["name"]}_{name}')
+                        scope['procedures'][name] = canonical
+                        source += '\n' + canonical
+
+        exports = {name: {} for name in modules}
+
+        def imported(scope):
+            resolved = {}
+            for module, tail in scope['uses']:
+                available = exports.get(module, {})
+                only = re.match(r'\s*,?\s*only\s*:\s*(.*)', tail, re.I)
+                selected = {} if only else dict(available)
+                for item in split_args(only.group(1) if only else tail.lstrip(',').strip()):
+                    pair = [p.strip().lower() for p in item.split('=>', 1)]
+                    local, remote = pair[0], pair[-1]
+                    if remote in available:
+                        if not only and local != remote:
+                            selected.pop(remote, None)
+                        selected[local] = available[remote]
+                for local, canonical in selected.items():
+                    resolved[local] = canonical if local not in resolved or resolved[local] == canonical else None
+            return resolved
+
+        # Modules can re-export USE-associated procedures, including renames.
+        for _ in range(len(modules) + 1):
+            changed = False
+            for name, scope in modules.items():
+                visible = {**imported(scope), **scope['procedures']}
+                public, private, default_private = set(), set(), False
+                for access, names in scope['access']:
+                    if names is None:
+                        default_private = access == 'private'
+                    else:
+                        (public if access == 'public' else private).update(p.strip().lower() for p in split_args(names))
+                visible = {n: v for n, v in visible.items() if n not in private and (not default_private or n in public)}
+                if exports[name] != visible:
+                    exports[name] = visible
+                    changed = True
+            if not changed:
+                break
+        self._module_procedure_exports = exports
+
+        def namespace(scope):
+            if 'resolved' in scope:
+                return scope['resolved']
+            visible = dict(namespace(scope['parent'])) if scope['parent'] else {}
+            visible.update(imported(scope))
+            for local in scope['locals']:
+                visible.pop(local, None)
+            visible.update(scope['procedures'])
+            if scope['kind'] in ('function', 'subroutine'):
+                canonical = scope['parent']['procedures'][scope['name']]
+                visible[scope['name']] = canonical
+            scope['resolved'] = visible
+            return visible
+
+        token = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|\b[a-z_]\w*\b", re.I)
+        rewritten = []
+        for (code, comment), scope in zip(lines, owners):
+            visible = namespace(scope)
+            if re.match(r'\s*(?:use|module|end\s*module|program|end\s*program)\b', code, re.I) and not re.match(r'\s*module\s+procedure\b', code, re.I):
+                rewritten.append((code, comment))
+                continue
+            # A shorthand binding keeps its member name but changes its target.
+            if scope['kind'] == 'type' and re.match(r'\s*procedure\b', code, re.I) and '::' in code:
+                head, items = code.split('::', 1)
+                code = head + ':: ' + ', '.join(
+                    item.strip() + ' => ' + visible[item.strip().lower()]
+                    if '=>' not in item and visible.get(item.strip().lower(), item.strip()) != item.strip()
+                    else item for item in split_args(items))
+            binding_names = set()
+            if scope['kind'] == 'type' and re.match(r'\s*procedure\b', code, re.I) and '::' in code:
+                start = code.index('::') + 2
+                binding_names = {start + m.start(1) for m in re.finditer(r'\b(\w+)\s*(?==>|,|$)', code[start:])}
+            def rename(match):
+                name = match.group(0)
+                if (name.startswith(('"', "'")) or match.start() in binding_names
+                        or code[:match.start()].rstrip().endswith('%')):
+                    return name
+                # Dummy keyword names belong to the callee, not this scope.
+                if re.match(r'\s*=(?!=|>)', code[match.end():]) and '(' in code[:match.start()]:
+                    prefix = token.sub(lambda m: '' if m.group(0).startswith(('"', "'")) else m.group(0), code[:match.start()])
+                    if prefix.count('(') > prefix.count(')'):
+                        return name
+                canonical = visible.get(name.lower(), name)
+                if canonical is None:
+                    raise ValueError(f"ambiguous USE-associated procedure '{name}' in {scope['name'] or 'main program'}")
+                return canonical
+            rewritten.append((token.sub(rename, code), comment))
+        return rewritten
+
     def transpile(self, src: str) -> str:
         self._host_scopes = []
         self._forall_stack = []
@@ -6492,6 +6654,7 @@ class basic_f2p:
         self._module_storage_owners: dict[str, str] = {}
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
+        raw = self._resolve_module_procedure_names(raw)
         raw, self._module_enum_names = lower_enum_declarations(raw)
         self._module_enum_storage_owners: dict[str, str] = {}
         reject_defined_operations(raw)
@@ -7546,6 +7709,7 @@ def main() -> int:
 
         generated: dict[Path, Path] = {}
         file_module_variables: dict[Path, dict[str, dict[str, dict]]] = {}
+        file_module_procedures: dict[Path, dict[str, dict[str, str]]] = {}
         rc = 0
         for p in in_paths:
             out_path = (Path(args.out_dir) / f"{p.stem}_f.py") if args.out_dir else p.with_name(f"{p.stem}_f.py")
@@ -7571,6 +7735,7 @@ def main() -> int:
                     print(py.rstrip())
             generated[p] = out_path
             file_module_variables[p] = t._module_variable_symbols
+            file_module_procedures[p] = t._module_procedure_exports
 
         # Add inter-file imports according to USE dependencies.
         for p in in_paths:
@@ -7613,6 +7778,10 @@ def main() -> int:
                                           re.finditer(r"=>\s*([a-z_]\w*)", use.group(2), re.I))
                 mutable = {var.lower() for var, info in variables.items()
                            if "parameter" not in info["attrs_l"]}
+                procedures = file_module_procedures[provider].get(us.module.lower(), {})
+                if any(remote in referenced and canonical != remote for remote, canonical in procedures.items()):
+                    print("Transpile: FAIL (USE-associated procedures with qualified module names across separate Python files are not yet supported; combine the module and program into a single Fortran input file)")
+                    return 1
                 if referenced & mutable:
                     print("Transpile: FAIL (mutable USE-associated variables across separate Python files are not yet supported; combine the module and program into a single Fortran input file)")
                     return 1
