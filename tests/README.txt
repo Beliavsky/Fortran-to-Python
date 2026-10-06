@@ -653,3 +653,8 @@ bit_size_inquiries.f90 and test_bit_size.py check BIT_SIZE for integer kinds
 1/2/4/8/16, array elements and expressions, keyword arguments, nested model
 inquiries, generic dispatch, preserved strings and user procedure names.
 Inquiries must not evaluate unallocated elements or side-effecting functions.
+
+dprod.f90 and test_dprod.py check double-precision products, scalar expansion,
+conforming vector/matrix operands, keyword arguments, result kinds and generic
+dispatch. Precision/overflow checks ensure conversion occurs before multiplying;
+non-real operands and nonconforming array shapes are explicitly diagnosed.

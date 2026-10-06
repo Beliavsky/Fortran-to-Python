@@ -337,7 +337,7 @@ __all__ = [
     "_f_fraction", "_f_exponent", "_f_scale", "_f_set_exponent",
     "_f_nearest", "_f_spacing", "_f_rrspacing", "_f_numeric_model", "_f_bit_size",
     "_f_selected_int_kind", "_f_selected_real_kind", "_f_selected_logical_kind",
-    "_f_dim", "_f_sign",
+    "_f_dim", "_f_sign", "_f_dprod",
     "spread",
     "huge",
     "tiny",
@@ -1264,6 +1264,17 @@ def _f_numeric_model(x, inquiry, *, integer_kind=None):
     if inquiry == "radix":
         return 2
     raise ValueError(f"unknown model inquiry: {inquiry}")
+
+
+def _f_dprod(x, y):
+    """Elemental double-precision product; widen operands, not their product."""
+    x, y = np.asarray(x), np.asarray(y)
+    if x.dtype.kind != 'f' or y.dtype.kind != 'f':
+        raise TypeError('DPROD requires real operands')
+    if x.ndim and y.ndim and x.shape != y.shape:
+        raise ValueError('DPROD array operands must have conforming shapes')
+    result = np.asarray(x, dtype=np.float64) * np.asarray(y, dtype=np.float64)
+    return result.item() if result.ndim == 0 else result
 
 
 def _f_dim(x, y):

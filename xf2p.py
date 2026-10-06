@@ -1133,6 +1133,7 @@ _LOCAL_RUNTIME_HELPERS = {
 }
 
 _INTRINSIC_ARGUMENTS = {
+    'dprod': (('x', 'y'), 2),
     'selected_int_kind': (('r',), 1),
     'selected_real_kind': (('p', 'r', 'radix'), 0),
     'selected_logical_kind': (('bits',), 1),
@@ -2657,6 +2658,8 @@ class basic_f2p:
             return (family, model[1] if model and model[0] == 'complex' else '4')
         if name == 'dble':
             return ('real', '8')
+        if name == 'dprod':
+            return ('real', '8')
         if name in {'aint', 'anint'}:
             model = first_model()
             kind = keywords.get('kind') or (positional[1] if len(positional) > 1 else None)
@@ -3242,6 +3245,9 @@ class basic_f2p:
 
         def _translate_special_call(name: str, inner: str) -> str | None:
             lname = name.lower()
+            if lname == 'dprod' and (lname in self._binding_targets
+                    or any(lname in scope for scope, _ in self._host_scopes)):
+                return None
             if lname not in _INTRINSIC_ARGUMENTS and lname not in {
                 "gamma",
                 "log_gamma",

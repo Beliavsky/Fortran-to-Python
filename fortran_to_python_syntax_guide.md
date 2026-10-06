@@ -577,6 +577,13 @@ Selection does not add kind-dependent storage or arithmetic emulation; existing
 floating-point kind fidelity limitations still apply. Other intrinsics, such
 as `SELECTED_CHAR_KIND`, remain unimplemented.
 
+`DPROD(x,y)` is translated to an elemental helper that converts both real
+operands to double precision before multiplying. Scalar operands may expand
+over an array; two array operands must have the same shape, rather than relying
+on NumPy's more general broadcasting. Keyword arguments `x=` and `y=` are
+supported, and result-kind inference records double precision (kind 8).
+This does not change the translator's general single-precision storage fidelity.
+
 `BIT_SIZE(i)` uses the argument's declared Fortran integer kind, not the width
 of its translated Python/NumPy storage. Kinds 1, 2, 4, 8, and 16 report 8,
 16, 32, 64, and 128 bits. Supported literals, integer expressions, array
