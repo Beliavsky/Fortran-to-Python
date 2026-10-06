@@ -459,6 +459,18 @@ Importing a qualified procedure across separately generated Python files is
 currently diagnosed; combine the Fortran modules and program into one input
 file to use this resolution path.
 
+Named generic interfaces dispatch on numeric kind as well as element type and
+rank. Translated calls carry kind metadata for numeric literals (including
+`D` exponents and kind suffixes), declared scalars/arrays, array sections,
+ordinary numeric arithmetic, and known function results. Named kind parameters
+and keyword arguments are supported. Empty arrays use their dtype to identify
+the element type. If numeric kind information cannot be determined, the call
+raises an explicit error instead of silently selecting the first specific.
+This dispatch metadata does not change the translator's general numeric
+storage/precision model; it is not full emulation of every Fortran kind.
+Direct calls to a generated generic from Python use NumPy dtype kinds, or kind
+4 for ordinary Python numeric scalars without metadata.
+
 Internal procedures can become nested Python functions. Host-variable writes
 may require `nonlocal`; module-variable writes may require `global`. A local
 declaration that shadows a host name must remain independent of it.

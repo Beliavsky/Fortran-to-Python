@@ -1347,6 +1347,9 @@ class basic_f2p:
         self._host_scopes: list[tuple[dict[str, dict], str]] = []
         self._subr_sigs: dict[str, dict] = {}
         self._func_sigs: dict[str, dict] = {}
+        self._generic_names = set()
+        self._generic_kind_keyword = '_xf2p_kind_hints'
+        self._function_result_models = {}
         self._current_result_name: str | None = None
         self._current_subroutine_outputs: list[str] = []
         self._optional_allocatable_presence = {}
@@ -2501,11 +2504,146 @@ class basic_f2p:
             return f"_f_numeric_model(None, {name!r}, integer_kind={kind})"
         return f"_f_numeric_model({self.translate_expr(argument, arrays_1d)}, {name!r})"
 
+    def _numeric_declared_kind(self, info, symbols=None):
+        if info.get('ftype') not in {'integer', 'real', 'complex'}:
+            return None
+        attrs = info.get('attrs_l', '').strip()
+        kind = '4'
+        if attrs.startswith('('):
+            closing = find_matching_paren(attrs, 0)
+            kind = re.sub(r'^kind\s*=\s*', '', attrs[1:closing].strip(), flags=re.I)
+        else:
+            legacy = re.match(r'\*\s*(\d+)', attrs)
+            if legacy:
+                kind = legacy.group(1)
+        visible = {name: value for scope, _ in self._host_scopes for name, value in scope.items()}
+        visible.update(symbols or {})
+        # A specific's local kind parameters are not Python globals visible
+        # to the generic wrapper. Inline their constant definitions instead.
+        for _ in range(len(visible) + 1):
+            previous = kind
+            for name, value in visible.items():
+                if 'parameter' in value.get('attrs_l', '') and value.get('init') is not None:
+                    kind = _replace_identifier_outside_strings(kind, name, '(' + str(value['init']) + ')')
+            if kind == previous:
+                break
+        return self.translate_expr(kind, set())
+
+    def _generic_expression_model(self, expression, arrays):
+        """Recover numeric type/kind before literal kind information is erased."""
+        models = {}
+        number = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|"
+                            r"(?<![\w.])(?P<num>(?:\d+(?:\.\d*)?|\.\d+)(?:[ed][+-]?\d+)?)"
+                            r"(?:_(?P<kind>[a-z_]\w*|\d+))?", re.I)
+        def literal(match):
+            if match.group('num') is None:
+                return match.group()
+            text = match.group('num').lower()
+            family = 'real' if any(c in text for c in '.ed') else 'integer'
+            kind = self.translate_expr(match.group('kind'), arrays) if match.group('kind') else ('8' if 'd' in text else '4')
+            name = f'_xf2p_kind_literal_{len(models)}'
+            models[name] = (family, kind)
+            return name
+        prepared = number.sub(literal, expression)
+        try:
+            tree = ast.parse(self.translate_expr(prepared, arrays), mode='eval').body
+        except (SyntaxError, ValueError):
+            return None
+
+        def reference(node):
+            if isinstance(node, ast.Name):
+                return node.id
+            if isinstance(node, ast.Attribute):
+                base = reference(node.value)
+                return base + '.' + node.attr if base else None
+            if isinstance(node, ast.Subscript):
+                return reference(node.value)
+
+        def combine(left, right):
+            if not left or not right:
+                return None
+            if left[0] == right[0]:
+                return left if left[1] == right[1] else (left[0], f'max({left[1]}, {right[1]})')
+            if left[0] == 'integer':
+                return right
+            if right[0] == 'integer':
+                return left
+            return ('complex', f'max({left[1]}, {right[1]})')
+
+        def infer(node):
+            if isinstance(node, ast.Name) and node.id in models:
+                return models[node.id]
+            name = reference(node)
+            if name:
+                info = self._component_spec(name) if '.' in name else next(
+                    (scope[name.lower()] for scope, _ in reversed(self._host_scopes) if name.lower() in scope), None)
+                kind = self._numeric_declared_kind(info) if info else None
+                return (info['ftype'], kind) if kind else None
+            if isinstance(node, ast.UnaryOp):
+                return infer(node.operand)
+            if isinstance(node, ast.BinOp):
+                left, right = infer(node.left), infer(node.right)
+                return left if isinstance(node.op, ast.Pow) and right and right[0] == 'integer' else combine(left, right)
+            if isinstance(node, ast.List):
+                result = None
+                for value in node.elts:
+                    model = infer(value)
+                    if model is None:
+                        return None
+                    result = model if result is None else combine(result, model)
+                return result
+            if isinstance(node, ast.Call):
+                name = ast.unparse(node.func)
+                if name in {'np.asarray', 'np.array', '_xf2p_div', '_xf2p_min', '_xf2p_max'}:
+                    result = infer(node.args[0]) if node.args else None
+                    for arg in node.args[1:]:
+                        result = combine(result, infer(arg))
+                    return result
+                if name in {'np.sqrt', 'np.exp', 'np.log', 'np.sin', 'np.cos', 'np.abs', 'np.sum', '_f_reshape', '_f_maxval', '_f_minval'}:
+                    return infer(node.args[0]) if node.args else None
+                if name == '_xf2p_real':
+                    return ('real', '4')
+                if name == '_xf2p_cmplx':
+                    return ('complex', '4')
+                return self._function_result_models.get(name.lower())
+        return infer(tree)
+
+    def _translate_generic_call(self, name, inner, arrays):
+        parts = split_args(inner)
+        # Calls already translated by an enclosing expression must not be tagged twice.
+        if any(re.match(rf'\s*{re.escape(self._generic_kind_keyword)}\s*=', p) for p in parts):
+            return f'{name}({inner})'
+        arguments, kinds = [], []
+        for part in parts:
+            keyword = re.match(r'^\s*([a-z_]\w*)\s*=(?!=)\s*(.*)$', part, re.I)
+            raw = keyword.group(2) if keyword else part
+            model = self._generic_expression_model(raw, arrays)
+            kinds.append(model[1] if model else '-1')
+            value = self.translate_expr(raw, arrays)
+            arguments.append((keyword.group(1) + '=' if keyword else '') + value)
+        arguments.append(f'{self._generic_kind_keyword}=[{", ".join(kinds)}]')
+        return f'{name}({", ".join(arguments)})'
+
     def translate_expr(self, expr: str, arrays_1d: set[str]) -> str:
         s = expr.strip()
         keyword = re.match(r"^([a-z_]\w*)\s*=(?!=)\s*(.+)$", s, re.I)
         if keyword:
             return f"{keyword.group(1)}={self.translate_expr(keyword.group(2), arrays_1d)}"
+        generic_pattern = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|\b([a-z_]\w*)\s*\(", re.I)
+        generic_out, generic_cursor = [], 0
+        while match := generic_pattern.search(s, generic_cursor):
+            generic_out.append(s[generic_cursor:match.start()])
+            if match.group(1) and match.group(1).lower() in self._generic_names:
+                opening = s.find('(', match.start())
+                closing = find_matching_paren(s, opening)
+                if closing < 0:
+                    raise ValueError('unbalanced generic call')
+                generic_out.append(self._translate_generic_call(match.group(1), s[opening+1:closing], arrays_1d))
+                generic_cursor = closing + 1
+            else:
+                generic_out.append(match.group())
+                generic_cursor = match.end()
+        s = ''.join(generic_out) + s[generic_cursor:]
         # Bit widths and integer models must be recovered before kind suffixes
         # are removed. Scan nested calls too, without matching string contents.
         bit_pattern = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|"
@@ -4853,6 +4991,9 @@ class basic_f2p:
             cname = re.sub(r"\s*%\s*", ".", mm.group(1))
             cname_l = cname.lower()
             argtxt = (mm.group(2) or "").strip()
+            if cname_l in self._generic_names:
+                self.emit(self._translate_generic_call(cname, argtxt, arrays_1d))
+                return True
             args_py: list[str] = []
             kwargs_py: dict[str, str] = {}
             if argtxt:
@@ -5667,6 +5808,8 @@ class basic_f2p:
                     "ftype": info.get("ftype"),
                     "type_name": info.get("type_name"),
                     "is_array": bool(info.get("is_array")),
+                    "kind_expr": self._numeric_declared_kind(info, sym),
+                    "rank": len(self._shape_bounds(info['shape'])) if info.get('shape') else 0,
                 })
         self._func_sigs[fname.lower()] = {"args": list(args), "arg_specs": arg_specs}
 
@@ -5928,16 +6071,21 @@ class basic_f2p:
                 candidates.append((proc, sig))
         if not candidates:
             return
-        self.emit(f"def {generic_name}(*args):")
+        self.emit(f"def {generic_name}(*args, {self._generic_kind_keyword}=None, **kwargs):")
         self.indent += 1
         for proc, sig in candidates:
             arg_specs = list(sig.get("arg_specs", []))
-            conds = [f"len(args) == {len(arg_specs)}"]
+            self.emit(f"bound = _xf2p_generic_bind(args, kwargs, {list(sig['args'])!r}, {self._generic_kind_keyword})")
+            conds = ["bound is not None"]
             for j, spec in enumerate(arg_specs):
-                cond = self._xf2p_generic_arg_cond(f"args[{j}]", spec)
+                cond = self._xf2p_generic_arg_cond(f"bound[0][{j}]", spec)
                 if cond != "True":
                     conds.append(cond)
-            call_args = [self._xf2p_generic_call_arg(f"args[{j}]", spec) for j, spec in enumerate(arg_specs)]
+                if spec.get('is_array'):
+                    conds.append(f"np.ndim(bound[0][{j}]) == {spec.get('rank', 1)}")
+                if spec.get('kind_expr'):
+                    conds.append(f"_xf2p_generic_kind(bound[0][{j}], bound[1][{j}]) == ({spec['kind_expr']})")
+            call_args = [self._xf2p_generic_call_arg(f"bound[0][{j}]", spec) for j, spec in enumerate(arg_specs)]
             self.emit(f"if {' and '.join(conds)}:")
             self.indent += 1
             self.emit(f"return {proc}({', '.join(call_args)})")
@@ -6320,6 +6468,8 @@ class basic_f2p:
                     "ftype": info.get("ftype"),
                     "type_name": info.get("type_name"),
                     "is_array": bool(info.get("is_array")),
+                    "kind_expr": self._numeric_declared_kind(info, sym),
+                    "rank": len(self._shape_bounds(info['shape'])) if info.get('shape') else 0,
                 })
         self._subr_sigs[sname.lower()] = {"args": list(args), "out": list(out_formals), "arg_specs": arg_specs}
 
@@ -6673,6 +6823,9 @@ class basic_f2p:
         raw = [split_fortran_comment(l) for l in src.splitlines()]
         raw = collapse_fortran_continuations(raw)
         raw = self._resolve_module_procedure_names(raw)
+        self._generic_names = {item['name'].lower() for item in _extract_generic_interfaces(raw)[1]}
+        self._generic_kind_keyword = _choose_fresh_identifier(src, '_xf2p_kind_hints')
+        self._function_result_models = {}
         raw, self._module_enum_names = lower_enum_declarations(raw)
         self._module_enum_storage_owners: dict[str, str] = {}
         reject_defined_operations(raw)
@@ -6709,7 +6862,7 @@ class basic_f2p:
                 _ftype, _type_name, attrs, items = declaration
                 for arg, _shape, _init in items:
                     symbols[arg.lower()] = dict(ftype=_ftype, type_name=_type_name,
-                        is_array=_shape is not None, attrs=attrs)
+                        is_array=_shape is not None, attrs=attrs, attrs_l=attrs.lower(), init=_init)
                     if not self._has_value_attribute(attrs) and re.search(r"intent\s*\(\s*(?:out|inout)\s*\)", attrs):
                         outputs.add(arg.lower())
                     if "optional" in attrs:
@@ -6723,6 +6876,16 @@ class basic_f2p:
                         and not symbols.get(a, {}).get('is_array')
                         and symbols.get(a, {}).get('ftype') != 'type'}
             inference_units[name] = (main_lines, eligible, symbols)
+            if kind == 'function':
+                result = re.search(r'\bresult\s*\(\s*(\w+)\s*\)', code, re.I)
+                info = symbols.get(result.group(1).lower() if result else name)
+                if info is None:
+                    ftype = infer_function_result_ftype(code)
+                    selector = re.search(r'\b(?:real|integer|complex)\s*(\([^)]*\)|\*\s*\d+)?', code[:header.start()], re.I)
+                    info = dict(ftype=ftype, attrs_l=(selector.group(1) or '') if selector else '')
+                model_kind = self._numeric_declared_kind(info, symbols)
+                if model_kind:
+                    self._function_result_models[name] = (info['ftype'], model_kind)
         # CALL chains can define a dummy even when its own body has no assignment.
         changed = True
         while changed:
@@ -6757,6 +6920,40 @@ class basic_f2p:
         self._loop_counter = 0
 
         self.emit("import numpy as np")
+        for helper_line in '''def _xf2p_generic_bind(args, kwargs, names, hints):
+    if len(args) + len(kwargs) != len(names):
+        return None
+    values = list(args)
+    kinds = list(hints) if hints is not None else [None] * (len(args) + len(kwargs))
+    if len(kinds) != len(names):
+        raise TypeError('invalid generic kind metadata')
+    actual_names = list(kwargs)
+    if any(name not in names[len(args):] for name in actual_names):
+        return None
+    ordered_kinds = kinds[:len(args)]
+    for name in names[len(args):]:
+        if name not in kwargs:
+            return None
+        values.append(kwargs[name])
+        ordered_kinds.append(kinds[len(args) + actual_names.index(name)])
+    return values, ordered_kinds
+
+def _xf2p_generic_kind(value, hint):
+    if hint is not None:
+        if hint < 0:
+            raise TypeError('cannot determine Fortran kind of generic argument')
+        return hint
+    # Untagged calls from Python use NumPy kinds, or Python scalar defaults.
+    if isinstance(value, (np.ndarray, np.generic)):
+        size = value.dtype.itemsize
+        return size // 2 if value.dtype.kind == 'c' else size
+    if isinstance(value, (int, float, complex)):
+        return 4
+    if isinstance(value, (list, tuple)) and value:
+        return _xf2p_generic_kind(value[0], None)
+    return -1
+'''.splitlines():
+            self.emit(helper_line)
         if any(spec['optional_allocatable'] for spec in self._binding_targets.values()):
             self.emit(f'{self._optional_absent_name} = object()')
         self.emit("import numpy.typing as npt")
@@ -7130,7 +7327,7 @@ class basic_f2p:
         self.emit("return False")
         self.indent -= 1
         self.emit("v = _xf2p_first_scalar(x)")
-        self.emit("return v is None or _xf2p_is_char_scalar(v)")
+        self.emit("return np.asarray(x).dtype.kind in 'USO' if v is None else _xf2p_is_char_scalar(v)")
         self.indent -= 1
         self.emit("")
         self.emit("def _xf2p_is_integer_scalar(x):")
@@ -7145,7 +7342,7 @@ class basic_f2p:
         self.emit("return False")
         self.indent -= 1
         self.emit("v = _xf2p_first_scalar(x)")
-        self.emit("return v is None or _xf2p_is_integer_scalar(v)")
+        self.emit("return np.asarray(x).dtype.kind in 'iu' if v is None else _xf2p_is_integer_scalar(v)")
         self.indent -= 1
         self.emit("")
         self.emit("def _xf2p_is_real_scalar(x):")
@@ -7160,7 +7357,7 @@ class basic_f2p:
         self.emit("return False")
         self.indent -= 1
         self.emit("v = _xf2p_first_scalar(x)")
-        self.emit("return v is None or _xf2p_is_real_scalar(v)")
+        self.emit("return np.asarray(x).dtype.kind == 'f' if v is None else _xf2p_is_real_scalar(v)")
         self.indent -= 1
         self.emit("")
         self.emit("def _xf2p_is_logical_scalar(x):")
@@ -7175,7 +7372,7 @@ class basic_f2p:
         self.emit("return False")
         self.indent -= 1
         self.emit("v = _xf2p_first_scalar(x)")
-        self.emit("return v is None or _xf2p_is_logical_scalar(v)")
+        self.emit("return np.asarray(x).dtype.kind == 'b' if v is None else _xf2p_is_logical_scalar(v)")
         self.indent -= 1
         self.emit("")
         self.emit("def _xf2p_is_complex_scalar(x):")
@@ -7190,7 +7387,7 @@ class basic_f2p:
         self.emit("return False")
         self.indent -= 1
         self.emit("v = _xf2p_first_scalar(x)")
-        self.emit("return v is None or _xf2p_is_complex_scalar(v)")
+        self.emit("return np.asarray(x).dtype.kind == 'c' if v is None else _xf2p_is_complex_scalar(v)")
         self.indent -= 1
         self.emit("")
 

@@ -598,3 +598,9 @@ inquiries, reallocation/copyback, MOVE_ALLOC, SOURCE/MOLD, empty dimensions,
 and ordinary assumed-shape rebasing. Runtime metadata uses weak references,
 so discarded allocations do not retain stale bounds or array storage. Saved
 allocatables start unallocated and retain their bounds across saved-value copies.
+
+generic_real_kinds.f90 and test_generic_kinds.py check kind-aware named generic
+dispatch: default/D-exponent/suffixed literals, declared scalars and arrays,
+sections, arithmetic, known function results, keyword argument reordering,
+integer/real/complex kinds, rank distinctions and empty arrays. Unmatched and
+unknown numeric kinds are diagnosed rather than silently guessed.
