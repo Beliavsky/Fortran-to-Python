@@ -335,7 +335,7 @@ __all__ = [
     "_f_cospi",
     "_f_tanpi",
     "_f_fraction", "_f_exponent", "_f_scale", "_f_set_exponent",
-    "_f_nearest", "_f_spacing", "_f_rrspacing", "_f_numeric_model",
+    "_f_nearest", "_f_spacing", "_f_rrspacing", "_f_numeric_model", "_f_bit_size",
     "_f_selected_int_kind", "_f_selected_real_kind", "_f_selected_logical_kind",
     "_f_dim", "_f_sign",
     "spread",
@@ -1211,6 +1211,13 @@ def _f_selected_real_kind(p=0, r=0, radix=None):
     if not range_available:
         return -2
     return -4
+
+
+def _f_bit_size(integer_kind):
+    """Storage bits of the declared Fortran integer model, not a NumPy value."""
+    if integer_kind not in (1, 2, 4, 8, 16):
+        raise ValueError(f'unsupported Fortran integer kind for BIT_SIZE: {integer_kind}')
+    return 8 * int(integer_kind)
 
 
 def _f_numeric_model(x, inquiry, *, integer_kind=None):

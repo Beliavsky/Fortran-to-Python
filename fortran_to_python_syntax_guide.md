@@ -577,6 +577,14 @@ Selection does not add kind-dependent storage or arithmetic emulation; existing
 floating-point kind fidelity limitations still apply. Other intrinsics, such
 as `SELECTED_CHAR_KIND`, remain unimplemented.
 
+`BIT_SIZE(i)` uses the argument's declared Fortran integer kind, not the width
+of its translated Python/NumPy storage. Kinds 1, 2, 4, 8, and 16 report 8,
+16, 32, 64, and 128 bits. Supported literals, integer expressions, array
+elements, components, and functions with known result declarations are modeled
+without evaluating the argument. The result retains the argument's integer kind
+for nested inquiries and generic dispatch. Unknown/non-integer argument models
+and unsupported integer kinds are diagnosed explicitly.
+
 Declared integer kind 16 uses a signed 128-bit model for `HUGE`, `DIGITS`,
 `RANGE` and `RADIX`: `2**127-1`, 127, 38 and 2 respectively. These inquiries
 use Python integers, without requiring a NumPy int128 dtype or evaluating the

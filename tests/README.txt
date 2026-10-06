@@ -648,3 +648,8 @@ lower-bound pointer association, independent descriptors, inherited whole-target
 bounds, default section bounds, reassociation, positive/negative strides,
 multidimensional targets, pointer components and INTENT(OUT) pointer dummies.
 Rank-changing bounds remapping is explicitly rejected.
+
+bit_size_inquiries.f90 and test_bit_size.py check BIT_SIZE for integer kinds
+1/2/4/8/16, array elements and expressions, keyword arguments, nested model
+inquiries, generic dispatch, preserved strings and user procedure names.
+Inquiries must not evaluate unallocated elements or side-effecting functions.

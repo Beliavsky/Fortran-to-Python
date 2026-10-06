@@ -2549,6 +2549,8 @@ class basic_f2p:
             if isinstance(node, ast.Call) and ast.unparse(node.func) in {"_f_maxval", "_f_minval"}:
                 explicit = next((kw.value for kw in node.keywords if kw.arg == "integer_kind"), None)
                 return ast.unparse(explicit) if explicit is not None else infer(node.args[0])
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == '_f_bit_size':
+                return ast.unparse(node.args[0])
             return None
         return infer(tree)
 
@@ -2629,6 +2631,12 @@ class basic_f2p:
             return self._generic_expression_model(raw, arrays) if raw is not None else None
         if name == 'kind':
             return ('integer', '4')
+        if name == '_f_bit_size':
+            return ('integer', self.translate_expr(inner, arrays))
+        if name == 'bit_size':
+            raw = _bind_intrinsic_arguments('bit_size', inner, ('i',), 1)['i']
+            model = self._generic_expression_model(raw, arrays)
+            return model if model and model[0] == 'integer' else None
         if name in {'int', 'nint', 'ceiling', 'floor', 'size', 'shape', 'lbound', 'ubound',
                     'count', 'len', 'len_trim', 'index', 'scan', 'verify', 'maxloc', 'minloc',
                     'selected_int_kind', 'selected_real_kind', 'selected_char_kind',
@@ -2788,7 +2796,8 @@ class basic_f2p:
                 return infer(node.operand)
             if isinstance(node, ast.BinOp):
                 left, right = infer(node.left), infer(node.right)
-                return left if isinstance(node.op, ast.Pow) and right and right[0] == 'integer' else combine(left, right)
+                return (left if isinstance(node.op, ast.Pow) and left and left[0] in {'real', 'complex'}
+                        and right and right[0] == 'integer' else combine(left, right))
             if isinstance(node, ast.Compare):
                 operands = [infer(node.left)] + [infer(value) for value in node.comparators]
                 if all(model and model[0] == 'logical' for model in operands):
@@ -2835,6 +2844,13 @@ class basic_f2p:
                     return ('complex', kinds[0] if len(set(kinds)) == 1 else f'max({", ".join(kinds)})') if kinds else None
                 return self._function_result_models.get(name.lower())
         return infer(tree)
+
+    def _translate_bit_size_inquiry(self, inner, arrays):
+        argument = _bind_intrinsic_arguments('bit_size', inner, ('i',), 1)['i']
+        model = self._generic_expression_model(argument, arrays)
+        if model is None or model[0] != 'integer':
+            raise ValueError(f'BIT_SIZE requires an argument with a known Fortran integer type/kind: {argument}')
+        return f'_f_bit_size({model[1]})'
 
     def _translate_kind_inquiry(self, inner, arrays):
         argument = _bind_intrinsic_arguments('kind', inner, ('x',), 1)['x']
@@ -2921,23 +2937,24 @@ class basic_f2p:
         keyword = re.match(r"^([a-z_]\w*)\s*=(?!=)\s*(.+)$", s, re.I)
         if keyword:
             return f"{keyword.group(1)}={self.translate_expr(keyword.group(2), arrays_1d)}"
-        kind_pattern = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|\b(kind)\s*\(", re.I)
-        shadowed_kind = 'kind' in self._binding_targets or any('kind' in scope for scope, _ in self._host_scopes)
-        if not shadowed_kind:
-            chunks, cursor = [], 0
-            while match := kind_pattern.search(s, cursor):
-                chunks.append(s[cursor:match.start()])
-                if match.group(1):
-                    opening = s.find('(', match.start())
-                    closing = find_matching_paren(s, opening)
-                    if closing < 0:
-                        raise ValueError('unbalanced KIND inquiry')
-                    chunks.append(self._translate_kind_inquiry(s[opening+1:closing], arrays_1d))
-                    cursor = closing + 1
-                else:
-                    chunks.append(match.group())
-                    cursor = match.end()
-            s = ''.join(chunks) + s[cursor:]
+        inquiry_pattern = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|\b(kind|bit_size)\s*\(", re.I)
+        chunks, cursor = [], 0
+        while match := inquiry_pattern.search(s, cursor):
+            chunks.append(s[cursor:match.start()])
+            name = match.group(1).lower() if match.group(1) else None
+            shadowed = name in self._binding_targets or any(name in scope for scope, _ in self._host_scopes)
+            if name and not shadowed:
+                opening = s.find('(', match.start())
+                closing = find_matching_paren(s, opening)
+                if closing < 0:
+                    raise ValueError(f'unbalanced {name.upper()} inquiry')
+                translator = self._translate_kind_inquiry if name == 'kind' else self._translate_bit_size_inquiry
+                chunks.append(translator(s[opening+1:closing], arrays_1d))
+                cursor = closing + 1
+            else:
+                chunks.append(match.group())
+                cursor = match.end()
+        s = ''.join(chunks) + s[cursor:]
         generic_pattern = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|\b([a-z_]\w*)\s*\(", re.I)
         generic_out, generic_cursor = [], 0
         while match := generic_pattern.search(s, generic_cursor):
