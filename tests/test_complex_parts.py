@@ -66,16 +66,18 @@ end program
     assert capsys.readouterr().out.strip() == '1 7.0 2.0'
 
 
-def test_projected_complex_part_assignment_is_explicitly_rejected():
-    with pytest.raises(ValueError, match='complex part assignment requires a definable'):
-        basic_f2p().transpile('''program main
+def test_projected_complex_part_assignment(capsys):
+    exec(basic_f2p().transpile('''program main
 type :: box
 complex :: z
 end type
 type(box) :: records(2)
+records%z = (2.0,3.0)
 records%z%re = 1.0
+print *, records%z%re, records%z%im
 end program
-''')
+'''), {'__name__': '__main__'})
+    assert capsys.readouterr().out.strip() == '1.0 1.0 3.0 3.0'
 
 
 def test_integer_fields_named_re_im_keep_integer_division(capsys):

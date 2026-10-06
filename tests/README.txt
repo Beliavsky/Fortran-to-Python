@@ -667,5 +667,12 @@ nondecreasing timings, not equality of Python and Fortran CPU seconds.
 complex_parts.f90 and test_complex_parts.py check real/imaginary part updates
 for scalars, arrays, elements, strided/matrix sections and WHERE masks;
 complex components, pointer aliases, scalar dummy updates and kind inquiries.
-Fields named re/im and quoted text are preserved. Whole derived-array projection
-assignments and indexed complex-part FORALL assignments are diagnosed explicitly.
+Fields named re/im and quoted text are preserved. Indexed complex-part FORALL
+assignments are diagnosed explicitly.
+
+projected_complex_parts.f90 and test_projected_complex_parts.py check explicit
+write-back through whole derived-array projections, scalar expansion, conformable
+vector/matrix RHS values, nested scalar components and WHERE/ELSEWHERE masks.
+RHS functions execute once and values are snapshotted before component writes.
+Pointer components are tested on individually selected records, as Fortran
+forbids a pointer component following a nonzero-rank parent.

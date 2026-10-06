@@ -586,8 +586,12 @@ components and components of individually selected derived-type elements are
 supported; ordinary derived-type fields named `re` or `im` are not renamed.
 The part's real kind follows its complex parent for inquiries and dispatch.
 Assignment through a whole derived-type-array projection, such as
-`records%z%re = ...`, and indexed complex-part assignments in `FORALL` are
-explicitly rejected; use individually selected records or ordinary `DO` loops.
+`records%z%re = ...`, writes back to each scalar complex component. Scalar
+expansion, conformable array RHS values, nested scalar components and `WHERE`
+masks are supported, with RHS values captured before any component is changed.
+Fortran itself forbids pointer components following a nonzero-rank parent;
+select individual records when updating those components. Indexed complex-part
+assignments in `FORALL` remain explicitly rejected; use ordinary `DO` loops.
 
 `CALL CPU_TIME(time)` becomes an assignment from Python's process CPU clock,
 not a wall-clock timer. Scalar REAL variables, array elements, components,

@@ -304,6 +304,7 @@ __all__ = [
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
     "_f_execute_command_line", "_f_cpu_time",
     "_f_set_complex_part", "_f_assign_complex_part", "_f_assign_complex_part_attribute",
+    "_f_assign_component_complex_part",
     "_reshape_with_pad",
     "_f_size",
     "_f_shape",
@@ -1104,6 +1105,36 @@ def _f_assign_component_array(obj, path, value, mask=None):
             for attr in attrs[:-1]:
                 item = getattr(item, attr)
             setattr(item, attrs[-1], value)
+
+
+def _f_assign_component_complex_part(obj, path, value, part, mask=None):
+    """Write projected complex parts back, retaining pointer component storage."""
+    if part not in ('real', 'imag'):
+        raise ValueError('complex part must be real or imag')
+    array = np.asarray(obj, dtype=object)
+    rhs = np.asarray(value)
+    if rhs.ndim and rhs.shape != array.shape:
+        raise ValueError('component assignment requires scalar or conformable RHS')
+    # Both RHS and selection may alias component storage: snapshot before writes.
+    rhs = np.broadcast_to(rhs, array.shape).copy()
+    selected = np.asarray(True if mask is None else mask, dtype=bool)
+    if selected.ndim and selected.shape != array.shape:
+        raise ValueError('component assignment MASK must be scalar or conformable')
+    selected = np.broadcast_to(selected, array.shape).copy()
+    attrs = path.split('.')
+    targets = []
+    for item in array.flat:
+        for attr in attrs[:-1]:
+            item = getattr(item, attr)
+        current = getattr(item, attrs[-1])
+        if np.ndim(current) != 0:
+            raise ValueError('array components of an array parent require explicit subscripts')
+        if np.asarray(current).dtype.kind != 'c':
+            raise TypeError('complex part assignment requires a complex component')
+        targets.append((item, current))
+    for (item, current), value, active in zip(targets, rhs.flat, selected.flat):
+        if active:
+            setattr(item, attrs[-1], _f_set_complex_part(current, value, part))
 
 
 def count(x):

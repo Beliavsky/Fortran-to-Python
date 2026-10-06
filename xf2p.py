@@ -3712,6 +3712,8 @@ class basic_f2p:
                         base_path, member = path_name.rsplit('.', 1)
                         base_spec = self._component_spec(root_name + '.' + base_path)
                         if base_spec and base_spec['ftype'] == 'complex':
+                            if base_spec.get('shape'):
+                                raise ValueError('array components of an array parent require explicit subscripts')
                             member = 'real' if member.lower() == 're' else 'imag'
                             out.append(f'_xf2p_component_array({root_name}, {base_path!r}, dtype=np.complex128).{member}')
                             i = j
@@ -3911,6 +3913,9 @@ class basic_f2p:
                     self.emit(f'_f_assign_complex_part_attribute({ast.unparse(node.value)}, {node.attr!r}, {rhs_py}, {member!r}{mask_arg})')
                 elif isinstance(node, ast.Name):
                     self.emit(f'{base} = _f_set_complex_part({base}, {rhs_py}, {member!r}{mask_arg})')
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                      and node.func.id == '_xf2p_component_array' and len(node.args) == 2):
+                    self.emit(f'_f_assign_component_complex_part({ast.unparse(node.args[0])}, {ast.unparse(node.args[1])}, {rhs_py}, {member!r}{mask_arg})')
                 else:
                     raise ValueError('complex part assignment requires a definable variable or array selection')
                 return
