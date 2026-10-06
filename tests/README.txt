@@ -631,3 +631,9 @@ Groups over 128 data descriptors are explicitly rejected.
 logical_kind_literals.f90 and test_logical_kind_literals.py check numeric and
 named kind suffixes on logical literals, arrays/expressions, KIND metadata and
 preservation of quoted text.
+
+integer_kind_16_model.f90 and test_integer_model_kinds.py check the signed
+128-bit HUGE/DIGITS/RANGE/RADIX model, exact Python integer results, literals,
+unallocated arrays and formatted output. Unsupported kinds and inapplicable
+inquiries remain explicitly rejected; kind-specific array storage and overflow
+are not emulated.

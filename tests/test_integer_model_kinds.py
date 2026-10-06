@@ -18,9 +18,27 @@ def test_integer_model_uses_kind_not_value(kind):
     assert _f_numeric_model(None, "radix", integer_kind=kind) == 2
 
 
-def test_unsupported_integer_model_kind_is_explicit():
+@pytest.mark.parametrize('kind', [0, -1, 3, 32])
+def test_unsupported_integer_model_kind_is_explicit(kind):
     with pytest.raises(ValueError, match="unsupported Fortran integer kind"):
-        _f_numeric_model(None, "huge", integer_kind=16)
+        _f_numeric_model(None, "huge", integer_kind=kind)
+
+
+@pytest.mark.parametrize('inquiry,expected', [
+    ('huge', 170141183460469231731687303715884105727),
+    ('digits', 127), ('range', 38), ('radix', 2),
+])
+@pytest.mark.parametrize('value', [None, 0, np.int64(0)])
+def test_integer_kind_16_model_inquiries(inquiry, expected, value):
+    result = _f_numeric_model(value, inquiry, integer_kind=16)
+    assert result == expected
+    assert type(result) is int
+
+
+@pytest.mark.parametrize('inquiry', ['tiny', 'epsilon', 'precision', 'unknown'])
+def test_integer_kind_16_rejects_inapplicable_inquiries(inquiry):
+    with pytest.raises(TypeError, match='requires REAL or COMPLEX'):
+        _f_numeric_model(None, inquiry, integer_kind=16)
 
 
 @pytest.mark.parametrize("declaration, argument, expected", [
@@ -45,6 +63,11 @@ def test_unsupported_integer_model_kind_is_explicit():
     ("integer :: i", "0_int8", 127),
     ("integer :: i", "0_int64", 9223372036854775807),
     ("integer :: i", "x=0_2", 32767),
+    ("integer(16) :: i", "i", 170141183460469231731687303715884105727),
+    ("integer(16) i", "i", 170141183460469231731687303715884105727),
+    ("integer(16), allocatable :: i(:)", "i", 170141183460469231731687303715884105727),
+    ("integer(16) :: i", "0_16", 170141183460469231731687303715884105727),
+    ("integer(16) :: i", "i+1", 170141183460469231731687303715884105727),
 ])
 def test_declared_and_literal_integer_models(declaration, argument, expected):
     source = ("program demo\n"
@@ -70,3 +93,16 @@ def test_model_inquiry_spelling_in_strings_is_unchanged(capsys):
     source = "program demo\nprint *, 'huge(0_int64) digits(i) range(i) radix(i)'\nend program"
     exec(basic_f2p().transpile(source), {"__name__": "__main__"})
     assert capsys.readouterr().out.strip() == "huge(0_int64) digits(i) range(i) radix(i)"
+
+
+def test_native_integer_kind_16_fixture(capsys):
+    source = (Path(__file__).parent / 'cases/features/integer_kind_16_model.f90').read_text()
+    exec(basic_f2p().transpile(source), {'__name__': '__main__'})
+    assert capsys.readouterr().out.splitlines() == [
+        '16 16 127 38 2', '170141183460469231731687303715884105727',
+        '170141183460469231731687303715884105727',
+        '10 20 30 40 50 60 4 4 8 8 16 16',
+        '127 127 32767 32767 2147483647 2147483647 9223372036854775807 '
+        '9223372036854775807 170141183460469231731687303715884105727 '
+        '170141183460469231731687303715884105727',
+    ]

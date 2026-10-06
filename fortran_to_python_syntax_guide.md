@@ -561,6 +561,12 @@ Selection does not add kind-dependent storage or arithmetic emulation; existing
 floating-point kind fidelity limitations still apply. Other intrinsics, such
 as `SELECTED_CHAR_KIND`, remain unimplemented.
 
+Declared integer kind 16 uses a signed 128-bit model for `HUGE`, `DIGITS`,
+`RANGE` and `RADIX`: `2**127-1`, 127, 38 and 2 respectively. These inquiries
+use Python integers, without requiring a NumPy int128 dtype or evaluating the
+argument. This does not extend kind selection, implement 128-bit array storage,
+or emulate overflow in arithmetic.
+
 `KIND` handles integer, real, complex, logical and character literals and
 declared variables, including arrays, elements, sections and components.
 `DOUBLE PRECISION` and the `DOUBLE COMPLEX` extension are normalized to

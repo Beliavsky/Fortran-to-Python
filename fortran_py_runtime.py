@@ -1153,6 +1153,13 @@ def _f_numeric_model(x, inquiry, *, integer_kind=None):
     # Plain Python integers and initialized ndarray storage can lose that
     # information; the translator supplies it when it is known.
     if integer_kind is not None:
+        if integer_kind == 16:
+            # NumPy has no signed int128 dtype. These inquiries describe the
+            # declared 128-bit model and do not need storage of that dtype.
+            models = {"huge": (1 << 127) - 1, "digits": 127, "range": 38, "radix": 2}
+            if inquiry in models:
+                return models[inquiry]
+            raise TypeError(f"{inquiry.upper()} requires REAL or COMPLEX input")
         if integer_kind not in (1, 2, 4, 8):
             raise ValueError(f"unsupported Fortran integer kind for {inquiry.upper()}: {integer_kind}")
         dtype = np.dtype(f"int{8 * int(integer_kind)}")
