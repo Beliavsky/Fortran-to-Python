@@ -783,7 +783,7 @@ def _f_get_command_argument(number, value_length=None):
     return text, length, status
 
 
-def _f_bits(operation, i, j=None, *, pos=None, length=None, shift=None, bits=32):
+def _f_bits(operation, i, j=None, *, pos=None, length=None, shift=None, size=None, bits=32):
     """Elemental bit operations with an explicit two's-complement word width."""
     bits = int(bits)
     if bits not in (8, 16, 32, 64, 128):
@@ -794,14 +794,17 @@ def _f_bits(operation, i, j=None, *, pos=None, length=None, shift=None, bits=32)
         operands.append(np.asarray(second, dtype=object))
     if length is not None:
         operands.append(np.asarray(length, dtype=object))
-    if operation in {'not', 'ishft'}:
+    if size is not None:
+        operands.append(np.asarray(size, dtype=object))
+    count_operations = {'popcnt', 'poppar', 'leadz', 'trailz'}
+    if operation in {'not', 'ishft', 'ishftc'} | count_operations:
         shapes = [operand.shape for operand in operands if operand.ndim]
         if shapes and any(shape != shapes[0] for shape in shapes):
             raise ValueError('bit intrinsic array arguments must be conformable')
     operands = np.broadcast_arrays(*operands)
     mask = (1 << bits) - 1
     def apply(*values):
-        if operation in {'not', 'ishft'} and any(
+        if operation in {'not', 'ishft', 'ishftc'} | count_operations and any(
                 not isinstance(v, (int, np.integer)) or isinstance(v, (bool, np.bool_)) for v in values):
             raise TypeError('bit intrinsic arguments must be INTEGER')
         value = int(values[0]) & mask
@@ -810,11 +813,26 @@ def _f_bits(operation, i, j=None, *, pos=None, length=None, shift=None, bits=32)
             raise ValueError('bit position out of range')
         if operation == 'btest':
             return bool(value & (1 << other))
+        if operation == 'popcnt': return value.bit_count()
+        if operation == 'poppar': return value.bit_count() % 2
+        if operation == 'leadz': return bits - value.bit_length()
+        if operation == 'trailz': return (value & -value).bit_length() - 1 if value else bits
         if operation == 'not': result = ~value
         elif operation == 'ishft':
             if not -bits <= other <= bits:
                 raise ValueError('ISHFT count out of range')
             result = value << other if other >= 0 else value >> -other
+        elif operation == 'ishftc':
+            width = int(values[2]) if len(values) > 2 else bits
+            if not 1 <= width <= bits:
+                raise ValueError('ISHFTC SIZE must be between 1 and the integer word width')
+            if not -width <= other <= width:
+                raise ValueError('ISHFTC SHIFT magnitude must not exceed SIZE')
+            low_mask = (1 << width) - 1
+            rotation = other % width
+            low = value & low_mask
+            rotated = ((low << rotation) | (low >> (width - rotation))) & low_mask
+            result = (value & ~low_mask) | rotated
         elif operation == 'ibset': result = value | (1 << other)
         elif operation == 'ibclr': result = value & ~(1 << other)
         elif operation == 'ibits':
@@ -832,7 +850,7 @@ def _f_bits(operation, i, j=None, *, pos=None, length=None, shift=None, bits=32)
         else: raise ValueError('unsupported bit operation')
         result &= mask
         return result - (1 << bits) if result >= (1 << (bits - 1)) else result
-    dtype = bool if operation == 'btest' else object if bits == 128 else np.dtype(f'int{bits}')
+    dtype = bool if operation == 'btest' else np.int32 if operation in count_operations else object if bits == 128 else np.dtype(f'int{bits}')
     result = np.vectorize(apply, otypes=[dtype])(*operands)
     return result[()] if result.ndim == 0 else result
 

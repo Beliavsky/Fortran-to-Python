@@ -660,7 +660,22 @@ rather than relying on general NumPy broadcasting. Keywords `i=` and `shift=`
 are supported. Shifts of exactly plus/minus the word width return zero; larger
 absolute counts are rejected. Kind inquiries and generic dispatch retain the
 result kind. The 128-bit helper uses Python integers/object arrays, not native
-NumPy int128 storage. Other shift/bit-count intrinsics may remain unsupported.
+NumPy int128 storage.
+
+`ISHFTC(i,shift,size)` circularly rotates the rightmost `size` bits, preserving
+bits outside that portion. Positive counts rotate left; negative counts rotate
+right. Omitting `size` rotates the full integer word. `size` must be positive
+and no greater than the word width; the absolute shift must not exceed `size`.
+A zero shift or a shift of exactly plus/minus `size` leaves the value unchanged.
+Source integer kinds, elemental scalar expansion, conformable array arguments,
+and keywords `i=`, `shift=`, and `size=` are supported as above.
+
+`POPCNT(i)`, `POPPAR(i)`, `LEADZ(i)`, and `TRAILZ(i)` count set bits,
+return their parity, or count leading/trailing zero bits. They are elemental
+and accept integer kinds 1, 2, 4, 8, and 16, including array and keyword `i=`
+arguments. Negative values are interpreted using the source kind's fixed-width
+two's-complement representation. For zero, `LEADZ` and `TRAILZ` return the word
+width. All four return default-kind integers, regardless of the argument kind.
 
 `BIT_SIZE(i)` uses the argument's declared Fortran integer kind, not the width
 of its translated Python/NumPy storage. Kinds 1, 2, 4, 8, and 16 report 8,

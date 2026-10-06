@@ -702,6 +702,19 @@ invalid inputs and user procedure/array shadowing. The compiled fixture checks
 native agreement for 8/16/32/64-bit operations; 128-bit helper values are checked
 against exact Python integers.
 
+integer_ishftc.f90 and test_integer_ishftc.py check circular rotations of whole
+words and low-bit portions, preservation of upper bits, positive/negative and
+full-width counts, optional elemental SIZE, kinds 1/2/4/8/16, empty arrays,
+conformance, keywords, nested/component result kinds, invalid inputs and
+user procedure/array shadowing. The fixture also compares against gfortran.
+
+integer_bit_counts.f90 and test_integer_bit_counts.py check POPCNT, POPPAR,
+LEADZ and TRAILZ on signed integers of kinds 1/2/4/8/16, zero and sign-bit
+boundaries, all 256 eight-bit patterns, elemental matrices and empty arrays,
+default-integer result metadata, nested/component arguments, keyword I,
+invalid types and user procedure/array shadowing. The fixture compares against
+gfortran; the 128-bit unit tests check exact values using Python integers.
+
 projected_complex_parts.f90 and test_projected_complex_parts.py check explicit
 write-back through whole derived-array projections, scalar expansion, conformable
 vector/matrix RHS values, nested scalar components and WHERE/ELSEWHERE masks.

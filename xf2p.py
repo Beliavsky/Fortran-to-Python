@@ -1155,8 +1155,13 @@ _INTRINSIC_ARGUMENTS = {
     'iand': (('i', 'j'), 2), 'ior': (('i', 'j'), 2), 'ieor': (('i', 'j'), 2),
     'shiftl': (('i', 'shift'), 2), 'shiftr': (('i', 'shift'), 2),
     'not': (('i',), 1), 'ishft': (('i', 'shift'), 2),
+    'ishftc': (('i', 'shift', 'size'), 2),
+    'popcnt': (('i',), 1), 'poppar': (('i',), 1),
+    'leadz': (('i',), 1), 'trailz': (('i',), 1),
 }
-_BIT_INTRINSICS = {'btest', 'ibset', 'ibclr', 'ibits', 'iand', 'ior', 'ieor', 'shiftl', 'shiftr', 'not', 'ishft'}
+_BIT_COUNT_INTRINSICS = {'popcnt', 'poppar', 'leadz', 'trailz'}
+_KIND_AWARE_BIT_INTRINSICS = {'not', 'ishft', 'ishftc'} | _BIT_COUNT_INTRINSICS
+_BIT_INTRINSICS = {'btest', 'ibset', 'ibclr', 'ibits', 'iand', 'ior', 'ieor', 'shiftl', 'shiftr'} | _KIND_AWARE_BIT_INTRINSICS
 
 
 def _bind_intrinsic_arguments(name, text, parameters, required):
@@ -2500,17 +2505,17 @@ class basic_f2p:
         raw = _bind_intrinsic_arguments(name, inner, parameters, required)
         bound = {k: self.translate_expr(v, arrays_1d) for k, v in raw.items()}
         bits = '32'
-        if name in {'not', 'ishft'}:
+        if name in _KIND_AWARE_BIT_INTRINSICS:
             model = self._generic_expression_model(raw['i'], arrays_1d)
             if model is None or model[0] != 'integer':
                 raise ValueError(f'{name.upper()} requires a known INTEGER type/kind')
             bits = f'_f_bit_size({model[1]})'
         literal = re.fullmatch(r'([+-]?\d+)_([a-z_]\w*|\d+)', raw['i'], re.I)
-        if literal and name not in {'not', 'ishft'}:
+        if literal and name not in _KIND_AWARE_BIT_INTRINSICS:
             bound['i'] = literal.group(1)
             bits = f'8 * ({self.translate_expr(literal.group(2), arrays_1d)})'
         name_match = re.match(r'^([a-z_]\w*)(?:\s*\(.*\))?$', raw['i'], re.I)
-        if name_match and name not in {'not', 'ishft'}:
+        if name_match and name not in _KIND_AWARE_BIT_INTRINSICS:
             for symbols, _binding in reversed(self._host_scopes):
                 info = symbols.get(name_match.group(1))
                 if info is not None:
@@ -2702,7 +2707,9 @@ class basic_f2p:
             return ('real', '8')
         if name == 'dprod':
             return ('real', '8')
-        if name in {'not', 'ishft'}:
+        if name in _BIT_COUNT_INTRINSICS:
+            return ('integer', '4')
+        if name in {'not', 'ishft', 'ishftc'}:
             raw = _bind_intrinsic_arguments(name, inner, *_INTRINSIC_ARGUMENTS[name])
             return self._generic_expression_model(raw['i'], arrays)
         if name in {'aint', 'anint'}:
@@ -2892,6 +2899,8 @@ class basic_f2p:
                     operation = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
                     if operation == 'btest':
                         return ('logical', '4')
+                    if operation in _BIT_COUNT_INTRINSICS:
+                        return ('integer', '4')
                     width = next((kw.value for kw in node.keywords if kw.arg == 'bits'), None)
                     if width is not None:
                         if isinstance(width, ast.Call) and ast.unparse(width.func) == '_f_bit_size':
@@ -3040,7 +3049,7 @@ class basic_f2p:
         # Bit widths and integer models must be recovered before kind suffixes
         # are removed. Scan nested calls too, without matching string contents.
         bit_pattern = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|"
-            r"(?<![\w.])(btest|ibset|ibclr|ibits|iand|ior|ieor|shiftl|shiftr|not|ishft|huge|digits|range|radix)\s*\(", re.I)
+            r"(?<![\w.])(btest|ibset|ibclr|ibits|iand|ior|ieor|shiftl|shiftr|not|ishft|ishftc|popcnt|poppar|leadz|trailz|huge|digits|range|radix)\s*\(", re.I)
         out, cursor = [], 0
         while match := bit_pattern.search(s, cursor):
             out.append(s[cursor:match.start()])
@@ -3050,7 +3059,7 @@ class basic_f2p:
                 if closing < 0:
                     raise ValueError('unbalanced intrinsic call')
                 name = match.group(1).lower()
-                if name in {'not', 'ishft'} and (name in self._binding_targets or name in arrays_1d):
+                if name in _KIND_AWARE_BIT_INTRINSICS and (name in self._binding_targets or name in arrays_1d):
                     out.append(match.group())
                     cursor = match.end()
                     continue
@@ -3313,7 +3322,7 @@ class basic_f2p:
             lname = name.lower()
             # Integer NOT was lowered before operator rewriting. At this stage
             # Python `not (...)` is logical negation, not another intrinsic call.
-            if lname == 'not' or (lname == 'ishft' and (lname in self._binding_targets or lname in arrays_1d)):
+            if lname == 'not' or (lname in _KIND_AWARE_BIT_INTRINSICS and (lname in self._binding_targets or lname in arrays_1d)):
                 return None
             if lname == 'dprod' and (lname in self._binding_targets
                     or any(lname in scope for scope, _ in self._host_scopes)):
