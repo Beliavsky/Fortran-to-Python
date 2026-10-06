@@ -3934,7 +3934,9 @@ class basic_f2p:
         lhs = lhs.replace("%", ".")
         if self._assign_projected_component(lhs, rhs_py, arrays_1d):
             return
-        if self._is_chained_subscript(lhs):
+        spec = self._component_spec(lhs)
+        whole_component_array = bool(spec and spec.get('shape') and not lhs.rstrip().endswith(')'))
+        if self._is_chained_subscript(lhs) or whole_component_array:
             target = self.translate_expr(lhs, arrays_1d)
             spec = self._component_spec(lhs)
             whole_array = bool(spec and spec.get("shape") and not lhs.rstrip().endswith(")"))
@@ -4482,7 +4484,9 @@ class basic_f2p:
         lhs = lhs.replace("%", ".")
         if self._assign_projected_component(lhs, rhs_py, arrays_1d, mask=mask_expr):
             return True
-        if self._is_chained_subscript(lhs):
+        spec = self._component_spec(lhs)
+        whole_component_array = bool(spec and spec.get('shape') and not lhs.rstrip().endswith(')'))
+        if self._is_chained_subscript(lhs) or whole_component_array:
             target = self.translate_expr(lhs, arrays_1d)
             spec = self._component_spec(lhs)
             if spec and spec["ftype"] == "integer":

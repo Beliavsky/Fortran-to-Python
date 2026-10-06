@@ -250,6 +250,13 @@ array values, and independent copies, including object-valued arrays. Basic
 NumPy sections are views; vector-indexed selections are copies. Indexed
 assignment must write through the index expression, not through a copied value.
 
+Whole array components also use array-assignment semantics: `record%samples = -1`
+fills every element rather than replacing the component with a Python scalar.
+Scalar expansion retains existing shape, dtype, and storage, including pointer
+aliases. Nested components, components of selected records, and masked `WHERE`
+updates are supported. Allocatable array components must already be allocated
+for scalar expansion; it cannot infer a new array shape from a scalar RHS.
+
 | Fortran construct | Translation consideration |
 | --- | --- |
 | `allocate(a(n))` | Create array storage; ordinary Fortran allocation does not initialize values. |

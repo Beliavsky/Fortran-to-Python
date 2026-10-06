@@ -27,7 +27,7 @@ program main
    values = -1
    matrix = -1
    record%count = -1
-   record%samples = [-1,-1]
+   record%samples = -1
    records(2)%count = -1
    call system_clock(values(1), values(2), values(3))
    call system_clock(matrix(1,2))

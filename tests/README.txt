@@ -680,6 +680,13 @@ sentinels, one sample per call, components, array elements, pointers, scalar dum
 copy-back, host updates, user procedure shadowing and invalid output diagnostics.
 Native/Python comparisons use clock properties rather than exact timestamps.
 
+component_scalar_expansion.f90 and test_component_scalar_expansion.py check
+scalar RHS expansion into whole array components, retaining storage identity,
+shape and dtype for numeric, logical and fixed-length character arrays. Tests
+include matrices, empty arrays, nested/selected records, WHERE masks, allocated
+components and pointer aliases. system_clock.f90 also initializes an array
+component by scalar expansion before assigning its elements as clock outputs.
+
 projected_complex_parts.f90 and test_projected_complex_parts.py check explicit
 write-back through whole derived-array projections, scalar expansion, conformable
 vector/matrix RHS values, nested scalar components and WHERE/ELSEWHERE masks.
