@@ -263,6 +263,15 @@ update both bindings. Reading uninitialized Fortran storage is not made valid
 by whatever initial values a translation happens to supply.
 
 Pointer and TARGET assignments may need in-place updates to preserve aliases.
+`ASSOCIATED(p)` tests whether the translated pointer has storage.
+`ASSOCIATED(p, target)` checks storage identity, shape, and element strides,
+not equal values or merely overlapping storage. Whole arrays, basic sections,
+scalar array elements, boxed scalar targets, and pointer components are
+supported. Scalar element associations retain writable views. Empty array
+targets give false for the two-argument inquiry, even when `ASSOCIATED(p)` is
+true. Unboxed Python scalar values are diagnosed rather than compared by value.
+Pointer bounds remapping and scalar non-pointer components without preserved
+storage remain limitations; this is not a complete pointer descriptor model.
 Python references are not a general implementation of Fortran pointer
 descriptors. Likewise, `IS_CONTIGUOUS` and `CONTIGUOUS` dummy arguments require
 more care than testing one ndarray flag; consult the README's limitations.

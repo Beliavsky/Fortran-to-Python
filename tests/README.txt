@@ -637,3 +637,8 @@ integer_kind_16_model.f90 and test_integer_model_kinds.py check the signed
 unallocated arrays and formatted output. Unsupported kinds and inapplicable
 inquiries remain explicitly rejected; kind-specific array storage and overflow
 are not emulated.
+
+associated_targets.f90 and test_associated_targets.py check one/two-argument
+ASSOCIATED, whole-array/scalar targets, distinct equal-valued targets, pointer
+targets/components, sections, strides, null pointers, empty targets, keyword
+arguments and writable scalar element views. Unboxed scalar storage is diagnosed.

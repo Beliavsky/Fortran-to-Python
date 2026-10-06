@@ -1143,6 +1143,7 @@ _INTRINSIC_ARGUMENTS = {
     'cshift': (('array', 'shift', 'dim'), 2),
     'eoshift': (('array', 'shift', 'boundary', 'dim'), 2),
     'is_contiguous': (('array',), 1),
+    'associated': (('pointer', 'target'), 1),
     'adjustr': (('string',), 1),
     'scan': (('string', 'set', 'back', 'kind'), 2),
     'verify': (('string', 'set', 'back', 'kind'), 2),
@@ -2856,6 +2857,23 @@ class basic_f2p:
         arguments.append(f'{self._generic_kind_keyword}=[{", ".join(kinds)}]')
         return f'{name}({", ".join(arguments)})'
 
+    def _translate_pointer_target(self, expr: str, arrays_1d: set[str]) -> str:
+        """Keep a scalar array element as a storage view, not a NumPy scalar."""
+        translated = self.translate_expr(expr, arrays_1d)
+        node = ast.parse(translated, mode='eval').body
+        if not isinstance(node, ast.Subscript):
+            return translated
+
+        def index_text(index):
+            if isinstance(index, ast.Slice):
+                return 'slice(' + ', '.join(ast.unparse(value) if value is not None else 'None'
+                                           for value in (index.lower, index.upper, index.step)) + ')'
+            if isinstance(index, ast.Tuple):
+                return '(' + ', '.join(index_text(value) for value in index.elts) + ',)'
+            return ast.unparse(index)
+
+        return f'_f_pointer_target({ast.unparse(node.value)}, {index_text(node.slice)})'
+
     def translate_expr(self, expr: str, arrays_1d: set[str]) -> str:
         s = expr.strip()
         keyword = re.match(r"^([a-z_]\w*)\s*=(?!=)\s*(.+)$", s, re.I)
@@ -3094,7 +3112,6 @@ class basic_f2p:
         s = re.sub(r"\bpresent\s*\(\s*([a-z_]\w*)\s*\)",
                    lambda match: '(' + self._optional_allocatable_presence.get(match.group(1).lower(),
                                        match.group(1) + ' is not None') + ')', s, flags=re.I)
-        s = re.sub(r"\bassociated\s*\(\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\)", r"(\1 is not None)", s, flags=re.I)
         s = re.sub(r"\bnull\s*\(\s*\)", "None", s, flags=re.I)
         s = s.replace("np.np.", "np.")
         s = re.sub(r"(?i)\.re\b", ".real", s)
@@ -3240,7 +3257,9 @@ class basic_f2p:
             if lname in _INTRINSIC_ARGUMENTS:
                 parameters, required = _INTRINSIC_ARGUMENTS[lname]
                 raw = _bind_intrinsic_arguments(lname, inner, parameters, required)
-                bound = {k: self.translate_expr(v, arrays_1d) for k, v in raw.items()}
+                bound = {k: (self._translate_pointer_target(v, arrays_1d)
+                             if lname == 'associated' else self.translate_expr(v, arrays_1d))
+                         for k, v in raw.items()}
                 if lname in {"maxval", "minval"}:
                     arguments = [bound["array"]]
                     arguments.extend(f"{k}={bound[k]}" for k in ("dim", "mask") if k in bound)
@@ -3905,7 +3924,7 @@ class basic_f2p:
                     if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
                         self.emit(f"{name} = None")
                     else:
-                        init_py = self.translate_expr(str(init), arrays_1d)
+                        init_py = self._translate_pointer_target(str(init), arrays_1d)
                         self.emit(f"{name} = {init_py}")
                     continue
 
@@ -3961,7 +3980,7 @@ class basic_f2p:
                 if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
                     self.emit(f"{name} = None")
                 else:
-                    init_py = self.translate_expr(str(init), arrays_1d)
+                    init_py = self._translate_pointer_target(str(init), arrays_1d)
                     self.emit(f"{name} = {init_py}")
                 continue
 
@@ -5408,7 +5427,7 @@ class basic_f2p:
             if re.match(r"^null\s*\(\s*\)\s*$", rhs_raw, re.I):
                 self.emit(f"{lhs} = None")
             else:
-                rhs_py = self.translate_expr(rhs_raw, arrays_1d)
+                rhs_py = self._translate_pointer_target(rhs_raw, arrays_1d)
                 self.emit(f"{lhs} = {rhs_py}")
             return True
 

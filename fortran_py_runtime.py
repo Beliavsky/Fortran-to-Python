@@ -298,6 +298,7 @@ __all__ = [
     "_f_component_array", "_f_assign_component_array",
     "_f_extended_type",
     "_f_product", "_f_unpack", "_f_cshift", "_f_eoshift", "_f_is_contiguous",
+    "_f_associated", "_f_pointer_target",
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
     "_f_execute_command_line",
@@ -545,6 +546,55 @@ def _f_cshift(array, shift, dim=1):
 
 def _f_eoshift(array, shift, boundary=None, dim=1):
     return _f_shift(array, shift, dim, boundary, False)
+
+
+def _f_pointer_target(array, index):
+    """Basic indexing with integer axes squeezed only after taking a view."""
+    if not isinstance(array, np.ndarray):
+        raise ValueError('pointer element targets require ndarray storage')
+    indices = index if isinstance(index, tuple) else (index,)
+    slices, scalar_axes = [], []
+    for axis, item in enumerate(indices):
+        if isinstance(item, (int, np.integer)):
+            position = int(item)
+            if position < 0:
+                position += array.shape[axis]
+            if not 0 <= position < array.shape[axis]:
+                raise IndexError('pointer target subscript out of bounds')
+            slices.append(slice(position, position + 1))
+            scalar_axes.append(axis)
+        elif isinstance(item, slice):
+            slices.append(item)
+        else:
+            raise ValueError('vector-subscripted pointer targets are not supported')
+    view = array[tuple(slices)]
+    return np.squeeze(view, axis=tuple(scalar_axes)) if scalar_axes else view
+
+
+_f_no_associated_target = object()
+
+
+def _f_associated(pointer, target=_f_no_associated_target):
+    if target is _f_no_associated_target:
+        return pointer is not None
+    if pointer is None or target is None:
+        return False
+    if isinstance(pointer, np.ndarray) and isinstance(target, np.ndarray):
+        if pointer.size == 0 or target.size == 0:
+            return False
+        if pointer.shape != target.shape or pointer.dtype != target.dtype:
+            return False
+        if pointer.__array_interface__['data'][0] != target.__array_interface__['data'][0]:
+            return False
+        # Singleton dimensions have no second element whose stride matters.
+        return all(size <= 1 or first == second
+                   for size, first, second in zip(pointer.shape, pointer.strides, target.strides))
+    if isinstance(pointer, np.ndarray) or isinstance(target, np.ndarray):
+        return False
+    if isinstance(pointer, (int, float, complex, bool, str, np.generic)) or isinstance(
+            target, (int, float, complex, bool, str, np.generic)):
+        raise ValueError('ASSOCIATED scalar targets require preserved storage, not Python values')
+    return pointer is target
 
 
 def _f_is_contiguous(array):
