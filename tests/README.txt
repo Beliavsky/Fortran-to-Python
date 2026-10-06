@@ -622,3 +622,12 @@ intrinsic declarations without ::, including kind selectors, legacy star
 selectors, nested array bounds, character lengths, multiple entities and
 dummy arguments. Executable assignments/calls and typed procedure headers
 must not be mistaken for declarations.
+
+unlimited_format_items.f90 and test_unlimited_format_items.py check unlimited
+repeats over scalar/mixed array I/O lists, column-major matrix order, nested
+finite repeats, multiple descriptors, partial final cycles, colon suppression,
+empty arrays, internal/external WRITE and once-only expression evaluation.
+Groups over 128 data descriptors are explicitly rejected.
+logical_kind_literals.f90 and test_logical_kind_literals.py check numeric and
+named kind suffixes on logical literals, arrays/expressions, KIND metadata and
+preservation of quoted text.

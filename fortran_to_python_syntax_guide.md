@@ -600,6 +600,20 @@ in Fortran element order. Python may print logical values as `True` and `False`
 rather than `T` and `F`. Formatting, whitespace, and default real precision can
 differ even when the numerical result is acceptable.
 
+Kind-suffixed logical literals such as `.TRUE._1` and `.FALSE._lk` become
+Python Boolean values. Their kind metadata remains available to `KIND`
+inquiries; text inside quoted strings is not rewritten.
+
+Unlimited-repeat formats such as `(*(1X,I0))` consume the remaining output
+items, including mixed scalars and arrays flattened in Fortran element order.
+Supported groups can contain multiple data descriptors, nested finite repeats,
+partial final cycles and `:` separator suppression. Each original output
+expression is evaluated once. Code generation is limited to 128 data descriptors
+per repeated group, with a clear error above that limit. This remains a limited
+formatter, not a complete Fortran I/O implementation: fixed prefix descriptors
+consuming array arguments and complex values requiring two real descriptors
+are separate limitations.
+
 List-directed complex output retains the `(real,imaginary)` notation, with
 each component using Python's precision-preserving float representation rather
 than a fixed decimal count. Numerical comparison checks components separately,

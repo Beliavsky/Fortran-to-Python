@@ -879,7 +879,7 @@ def _single_iterable_formatted_arg_plan(fmt_literal: str, raw_args: list[str], d
     return pos, needed
 
 
-def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
+def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str], *, following_items: bool = False) -> str | None:
     """Return a Python expression for a limited Fortran character format string."""
     try:
         fmt_text = _strip_one_outer_paren(_fortran_unquote(fmt_literal.strip()))
@@ -908,28 +908,32 @@ def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
         mm = re.fullmatch(r"\*\((.*)\)", tok, re.I)
         if mm:
             inner = mm.group(1).strip()
-            if arg_i >= len(arg_exprs):
-                return "ok"
-            iterable = arg_exprs[arg_i]
-            arg_i += 1
-            inner_items = split_args(inner)
-            if ":" in [it.strip().lower() for it in inner_items]:
-                colon_i = next(i for i, it in enumerate(inner_items) if it.strip().lower() == ":")
-                left = ",".join(inner_items[:colon_i]).strip()
-                right = ",".join(inner_items[colon_i + 1:]).strip()
-                if left and right:
-                    left_n = _fortran_format_arg_count(repr("(" + left + ")"))
-                    right_n = _fortran_format_arg_count(repr("(" + right + ")"))
-                    if left_n == 1 and right_n == 0:
-                        item_expr = _fortran_format_expr(repr("(" + left + ")"), ["_xf2p_item"])
-                        sep_expr = _fortran_format_expr(repr("(" + right + ")"), [])
-                        if item_expr is not None and sep_expr is not None:
-                            parts.append(f"({sep_expr}).join({item_expr} for _xf2p_item in {iterable})")
-                            return "ok"
-            inner_expr = _fortran_format_expr(repr("(" + inner + ")"), ["_xf2p_item"])
-            if inner_expr is None:
+            inner_literal = repr('(' + inner + ')')
+            width = _fortran_format_arg_count(inner_literal)
+            if width is None or width == 0:
                 return "fail"
-            parts.append(f"''.join({inner_expr} for _xf2p_item in {iterable})")
+            # Partial final cycles and colon suppression need separate renderers.
+            # Bound code expansion instead of generating quadratic megabytes for
+            # huge repeated groups (a separate unsupported formatting case).
+            if width > 128:
+                raise ValueError('unsupported unlimited format: more than 128 data descriptors per repetition')
+            renderers = []
+            for count in range(width + 1):
+                group_args = [f'_xf2p_group[{j}]' for j in range(count)]
+                rendered = _fortran_format_expr(inner_literal, group_args)
+                if rendered is None:
+                    return 'fail'
+                renderers.append(f'lambda _xf2p_group: {rendered}')
+            more = _fortran_format_expr(inner_literal, [f'_xf2p_group[{j}]' for j in range(width)], following_items=True)
+            if more is None:
+                return 'fail'
+            # Consume every remaining I/O item, flattening arrays in Fortran
+            # order while leaving scalar CHARACTER values intact. Evaluate each
+            # original expression once, even for mixed scalar/array lists.
+            remaining = ', '.join(arg_exprs[arg_i:])
+            iterable = f'[_xf2p_item for _xf2p_arg in [{remaining}] for _xf2p_item in _xf2p_io_items(_xf2p_arg)]'
+            arg_i = len(arg_exprs)
+            parts.append(f'_xf2p_unlimited_format({iterable}, {width}, [{", ".join(renderers)}], lambda _xf2p_group: {more})')
             return "ok"
 
         if tok[0] in ("'", '"') and tok[-1] == tok[0]:
@@ -957,7 +961,7 @@ def _fortran_format_expr(fmt_literal: str, arg_exprs: list[str]) -> str | None:
             return "ok"
 
         if low == ":":
-            if arg_i >= len(arg_exprs):
+            if arg_i >= len(arg_exprs) and not following_items:
                 return STOP
             return "ok"
 
@@ -3059,8 +3063,9 @@ class basic_f2p:
                      "lt": " < ", "le": " <= ", "gt": " > ", "ge": " >= ",
                      "and": " and ", "or": " or ", "not": " not "}
         s = re.sub(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|"
-                   r"\.(true|false|eqv|neqv|eq|ne|lt|le|gt|ge|and|or|not)\.",
-                   lambda m: operators[m.group(1).lower()] if m.group(1) else m.group(),
+                   r"\.(true|false)\.(?:_(?:[a-z_]\w*|\d+))?|"
+                   r"\.(eqv|neqv|eq|ne|lt|le|gt|ge|and|or|not)\.",
+                   lambda m: operators[(m.group(1) or m.group(2)).lower()] if m.group(1) or m.group(2) else m.group(),
                    s, flags=re.I)
         s = s.replace("/=", " != ")
 
@@ -7669,6 +7674,19 @@ def _xf2p_generic_kind(value, hint):
         self.indent -= 1
         self.emit("")
 
+        for helper_line in '''def _xf2p_unlimited_format(values, width, final_renderers, more_renderer):
+    if not values:
+        return final_renderers[0]([])
+    pieces = []
+    for start in range(0, len(values), width):
+        group = values[start:start + width]
+        if start + width < len(values):
+            pieces.append(more_renderer(group))
+        else:
+            pieces.append(final_renderers[len(group)](group))
+    return ''.join(pieces)
+'''.splitlines():
+            self.emit(helper_line)
         self.emit("def _xf2p_print_star(*args, file=None):")
         self.indent += 1
         self.emit('"""Approximate Fortran list-directed PRINT/WRITE to stdout or a file."""')
