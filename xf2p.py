@@ -1181,12 +1181,13 @@ def infer_function_result_ftype(header: str) -> str | None:
       real(kind=dp) pure function g(...)
     """
     h = header.strip()
-    m = re.search(r"\b(integer|real|logical|complex)\b(?:\s*\([^)]*\))?\b[^!\n]*\bfunction\b", h, re.I)
+    m = re.search(r"\b(double\s+precision|double\s+complex|integer|real|logical|complex)\b(?:\s*\([^)]*\))?\b[^!\n]*\bfunction\b", h, re.I)
     if not m:
         return None
-    return m.group(1).lower()
+    ftype = re.sub(r'\s+', ' ', m.group(1).lower())
+    return {'double precision': 'real', 'double complex': 'complex'}.get(ftype, ftype)
 
-_decl_re = re.compile(r"^(integer|real|logical|complex|character(?:\s*\([^)]*\))?)\b(.*)$", re.I)
+_decl_re = re.compile(r"^(double\s+precision|double\s+complex|integer|real|logical|complex|character(?:\s*\([^)]*\))?)\b(.*)$", re.I)
 
 
 def _find_top_level_double_colon(s: str) -> int:
@@ -1240,10 +1241,16 @@ def parse_decl(line: str):
     m = _decl_re.match(lhs)
     if not m:
         return None
-    ftype = m.group(1).lower()
+    ftype = re.sub(r'\s+', ' ', m.group(1).lower())
+    double_kind = ftype in {'double precision', 'double complex'}
+    ftype = {'double precision': 'real', 'double complex': 'complex'}.get(ftype, ftype)
     if ftype.startswith("character"):
         ftype = "character"
     attrs = m.group(2).strip().rstrip(",").strip()
+    if double_kind:
+        # Normalize legacy double types once, preserving their kind for all
+        # consumers: declarations, dummy signatures and KIND inquiries.
+        attrs = '(kind=8)' + (', ' + attrs.lstrip(',').strip() if attrs else '')
     return ftype, attrs, rest
 
 
@@ -2507,12 +2514,26 @@ class basic_f2p:
     def _numeric_declared_kind(self, info, symbols=None):
         if info.get('ftype') not in {'integer', 'real', 'complex'}:
             return None
+        return self._declared_value_kind(info, symbols)
+
+    def _declared_value_kind(self, info, symbols=None):
+        if info.get('ftype') not in {'integer', 'real', 'complex', 'logical', 'character'}:
+            return None
         attrs = info.get('attrs_l', '').strip()
-        kind = '4'
+        kind = '1' if info['ftype'] == 'character' else '4'
         if attrs.startswith('('):
             closing = find_matching_paren(attrs, 0)
-            kind = re.sub(r'^kind\s*=\s*', '', attrs[1:closing].strip(), flags=re.I)
-        else:
+            selectors = split_args(attrs[1:closing])
+            named = next((re.match(r'\s*kind\s*=\s*(.+)', part, re.I) for part in selectors
+                          if re.match(r'\s*kind\s*=', part, re.I)), None)
+            if named:
+                kind = named.group(1)
+            elif info['ftype'] == 'character':
+                if len(selectors) > 1 and '=' not in selectors[1]:
+                    kind = selectors[1].strip()
+            else:
+                kind = selectors[0].strip()
+        elif info['ftype'] != 'character':
             legacy = re.match(r'\*\s*(\d+)', attrs)
             if legacy:
                 kind = legacy.group(1)
@@ -2529,21 +2550,161 @@ class basic_f2p:
                 break
         return self.translate_expr(kind, set())
 
+    def _expression_call_model(self, name, inner, arrays):
+        """Infer an intrinsic/procedure result without evaluating its arguments."""
+        name = name.lower()
+        if name in self._function_result_models:
+            return self._function_result_models[name]
+        if name in self._generic_names:
+            return None
+        parts = split_args(inner)
+        positional, keywords = [], {}
+        for part in parts:
+            keyword = re.match(r'\s*([a-z_]\w*)\s*=(?!=)\s*(.*)', part, re.I)
+            if keyword:
+                keywords[keyword.group(1).lower()] = keyword.group(2)
+            else:
+                positional.append(part)
+        def argument(index=0):
+            if index < len(positional):
+                return positional[index]
+            keys = {'matmul': ('matrix_a', 'matrix_b'),
+                    'dot_product': ('vector_a', 'vector_b'),
+                    'reshape': ('source',), 'transpose': ('matrix',),
+                    'merge': ('tsource',), 'spread': ('source',),
+                    'all': ('mask',), 'any': ('mask',)}.get(name, ('a', 'x', 'z', 'array', 'source', 'string'))
+            if name in {'matmul', 'dot_product'}:
+                return keywords.get(keys[index])
+            return next((keywords[key] for key in keys if key in keywords), None)
+        def first_model():
+            raw = argument()
+            return self._generic_expression_model(raw, arrays) if raw is not None else None
+        if name == 'kind':
+            return ('integer', '4')
+        if name in {'int', 'nint', 'ceiling', 'floor', 'size', 'shape', 'lbound', 'ubound',
+                    'count', 'len', 'len_trim', 'index', 'scan', 'verify', 'maxloc', 'minloc',
+                    'selected_int_kind', 'selected_real_kind', 'selected_char_kind',
+                    'digits', 'range', 'radix', 'precision', 'exponent'}:
+            kind = keywords.get('kind')
+            if name in {'int', 'nint', 'ceiling', 'floor'} and len(positional) > 1:
+                kind = positional[1]
+            return ('integer', self.translate_expr(kind, arrays) if kind else '4')
+        if name in {'real', 'cmplx', 'logical'}:
+            kind = keywords.get('kind')
+            kind_position = 2 if name == 'cmplx' else 1
+            if len(positional) > kind_position:
+                kind = positional[kind_position]
+            family = {'real': 'real', 'cmplx': 'complex', 'logical': 'logical'}[name]
+            if kind:
+                return (family, self.translate_expr(kind, arrays))
+            model = first_model() if name == 'real' else None
+            return (family, model[1] if model and model[0] == 'complex' else '4')
+        if name == 'dble':
+            return ('real', '8')
+        if name in {'aint', 'anint'}:
+            model = first_model()
+            kind = keywords.get('kind') or (positional[1] if len(positional) > 1 else None)
+            return ('real', self.translate_expr(kind, arrays)) if kind else model
+        if name in {'min', 'max'}:
+            arguments = positional or list(keywords.values())
+            result = None
+            for raw in arguments:
+                model = self._generic_expression_model(raw, arrays)
+                if model is None:
+                    return None
+                result = model if result is None else self._combine_expression_models(result, model)
+            return result
+        if name in {'matmul', 'dot_product'}:
+            raw1, raw2 = argument(), argument(1)
+            left = self._generic_expression_model(raw1, arrays) if raw1 else None
+            right = self._generic_expression_model(raw2, arrays) if raw2 else None
+            if name == 'matmul' and left and right and left[0] == right[0] == 'logical':
+                return ('logical', '4')
+            return self._combine_expression_models(left, right)
+        if name in {'all', 'any'}:
+            return first_model()
+        if name in {'allocated', 'associated', 'present', 'btest', 'is_contiguous'}:
+            return ('logical', '4')
+        if name in {'achar', 'char'}:
+            kind = keywords.get('kind') or (positional[1] if len(positional) > 1 else None)
+            return ('character', self.translate_expr(kind, arrays) if kind else '1')
+        if name in {'abs', 'aimag', 'conjg', 'sqrt', 'exp', 'log', 'log10', 'sin', 'cos', 'tan',
+                    'asin', 'acos', 'atan', 'sinh', 'cosh', 'tanh', 'aint', 'anint', 'sum', 'product',
+                    'maxval', 'minval', 'transpose', 'reshape', 'trim', 'adjustl', 'adjustr',
+                    'mod', 'modulo', 'sign', 'dim', 'atan2', 'merge', 'pack', 'unpack', 'spread',
+                    'cshift', 'eoshift', 'huge', 'tiny', 'epsilon', 'spacing', 'rrspacing',
+                    'fraction', 'scale', 'set_exponent', 'nearest'}:
+            model = first_model()
+            if model and name in {'abs', 'aimag'} and model[0] == 'complex':
+                return ('real', model[1])
+            return model
+        return None
+
+    @staticmethod
+    def _combine_expression_models(left, right):
+        if not left or not right:
+            return None
+        if left[0] == right[0]:
+            return left if left[1] == right[1] else (left[0], f'max({left[1]}, {right[1]})')
+        if left[0] == 'integer':
+            return right
+        if right[0] == 'integer':
+            return left
+        if {left[0], right[0]} == {'real', 'complex'}:
+            return ('complex', f'max({left[1]}, {right[1]})')
+        return None
+
     def _generic_expression_model(self, expression, arrays):
-        """Recover numeric type/kind before literal kind information is erased."""
+        """Recover intrinsic type/kind before literal kind information is erased."""
+        expression = expression.strip()
+        if expression.startswith('(') and find_matching_paren(expression, 0) == len(expression) - 1:
+            components = split_args(expression[1:-1])
+            if len(components) == 2:
+                models = [self._generic_expression_model(part, arrays) for part in components]
+                if all(model and model[0] in {'integer', 'real'} for model in models):
+                    kinds = [model[1] if model[0] == 'real' else '4' for model in models]
+                    return ('complex', kinds[0] if kinds[0] == kinds[1] else f'max({kinds[0]}, {kinds[1]})')
+        char_literal = re.fullmatch(r"([a-z_]\w*|\d+)_(?:'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\")", expression, re.I)
+        if char_literal:
+            return ('character', self.translate_expr(char_literal.group(1), arrays))
         models = {}
+        def placeholder(model):
+            name = f'_xf2p_kind_literal_{len(models)}'
+            models[name] = model
+            return name
+        # Model nested calls before translating them: e.g. REAL(x,KIND=8)
+        # currently loses its KIND selector in the executable translation.
+        call_pattern = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|\b([a-z_]\w*)\s*\(", re.I)
+        chunks, cursor = [], 0
+        while match := call_pattern.search(expression, cursor):
+            chunks.append(expression[cursor:match.start()])
+            if match.group(1):
+                opening = expression.find('(', match.start())
+                closing = find_matching_paren(expression, opening)
+                if closing < 0:
+                    return None
+                model = self._expression_call_model(match.group(1), expression[opening+1:closing], arrays)
+                if model:
+                    chunks.append(placeholder(model))
+                    cursor = closing + 1
+                    continue
+            chunks.append(match.group())
+            cursor = match.end()
+        expression = ''.join(chunks) + expression[cursor:]
         number = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|"
+                            r"(?P<logical>\.(?:true|false)\.)(?:_(?P<logical_kind>[a-z_]\w*|\d+))?|"
                             r"(?<![\w.])(?P<num>(?:\d+(?:\.\d*)?|\.\d+)(?:[ed][+-]?\d+)?)"
                             r"(?:_(?P<kind>[a-z_]\w*|\d+))?", re.I)
         def literal(match):
+            if match.group('logical'):
+                kind = match.group('logical_kind')
+                return placeholder(('logical', self.translate_expr(kind, arrays) if kind else '4'))
             if match.group('num') is None:
                 return match.group()
             text = match.group('num').lower()
             family = 'real' if any(c in text for c in '.ed') else 'integer'
             kind = self.translate_expr(match.group('kind'), arrays) if match.group('kind') else ('8' if 'd' in text else '4')
-            name = f'_xf2p_kind_literal_{len(models)}'
-            models[name] = (family, kind)
-            return name
+            return placeholder((family, kind))
         prepared = number.sub(literal, expression)
         try:
             tree = ast.parse(self.translate_expr(prepared, arrays), mode='eval').body
@@ -2559,31 +2720,42 @@ class basic_f2p:
             if isinstance(node, ast.Subscript):
                 return reference(node.value)
 
-        def combine(left, right):
-            if not left or not right:
-                return None
-            if left[0] == right[0]:
-                return left if left[1] == right[1] else (left[0], f'max({left[1]}, {right[1]})')
-            if left[0] == 'integer':
-                return right
-            if right[0] == 'integer':
-                return left
-            return ('complex', f'max({left[1]}, {right[1]})')
+        combine = self._combine_expression_models
 
         def infer(node):
             if isinstance(node, ast.Name) and node.id in models:
                 return models[node.id]
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, str):
+                    return ('character', '1')
+                if isinstance(node.value, bool):
+                    return ('logical', '4')
             name = reference(node)
             if name:
                 info = self._component_spec(name) if '.' in name else next(
                     (scope[name.lower()] for scope, _ in reversed(self._host_scopes) if name.lower() in scope), None)
-                kind = self._numeric_declared_kind(info) if info else None
+                kind = self._declared_value_kind(info) if info else None
                 return (info['ftype'], kind) if kind else None
             if isinstance(node, ast.UnaryOp):
                 return infer(node.operand)
             if isinstance(node, ast.BinOp):
                 left, right = infer(node.left), infer(node.right)
                 return left if isinstance(node.op, ast.Pow) and right and right[0] == 'integer' else combine(left, right)
+            if isinstance(node, ast.Compare):
+                operands = [infer(node.left)] + [infer(value) for value in node.comparators]
+                if all(model and model[0] == 'logical' for model in operands):
+                    # EQV/NEQV are translated as comparisons, but retain the
+                    # logical operands' kind rather than default LOGICAL.
+                    result = operands[0]
+                    for model in operands[1:]:
+                        result = combine(result, model)
+                    return result
+                return ('logical', '4')
+            if isinstance(node, ast.BoolOp):
+                result = infer(node.values[0])
+                for value in node.values[1:]:
+                    result = combine(result, infer(value))
+                return result
             if isinstance(node, ast.List):
                 result = None
                 for value in node.elts:
@@ -2594,7 +2766,7 @@ class basic_f2p:
                 return result
             if isinstance(node, ast.Call):
                 name = ast.unparse(node.func)
-                if name in {'np.asarray', 'np.array', '_xf2p_div', '_xf2p_min', '_xf2p_max'}:
+                if name in {'np.asarray', 'np.array', '_xf2p_div', '_xf2p_min', '_xf2p_max', '_xf2p_concat'}:
                     result = infer(node.args[0]) if node.args else None
                     for arg in node.args[1:]:
                         result = combine(result, infer(arg))
@@ -2604,9 +2776,26 @@ class basic_f2p:
                 if name == '_xf2p_real':
                     return ('real', '4')
                 if name == '_xf2p_cmplx':
-                    return ('complex', '4')
+                    # Intrinsic CMPLX calls were modeled before translation;
+                    # remaining calls come from complex literal syntax.
+                    kinds = []
+                    for arg in node.args:
+                        model = infer(arg)
+                        if not model:
+                            return None
+                        kinds.append(model[1] if model[0] == 'real' else '4')
+                    return ('complex', kinds[0] if len(set(kinds)) == 1 else f'max({", ".join(kinds)})') if kinds else None
                 return self._function_result_models.get(name.lower())
         return infer(tree)
+
+    def _translate_kind_inquiry(self, inner, arrays):
+        argument = _bind_intrinsic_arguments('kind', inner, ('x',), 1)['x']
+        model = self._generic_expression_model(argument, arrays)
+        if model is None:
+            raise ValueError(f'cannot determine Fortran KIND of expression: {argument}')
+        # KIND is an inquiry: do not evaluate an unallocated array, invalid
+        # subscript, or side-effecting function merely to discover its type.
+        return f'({model[1]})'
 
     def _translate_generic_call(self, name, inner, arrays):
         parts = split_args(inner)
@@ -2629,6 +2818,23 @@ class basic_f2p:
         keyword = re.match(r"^([a-z_]\w*)\s*=(?!=)\s*(.+)$", s, re.I)
         if keyword:
             return f"{keyword.group(1)}={self.translate_expr(keyword.group(2), arrays_1d)}"
+        kind_pattern = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|\b(kind)\s*\(", re.I)
+        shadowed_kind = 'kind' in self._binding_targets or any('kind' in scope for scope, _ in self._host_scopes)
+        if not shadowed_kind:
+            chunks, cursor = [], 0
+            while match := kind_pattern.search(s, cursor):
+                chunks.append(s[cursor:match.start()])
+                if match.group(1):
+                    opening = s.find('(', match.start())
+                    closing = find_matching_paren(s, opening)
+                    if closing < 0:
+                        raise ValueError('unbalanced KIND inquiry')
+                    chunks.append(self._translate_kind_inquiry(s[opening+1:closing], arrays_1d))
+                    cursor = closing + 1
+                else:
+                    chunks.append(match.group())
+                    cursor = match.end()
+            s = ''.join(chunks) + s[cursor:]
         generic_pattern = re.compile(r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|\b([a-z_]\w*)\s*\(", re.I)
         generic_out, generic_cursor = [], 0
         while match := generic_pattern.search(s, generic_cursor):
@@ -2738,9 +2944,6 @@ class basic_f2p:
             # a complex literal is a Fortran value, not a Python tuple.
             s = "[" + ", ".join(self.translate_expr(p, arrays_1d) for p in elems_parts) + "]"
 
-        # kind(...) used as a kind selector
-        # basic rule: if it uses a d exponent constant, treat it as double precision -> 8
-        s = re.sub(r"\bkind\s*\(\s*[^)]*[dD][^)]*\)\s*", "8", s, flags=re.I)
         s = re.sub(r"\breal64\b", "8", s, flags=re.I)
         s = re.sub(r"\breal32\b", "4", s, flags=re.I)
 
@@ -6883,7 +7086,9 @@ class basic_f2p:
                     ftype = infer_function_result_ftype(code)
                     selector = re.search(r'\b(?:real|integer|complex)\s*(\([^)]*\)|\*\s*\d+)?', code[:header.start()], re.I)
                     info = dict(ftype=ftype, attrs_l=(selector.group(1) or '') if selector else '')
-                model_kind = self._numeric_declared_kind(info, symbols)
+                    if re.search(r'\bdouble\s+(?:precision|complex)\b', code[:header.start()], re.I):
+                        info['attrs_l'] = '(kind=8)'
+                model_kind = self._declared_value_kind(info, symbols)
                 if model_kind:
                     self._function_result_models[name] = (info['ftype'], model_kind)
         # CALL chains can define a dummy even when its own body has no assignment.

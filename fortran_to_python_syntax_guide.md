@@ -545,6 +545,7 @@ not a guarantee that every argument combination or context is supported.
 | `cshift`, `eoshift` | `_f_cshift`, `_f_eoshift`. |
 | Selected special functions | SciPy functions, imported only when needed. |
 | `selected_int_kind`, `selected_real_kind`, `selected_logical_kind` | Runtime selection helpers, including keyword arguments and failure codes. |
+| `kind(x)` | Static type/kind metadata; the inquiry does not evaluate `x`. |
 
 Fortran reductions with MASK and DIM, logical matrix products, and location
 intrinsics should not be replaced blindly with the nearest NumPy spelling.
@@ -559,6 +560,20 @@ installed Fortran compiler: extended integer/real/logical kinds may differ.
 Selection does not add kind-dependent storage or arithmetic emulation; existing
 floating-point kind fidelity limitations still apply. Other intrinsics, such
 as `SELECTED_CHAR_KIND`, remain unimplemented.
+
+`KIND` handles integer, real, complex, logical and character literals and
+declared variables, including arrays, elements, sections and components.
+`DOUBLE PRECISION` and the `DOUBLE COMPLEX` extension are normalized to
+`REAL(KIND=8)` and `COMPLEX(KIND=8)`, including typed function headers.
+Arithmetic and supported intrinsic results (for example `MATMUL`, `DOT_PRODUCT`,
+reductions and conversions with explicit KIND selectors), and functions with
+known result declarations, retain their result-kind metadata. An inquiry can
+therefore inspect an unallocated array or a side-effecting function result
+without evaluating it. Unknown expression kinds produce a translation error
+instead of a missing Python `kind` function or a guessed answer. Reporting a
+declared kind, including extended kinds, does not emulate that kind's storage
+or arithmetic precision. User procedures and arrays named `kind` are not
+automatically treated as intrinsic inquiries.
 
 ## Output and validation
 

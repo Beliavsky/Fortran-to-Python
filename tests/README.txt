@@ -604,3 +604,15 @@ dispatch: default/D-exponent/suffixed literals, declared scalars and arrays,
 sections, arithmetic, known function results, keyword argument reordering,
 integer/real/complex kinds, rank distinctions and empty arrays. Unmatched and
 unknown numeric kinds are diagnosed rather than silently guessed.
+
+kind_inquiries.f90 and test_kind_inquiries.py check KIND for declared numeric,
+logical and character types, named kinds, literals, arrays/sections/components,
+arithmetic, MATMUL/DOT_PRODUCT, conversions, and known function results.
+Inquiries do not evaluate unallocated arrays or side-effecting arguments;
+unknown expression kinds are diagnosed and user entities named KIND remain
+ordinary procedures/arrays. Kind metadata does not emulate kind-specific
+numeric storage or precision.
+
+double_types.f90 and test_double_types.py check DOUBLE PRECISION and
+DOUBLE COMPLEX declarations, attributes, arrays, parameters, components,
+dummy arguments, typed function headers and KIND inquiries.
