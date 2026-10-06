@@ -12,6 +12,7 @@ import inspect
 import os
 import tempfile
 import subprocess
+import weakref
 import numpy as np
 
 _np_reshape_orig = np.reshape
@@ -308,6 +309,9 @@ __all__ = [
     "_f_assign_array",
     "_f_init_component_array",
     "_f_allocate",
+    "_f_set_array_bounds",
+    "_f_array_lbound",
+    "_f_array_ubound",
     "_f_section_slice",
     "_f_dot_product",
     "_f_reshape",
@@ -755,6 +759,62 @@ def _f_init_component_array(shape, initializer, dtype):
     return result
 
 
+_f_allocation_bounds = {}
+
+
+def _f_set_array_bounds(array, lower):
+    """Attach allocation bounds without changing NumPy's indexing or type.
+
+    Weak references prevent stale metadata after deallocation or replacement,
+    and guard against Python reusing the identity of a released array.
+    """
+    if isinstance(lower, (int, np.integer)):
+        lower = (int(lower),) * np.ndim(array)
+    lower = tuple(int(n) for n in lower)
+    if not isinstance(array, np.ndarray) or len(lower) != array.ndim:
+        raise ValueError('allocation bounds must match the array rank')
+    key = id(array)
+    if all(n == 1 for n in lower):
+        _f_allocation_bounds.pop(key, None)
+    else:
+        def released(ref):
+            entry = _f_allocation_bounds.get(key)
+            if entry is not None and entry[0] is ref:
+                _f_allocation_bounds.pop(key, None)
+        _f_allocation_bounds[key] = (weakref.ref(array, released), lower)
+    return array
+
+
+def _f_array_lower_bounds(array):
+    entry = _f_allocation_bounds.get(id(array))
+    if entry is not None and entry[0]() is array:
+        return entry[1]
+    return (1,) * np.ndim(array)
+
+
+def _f_array_bound(array, dim, upper):
+    if array is None:
+        raise ValueError('bounds of an unallocated array are undefined')
+    shape = np.shape(array)
+    lower = _f_array_lower_bounds(array)
+    values = tuple((lo + size - 1 if size else 0) if upper else (lo if size else 1)
+                   for lo, size in zip(lower, shape))
+    if dim is None:
+        return np.asarray(values, dtype=int)
+    axis = int(dim) - 1
+    if not 0 <= axis < len(shape):
+        raise ValueError('bounds DIM is outside the array rank')
+    return values[axis]
+
+
+def _f_array_lbound(array, dim=None):
+    return _f_array_bound(array, dim, False)
+
+
+def _f_array_ubound(array, dim=None):
+    return _f_array_bound(array, dim, True)
+
+
 def _f_allocate(model=None, shape=None, dtype=float, source=False, rank=1,
                 factory=None, char_len=None):
     """Allocate typed storage; SOURCE copies values, MOLD supplies only shape."""
@@ -787,7 +847,7 @@ def _f_allocate(model=None, shape=None, dtype=float, source=False, rank=1,
     return np.empty(shape, dtype=dtype)
 
 
-def _f_assign_array(lhs, rhs):
+def _f_assign_array(lhs, rhs, lower_bounds=None):
     """Assign with array-shape-aware replacement semantics used by transpiled code."""
     try:
         arr = np.array(rhs, copy=True)
@@ -800,8 +860,9 @@ def _f_assign_array(lhs, rhs):
     if lhs is None:
         if arr.dtype == object:
             import copy
-            return copy.deepcopy(arr)
-        return arr
+            arr = copy.deepcopy(arr)
+        lower = lower_bounds if lower_bounds is not None else (_f_array_lower_bounds(rhs) if isinstance(rhs, np.ndarray) else (1,) * arr.ndim)
+        return _f_set_array_bounds(arr, lower)
     lhs_arr = np.asarray(lhs)
     if arr.dtype == object:
         import copy
@@ -814,7 +875,11 @@ def _f_assign_array(lhs, rhs):
         lhs_arr[...] = arr.item()
         return lhs
     if lhs_arr.shape != arr.shape or lhs_arr.dtype != arr.dtype:
-        return arr
+        if lhs_arr.shape == arr.shape:
+            lower = _f_array_lower_bounds(lhs)
+        else:
+            lower = lower_bounds if lower_bounds is not None else (_f_array_lower_bounds(rhs) if isinstance(rhs, np.ndarray) else (1,) * arr.ndim)
+        return _f_set_array_bounds(arr, lower)
     lhs_arr[...] = arr
     return lhs
 

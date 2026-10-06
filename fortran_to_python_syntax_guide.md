@@ -124,6 +124,19 @@ x = b[1, 2]  # (-1)-(-2), 2-0
 The Python shape is still `(5, 4)`. Lower bounds belong to the Fortran entity,
 not merely its NumPy data. Generated index calculations account for declared
 bounds; allocation, pointers, and dummy arguments introduce additional rules.
+
+Allocatable array dummies retain the actual allocation's lower and upper
+bounds. Generated allocation records these bounds using runtime metadata;
+`MOVE_ALLOC` transfers the same array object and its bounds. Reallocation in
+an output/inout dummy returns the replacement and its bounds to the caller.
+In contrast, an ordinary assumed-shape dummy `x(:)` starts at one, while
+`x(0:)` starts at zero, regardless of the actual's lower bound. Indexing,
+bound inquiries, and whole-array assignment use this association's bounds.
+Shape-preserving assignment retains the allocation bounds; replacement by an
+array expression with a different shape acquires one-based bounds. Empty
+dimensions report lower bound one and upper bound zero.
+These rules cover allocatable arrays; pointer dummy association/remapping and
+non-default allocated component bounds remain separate limitations.
 Do not copy an offset from one entity blindly to another.
 
 A Fortran out-of-bounds negative subscript is not legitimate Python negative

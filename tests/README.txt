@@ -591,3 +591,10 @@ module procedure collisions, implicit/explicit results, module-local calls,
 ONLY and renamed USE association, re-exports, private helpers, lexical shadowing,
 generic and type-bound calls, scalar copyback, and ambiguity diagnostics.
 Separate-file imports of qualified procedures are explicitly diagnosed.
+
+allocatable_bounds.f90 and test_allocatable_bounds.py check allocation bounds
+through allocatable dummies, indexing/sections, vector/matrix and dynamic-DIM
+inquiries, reallocation/copyback, MOVE_ALLOC, SOURCE/MOLD, empty dimensions,
+and ordinary assumed-shape rebasing. Runtime metadata uses weak references,
+so discarded allocations do not retain stale bounds or array storage. Saved
+allocatables start unallocated and retain their bounds across saved-value copies.

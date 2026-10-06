@@ -1571,8 +1571,7 @@ class basic_f2p:
             init = info.get("init")
             if info.get('data_initialized'):
                 init_py = self._data_init_expr(info, arrays_1d)
-            elif (ftype == "character" and info.get("char_len") == ":"
-                    and "allocatable" in info.get("attrs_l", "")):
+            elif "allocatable" in info.get("attrs_l", ""):
                 init_py = "None"
             elif is_array:
                 shape = info.get("shape")
@@ -2311,6 +2310,15 @@ class basic_f2p:
                 bounds.append(("1", ds))
         return bounds
 
+    def _set_allocatable_array_bounds(self, name, rank):
+        self._decl_lbounds[name.lower()] = [f'_f_array_lbound({name}, {d+1})' for d in range(rank)]
+        self._decl_ubounds[name.lower()] = [f'_f_array_ubound({name}, {d+1})' for d in range(rank)]
+
+    def _register_allocatable_array_bounds(self, symbols):
+        for name, info in symbols.items():
+            if info.get('is_array') and 'allocatable' in info.get('attrs_l', '') and info.get('shape') is not None:
+                self._set_allocatable_array_bounds(name, len(self._shape_bounds(info['shape'])))
+
     def _decl_bound_expr(self, name: str, dim0: int, which: str, arrays_1d: set[str]) -> str | None:
         key = name.split(".", 1)[0].lower()
         src = self._decl_lbounds if which == "lo" else self._decl_ubounds
@@ -2988,6 +2996,9 @@ class basic_f2p:
                     key = base_raw.split(".", 1)[0].lower()
                     vals = self._decl_lbounds.get(key) if lname == "lbound" else self._decl_ubounds.get(key)
                     if vals:
+                        helper = '_f_array_lbound' if lname == 'lbound' else '_f_array_ubound'
+                        if '.' not in base_raw and all(str(value).startswith(helper + '(') for value in vals):
+                            return f'{helper}({base_py}' + (f', dim={dim_py})' if dim_py is not None else ')')
                         if dim_raw is None:
                             parts_py: list[str] = []
                             for idx0 in range(len(vals)):
@@ -3345,6 +3356,14 @@ class basic_f2p:
     def transpile_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> None:
         if self._where_masked_assignment(lhs, rhs_py, arrays_1d):
             return
+        # An array expression/section has one-based bounds. A whole-array
+        # variable uses the bounds of its current Fortran association, which
+        # may differ from the allocation bounds stored on the NumPy object.
+        rhs_lower = '1'
+        if re.fullmatch(r'[a-z_]\w*', rhs_py, re.I) and rhs_py.lower() in self._decl_lbounds:
+            lows = [self._decl_bound_expr(rhs_py, d, 'lo', arrays_1d) or '1'
+                    for d in range(len(self._decl_lbounds[rhs_py.lower()]))]
+            rhs_lower = '[' + ', '.join(lows) + ']'
         lhs = lhs.replace("%", ".")
         if self._assign_projected_component(lhs, rhs_py, arrays_1d):
             return
@@ -3408,7 +3427,7 @@ class basic_f2p:
             if re.fullmatch(r"[A-Za-z_]\w*", lhs) and (lhs.lower() in self._decl_pointer or lhs.lower() in self._decl_target):
                 self.emit(f"{lhs}[...] = {rhs_py}")
             else:
-                self.emit(f"{lhs} = _f_assign_array({lhs}, {rhs_py})")
+                self.emit(f"{lhs} = _f_assign_array({lhs}, {rhs_py}, lower_bounds={rhs_lower})")
             return
 
         if re.fullmatch(r"[A-Za-z_]\w*", lhs) and (lhs.lower() in self._decl_pointer or lhs.lower() in self._decl_target):
@@ -4707,9 +4726,10 @@ class basic_f2p:
                 length_py = self.translate_expr(length, arrays_1d) if length is not None else "None"
                 model = model_name if model_raw is not None else "None"
                 self.emit(f"{name} = _f_allocate({model}, shape={shape_py}, dtype={dtype}, source={'source' in options}, rank={rank}, factory={factory}, char_len={length_py})")
+                if rank:
+                    self.emit(f"{name} = _f_set_array_bounds({name}, [{', '.join(lows)}])")
                 if "." not in name:
-                    self._decl_lbounds[name.lower()] = [f"({lo}) if _f_size({name}, dim={d+1}) else 1" for d, lo in enumerate(lows)]
-                    self._decl_ubounds[name.lower()] = [f"({lo}) + _f_size({name}, dim={d+1}) - 1 if _f_size({name}, dim={d+1}) else 0" for d, lo in enumerate(lows)]
+                    self._set_allocatable_array_bounds(name, rank)
             if status:
                 self.indent -= 1
                 self.emit("except (MemoryError, ValueError, TypeError, OverflowError) as _xf2p_allocation_error:")
@@ -4857,12 +4877,7 @@ class basic_f2p:
                 if source == destination or rank_a != rank_b or a['ftype'] != b['ftype'] or a.get('type_name') != b.get('type_name'):
                     raise ValueError('MOVE_ALLOC requires distinct variables of matching type and rank')
                 if rank_a:
-                    self._allocation_counter += 1
-                    bounds_name = _choose_fresh_identifier(self._allocation_source, f'_xf2p_move_bounds_{self._allocation_counter}')
-                    lows = [self._decl_bound_expr(source, d, 'lo', arrays_1d) or '1' for d in range(rank_a)]
-                    self.emit(f"{bounds_name} = [{', '.join(lows)}] if {source} is not None else None")
-                    self._decl_lbounds[destination.lower()] = [f'{bounds_name}[{d}]' for d in range(rank_a)]
-                    self._decl_ubounds[destination.lower()] = [''] * rank_a
+                    self._set_allocatable_array_bounds(destination, rank_a)
                 self.emit(f'{destination}, {source} = {source}, None')
                 if 'stat' in raw:
                     self.emit(f"{self.translate_expr(raw['stat'], arrays_1d)} = 0")
@@ -5776,6 +5791,7 @@ class basic_f2p:
         self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in scope_sym.items() if v.get('char_len') is not None}
         self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
         self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._register_allocatable_array_bounds(scope_sym)
 
         # exec pass
         prev_result_name = self._current_result_name
@@ -5866,6 +5882,7 @@ class basic_f2p:
         self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
         self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
         self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._register_allocatable_array_bounds(sym)
 
         # exec statements
         for code, comment in body_lines:
@@ -6369,6 +6386,7 @@ class basic_f2p:
         self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in scope_sym.items() if v.get('char_len') is not None}
         self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
         self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in scope_sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._register_allocatable_array_bounds(scope_sym)
 
         previous_outputs = self._current_subroutine_outputs
         self._current_subroutine_outputs = out_formals
@@ -7277,12 +7295,7 @@ class basic_f2p:
         self.emit('"""Fortran-style assignment copy for arrays and derived-type values."""')
         self.emit("if isinstance(x, np.ndarray):")
         self.indent += 1
-        self.emit("if x.dtype == object:")
-        self.indent += 1
-        self.emit("import copy as _xf2p_copy_mod")
-        self.emit("return _xf2p_copy_mod.deepcopy(x)")
-        self.indent -= 1
-        self.emit("return np.array(x, copy=True)")
+        self.emit("return _f_assign_array(None, x)")
         self.indent -= 1
         self.emit("if hasattr(x, '__dict__'):")
         self.indent += 1
