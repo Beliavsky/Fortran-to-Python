@@ -2370,7 +2370,8 @@ class basic_f2p:
 
     def _register_allocatable_array_bounds(self, symbols):
         for name, info in symbols.items():
-            if info.get('is_array') and 'allocatable' in info.get('attrs_l', '') and info.get('shape') is not None:
+            if (info.get('is_array') and info.get('shape') is not None
+                    and any(attr in info.get('attrs_l', '') for attr in ('allocatable', 'pointer'))):
                 self._set_allocatable_array_bounds(name, len(self._shape_bounds(info['shape'])))
 
     def _decl_bound_expr(self, name: str, dim0: int, which: str, arrays_1d: set[str]) -> str | None:
@@ -2379,6 +2380,9 @@ class basic_f2p:
         vals = src.get(key)
         if "." in name:
             spec = self._component_spec(name)
+            if spec and spec.get('shape') and 'pointer' in spec.get('attrs_l', ''):
+                helper = '_f_array_lbound' if which == 'lo' else '_f_array_ubound'
+                return f'{helper}({self.translate_expr(name, arrays_1d)}, {dim0+1})'
             bounds = self._shape_bounds(spec["shape"]) if spec and spec.get("shape") else []
             vals = [bound[0 if which == "lo" else 1] for bound in bounds]
         if not vals or dim0 < 0 or dim0 >= len(vals):
@@ -2856,6 +2860,44 @@ class basic_f2p:
             arguments.append((keyword.group(1) + '=' if keyword else '') + value)
         arguments.append(f'{self._generic_kind_keyword}=[{", ".join(kinds)}]')
         return f'{name}({", ".join(arguments)})'
+
+    def _pointer_initializer_expr(self, target, arrays_1d, symbols):
+        # Initializers are emitted before the executable pass installs the
+        # scope's declaration bounds. Use local bounds, not a previous scope's.
+        previous_lower, previous_upper = self._decl_lbounds, self._decl_ubounds
+        local_names = {name.lower() for name in symbols}
+        self._decl_lbounds = {**{name: value for name, value in previous_lower.items()
+                                if name not in local_names}, **{
+            name.lower(): [lo for lo, _ in self._shape_bounds(info['shape'])]
+            for name, info in symbols.items() if info.get('shape') is not None}}
+        self._decl_ubounds = {**{name: value for name, value in previous_upper.items()
+                                if name not in local_names}, **{
+            name.lower(): [hi for _, hi in self._shape_bounds(info['shape'])]
+            for name, info in symbols.items() if info.get('shape') is not None}}
+        self._register_allocatable_array_bounds(symbols)
+        try:
+            return self._pointer_association_expr(target, arrays_1d)
+        finally:
+            self._decl_lbounds, self._decl_ubounds = previous_lower, previous_upper
+
+    def _pointer_association_expr(self, target, arrays_1d, lower=None, rank=None):
+        rhs = self._translate_pointer_target(target, arrays_1d)
+        # A whole target retains its bounds; a section/expression has lower
+        # bounds one. Pointer bounds must never overwrite the target's metadata.
+        if lower is None and re.fullmatch(r'[a-z_]\w*(?:%[a-z_]\w*)*', target, re.I):
+            name = target.replace('%', '.')
+            spec = self._component_spec(name) if '.' in name else None
+            count = (len(self._shape_bounds(spec['shape'])) if spec and spec.get('shape')
+                     else len(self._decl_lbounds.get(name.lower(), [])))
+            if count:
+                lower = [self._decl_bound_expr(name, axis, 'lo', arrays_1d) or '1'
+                         for axis in range(count)]
+        args = [rhs]
+        if lower is not None:
+            args.append('lower=[' + ', '.join(lower) + ']')
+        if rank is not None:
+            args.append(f'rank={rank}')
+        return '_f_pointer_associate(' + ', '.join(args) + ')'
 
     def _translate_pointer_target(self, expr: str, arrays_1d: set[str]) -> str:
         """Keep a scalar array element as a storage view, not a NumPy scalar."""
@@ -3396,6 +3438,11 @@ class basic_f2p:
                     elif idx_part == 1 and dim_raw is None:
                         dim_raw = p.strip()
                         dim_py = self.translate_expr(dim_raw, arrays_1d)
+                component = self._component_spec(base_raw) if '.' in base_raw else None
+                if (component and component.get('shape') and 'pointer' in component.get('attrs_l', '')
+                        and re.fullmatch(r'[a-z_]\w*(?:\([^()]*\))?(?:\.[a-z_]\w*)+', base_raw, re.I)):
+                    helper = '_f_array_lbound' if lname == 'lbound' else '_f_array_ubound'
+                    return f'{helper}({base_py}' + (f', dim={dim_py})' if dim_py is not None else ')')
                 if re.fullmatch(r"[a-z_]\w*(?:\.[a-z_]\w*)*", base_raw, flags=re.I):
                     key = base_raw.split(".", 1)[0].lower()
                     vals = self._decl_lbounds.get(key) if lname == "lbound" else self._decl_ubounds.get(key)
@@ -3924,7 +3971,7 @@ class basic_f2p:
                     if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
                         self.emit(f"{name} = None")
                     else:
-                        init_py = self._translate_pointer_target(str(init), arrays_1d)
+                        init_py = self._pointer_initializer_expr(str(init), arrays_1d, sym)
                         self.emit(f"{name} = {init_py}")
                     continue
 
@@ -3980,7 +4027,7 @@ class basic_f2p:
                 if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
                     self.emit(f"{name} = None")
                 else:
-                    init_py = self._translate_pointer_target(str(init), arrays_1d)
+                    init_py = self._pointer_initializer_expr(str(init), arrays_1d, sym)
                     self.emit(f"{name} = {init_py}")
                 continue
 
@@ -5420,15 +5467,30 @@ class basic_f2p:
             return True
 
         # pointer association: p => target_expr
-        mm = re.match(r"^([a-z_]\w*(?:%[a-z_]\w*)*)\s*=>\s*(.+)$", s, re.I)
+        mm = re.match(r"^([a-z_]\w*(?:\([^()]*\)(?=\s*%))?(?:%[a-z_]\w*)*)\s*(?:\((.*?)\))?\s*=>\s*(.+)$", s, re.I)
         if mm:
             lhs = mm.group(1).replace("%", ".")
-            rhs_raw = mm.group(2).strip()
+            lhs_py = self.translate_expr(lhs, arrays_1d)
+            bounds_raw = mm.group(2)
+            rhs_raw = mm.group(3).strip()
+            lower = None
+            if bounds_raw is not None:
+                lower = []
+                for bound in split_args(bounds_raw):
+                    parts = split_top_level(bound, ':', preserve_empty=True)
+                    if len(parts) != 2 or not parts[0].strip() or parts[1].strip():
+                        raise ValueError('rank-changing pointer bounds remapping is not yet supported; use lower-bound-only association')
+                    lower.append(self.translate_expr(parts[0], arrays_1d))
+            component = self._component_spec(lhs) if '.' in lhs else None
+            rank = (len(self._shape_bounds(component['shape'])) if component and component.get('shape')
+                    else len(self._decl_lbounds.get(lhs.lower(), [])))
+            if lower is not None and len(lower) != rank:
+                raise ValueError('pointer association lower bounds must match the pointer rank')
             if re.match(r"^null\s*\(\s*\)\s*$", rhs_raw, re.I):
-                self.emit(f"{lhs} = None")
+                self.emit(f"{lhs_py} = None")
             else:
-                rhs_py = self._translate_pointer_target(rhs_raw, arrays_1d)
-                self.emit(f"{lhs} = {rhs_py}")
+                rhs_py = self._pointer_association_expr(rhs_raw, arrays_1d, lower, rank)
+                self.emit(f"{lhs_py} = {rhs_py}")
             return True
 
         # nullify(p1, p2, ...)

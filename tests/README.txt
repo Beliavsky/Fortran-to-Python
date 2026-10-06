@@ -642,3 +642,9 @@ associated_targets.f90 and test_associated_targets.py check one/two-argument
 ASSOCIATED, whole-array/scalar targets, distinct equal-valued targets, pointer
 targets/components, sections, strides, null pointers, empty targets, keyword
 arguments and writable scalar element views. Unboxed scalar storage is diagnosed.
+
+pointer_lower_bounds.f90 and test_pointer_lower_bounds.py check same-rank
+lower-bound pointer association, independent descriptors, inherited whole-target
+bounds, default section bounds, reassociation, positive/negative strides,
+multidimensional targets, pointer components and INTENT(OUT) pointer dummies.
+Rank-changing bounds remapping is explicitly rejected.

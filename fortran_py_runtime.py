@@ -298,7 +298,7 @@ __all__ = [
     "_f_component_array", "_f_assign_component_array",
     "_f_extended_type",
     "_f_product", "_f_unpack", "_f_cshift", "_f_eoshift", "_f_is_contiguous",
-    "_f_associated", "_f_pointer_target",
+    "_f_associated", "_f_pointer_target", "_f_pointer_associate",
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
     "_f_execute_command_line",
@@ -546,6 +546,21 @@ def _f_cshift(array, shift, dim=1):
 
 def _f_eoshift(array, shift, boundary=None, dim=1):
     return _f_shift(array, shift, dim, boundary, False)
+
+
+def _f_pointer_associate(target, lower=None, rank=None):
+    """Give each pointer its own bounds descriptor while retaining shared data."""
+    if target is None:
+        return None
+    if not isinstance(target, np.ndarray):
+        if lower is not None or (rank is not None and rank != 0):
+            raise ValueError('array pointer association requires ndarray storage')
+        return target
+    if rank is not None and target.ndim != rank:
+        raise ValueError('rank-changing pointer association is not yet supported')
+    if lower is None:
+        lower = _f_array_lower_bounds(target)
+    return _f_set_array_bounds(target.view(), lower)
 
 
 def _f_pointer_target(array, index):

@@ -135,8 +135,9 @@ bound inquiries, and whole-array assignment use this association's bounds.
 Shape-preserving assignment retains the allocation bounds; replacement by an
 array expression with a different shape acquires one-based bounds. Empty
 dimensions report lower bound one and upper bound zero.
-These rules cover allocatable arrays; pointer dummy association/remapping and
-non-default allocated component bounds remain separate limitations.
+These rules cover allocatable arrays; supported pointer associations also retain
+pointer-specific bounds, including through pointer dummy arguments. Rank-changing
+pointer remapping and non-default allocated component bounds remain limitations.
 Do not copy an offset from one entity blindly to another.
 
 A Fortran out-of-bounds negative subscript is not legitimate Python negative
@@ -270,8 +271,14 @@ scalar array elements, boxed scalar targets, and pointer components are
 supported. Scalar element associations retain writable views. Empty array
 targets give false for the two-argument inquiry, even when `ASSOCIATED(p)` is
 true. Unboxed Python scalar values are diagnosed rather than compared by value.
-Pointer bounds remapping and scalar non-pointer components without preserved
-storage remain limitations; this is not a complete pointer descriptor model.
+Same-rank lower-bound association such as `p(0:) => a(2:4)` is supported,
+including strided sections and pointer components. Each pointer gets an independent
+view and bounds metadata, so associating `q(-1:)` with the same target does not
+change `p`'s bounds. Whole targets retain their bounds; sections default to one
+unless explicit pointer lower bounds are supplied. Bounds inquiries, subscripts,
+and writes through the pointer use those bounds. Rank-changing remapping such as
+`p(1:2,1:3) => a` is explicitly rejected. Scalar non-pointer components without
+preserved storage remain limited; this is not a complete pointer descriptor model.
 Python references are not a general implementation of Fortran pointer
 descriptors. Likewise, `IS_CONTIGUOUS` and `CONTIGUOUS` dummy arguments require
 more care than testing one ndarray flag; consult the README's limitations.
