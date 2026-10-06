@@ -404,9 +404,13 @@ body statements execute. Returning without reallocating leaves the caller's
 actual unallocated; allocating or assigning a new value in the procedure
 returns that replacement to the caller. `INTENT(INOUT)` retains the incoming
 allocation. This applies to both functions and subroutines.
-For optional allocatable outputs, argument presence is tracked independently:
-an unallocated actual is still present, and resetting the allocation must not
-change `PRESENT` to false.
+For optional allocatable dummies, argument presence is tracked independently
+of allocation, with or without `INTENT`: an explicitly passed unallocated
+actual is present, while an omitted argument is absent. Allocation,
+deallocation, and the `INTENT(OUT)` entry reset do not change `PRESENT`.
+Generated optional allocatable defaults use a private omission sentinel rather
+than `None`, which represents an unallocated but present actual. Forwarding
+an absent dummy to another optional allocatable dummy preserves its absence.
 
 This is not a complete alias or side-effect analysis: writes through unknown
 procedures and complicated argument aliasing need manual review. Array and derived-type

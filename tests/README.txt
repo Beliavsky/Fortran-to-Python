@@ -580,3 +580,8 @@ character_lengths.f90 and test_character_lengths.py check equivalent legacy
 CHARACTER*n / CHARACTER*(expr) and modern CHARACTER(LEN=expr) declarations:
 initialization, padding/truncation, arrays, nested constant expressions, and
 assumed-length dummy arguments.
+
+optional_allocatable.f90 and test_optional_allocatable.py check PRESENT
+independently of ALLOCATED for scalars and arrays, all intents and no INTENT,
+functions, component actuals and type-bound calls. They also check allocation
+changes and forwarding omitted/unallocated actuals to optional allocatables.
