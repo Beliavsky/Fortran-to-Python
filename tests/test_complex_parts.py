@@ -101,15 +101,16 @@ def test_scalar_untouched_part_preserves_special_values():
     assert result.real == 2 and np.signbit(result.imag)
 
 
-def test_complex_part_forall_is_diagnosed():
-    with pytest.raises(ValueError, match='unsupported FORALL assignment target'):
-        basic_f2p().transpile('''program main
+def test_complex_part_forall(capsys):
+    exec(basic_f2p().transpile('''program main
 complex :: z(3)
 integer :: i
 z = (1.0,2.0)
 forall(i=1:3) z(i)%re = real(i)
+print *, z%re, z%im
 end program
-''')
+'''), {'__name__': '__main__'})
+    assert capsys.readouterr().out.strip() == '1.0 2.0 3.0 2.0 2.0 2.0'
 
 
 def test_derived_parent_subscript_evaluated_once(capsys):

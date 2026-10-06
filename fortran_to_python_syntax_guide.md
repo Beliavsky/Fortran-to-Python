@@ -591,7 +591,10 @@ expansion, conformable array RHS values, nested scalar components and `WHERE`
 masks are supported, with RHS values captured before any component is changed.
 Fortran itself forbids pointer components following a nonzero-rank parent;
 select individual records when updating those components. Indexed complex-part
-assignments in `FORALL` remain explicitly rejected; use ordinary `DO` loops.
+assignments in `FORALL` are supported: destination selectors and RHS values are
+captured for all selected iterations before that statement writes any results.
+This also handles complex array sections and components of selected records,
+while preserving the untouched part and associated pointer storage.
 
 `CALL CPU_TIME(time)` becomes an assignment from Python's process CPU clock,
 not a wall-clock timer. Scalar REAL variables, array elements, components,

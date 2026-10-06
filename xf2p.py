@@ -4644,6 +4644,29 @@ class basic_f2p:
             finally:
                 self.out, self._code_emit_count = original_out, original_count
             nodes = ast.parse(translated).body
+            if len(nodes) == 1 and isinstance(nodes[0], ast.Expr):
+                call = RenameIndices().visit(nodes[0].value)
+                if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                        and call.func.id in {'_f_assign_complex_part',
+                                             '_f_assign_complex_part_attribute',
+                                             '_f_assign_component_complex_part'}
+                        and len(call.args) == 4 and not call.keywords):
+                    # Preserve the destination storage/owner, but freeze selectors
+                    # and RHS values before any iteration writes a complex part.
+                    pending, item = fresh('pending'), fresh('entry')
+                    arguments = [ast.unparse(arg) for arg in call.args]
+                    captured = [arguments[0]] + [f'_xf2p_copy_value({arg})'
+                                                 for arg in arguments[1:]]
+                    self.emit(f'{pending} = []')
+                    self.emit(f'for {tuple_indices} in {selected}:')
+                    self.indent += 1
+                    self.emit(f"{pending}.append(({', '.join(captured)}))")
+                    self.indent -= 1
+                    self.emit(f'for {item} in {pending}:')
+                    self.indent += 1
+                    self.emit(f'{call.func.id}(*{item})')
+                    self.indent -= 1
+                    continue
             if len(nodes) != 1 or not isinstance(nodes[0], ast.Assign) or len(nodes[0].targets) != 1:
                 raise ValueError(f'unsupported FORALL assignment target: {lhs.strip()}')
             node = RenameIndices().visit(nodes[0])

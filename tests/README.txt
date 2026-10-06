@@ -667,8 +667,12 @@ nondecreasing timings, not equality of Python and Fortran CPU seconds.
 complex_parts.f90 and test_complex_parts.py check real/imaginary part updates
 for scalars, arrays, elements, strided/matrix sections and WHERE masks;
 complex components, pointer aliases, scalar dummy updates and kind inquiries.
-Fields named re/im and quoted text are preserved. Indexed complex-part FORALL
-assignments are diagnosed explicitly.
+Fields named re/im and quoted text are preserved.
+
+forall_complex_parts.f90 and test_forall_complex_parts.py check simultaneous
+complex-part assignments, cross-element dependencies, frozen masks, statement
+order, multidimensional indices, copied section RHS values, derived components,
+captured destination selectors, descending triplets and empty iteration sets.
 
 projected_complex_parts.f90 and test_projected_complex_parts.py check explicit
 write-back through whole derived-array projections, scalar expansion, conformable
