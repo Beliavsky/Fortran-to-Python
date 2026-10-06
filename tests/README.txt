@@ -658,3 +658,8 @@ dprod.f90 and test_dprod.py check double-precision products, scalar expansion,
 conforming vector/matrix operands, keyword arguments, result kinds and generic
 dispatch. Precision/overflow checks ensure conversion occurs before multiplying;
 non-real operands and nonconforming array shapes are explicitly diagnosed.
+
+cpu_time.f90 and test_cpu_time.py check process CPU timing into scalar variables,
+array elements, components and pointers; keyword arguments; dummy/host variable
+updates; user procedure names and invalid outputs. Tests check nonnegative,
+nondecreasing timings, not equality of Python and Fortran CPU seconds.

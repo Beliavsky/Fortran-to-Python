@@ -13,6 +13,7 @@ import os
 import tempfile
 import subprocess
 import weakref
+import time
 import numpy as np
 
 _np_reshape_orig = np.reshape
@@ -301,7 +302,7 @@ __all__ = [
     "_f_associated", "_f_pointer_target", "_f_pointer_associate",
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
-    "_f_execute_command_line",
+    "_f_execute_command_line", "_f_cpu_time",
     "_reshape_with_pad",
     "_f_size",
     "_f_shape",
@@ -671,6 +672,14 @@ def _f_execute_command_line(command, wait=True, *, has_cmdstat=False):
             raise RuntimeError(f'EXECUTE_COMMAND_LINE could not launch shell: {error}') from error
         return None, 1, str(error)
     return result.returncode, 0, None
+
+
+def _f_cpu_time():
+    """Process CPU seconds, or Fortran's negative unavailable-time indicator."""
+    try:
+        return float(time.process_time())
+    except (AttributeError, NotImplementedError, OSError):
+        return -1.0
 
 
 def _f_command_argument_count():

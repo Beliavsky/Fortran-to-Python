@@ -577,6 +577,14 @@ Selection does not add kind-dependent storage or arithmetic emulation; existing
 floating-point kind fidelity limitations still apply. Other intrinsics, such
 as `SELECTED_CHAR_KIND`, remain unimplemented.
 
+`CALL CPU_TIME(time)` becomes an assignment from Python's process CPU clock,
+not a wall-clock timer. Scalar REAL variables, array elements, components,
+associated scalar pointers, and `time=` keyword arguments are supported.
+Writes through scalar dummy arguments or to host variables are propagated.
+An unavailable process clock returns a negative value. CPU timings naturally
+differ between independently executed Fortran and Python programs; comparisons
+should test timing properties rather than equality of the measured seconds.
+
 `DPROD(x,y)` is translated to an elemental helper that converts both real
 operands to double precision before multiplying. Scalar operands may expand
 over an array; two array operands must have the same shape, rather than relying

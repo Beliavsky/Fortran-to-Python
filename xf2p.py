@@ -1812,12 +1812,14 @@ class basic_f2p:
                         if formal in signature['out']:
                             mark(keyword.group(2) if keyword else actual)
                 intrinsic_outputs = {
+                    'cpu_time': ('time',) if signature is None and callee not in self._generic_names else (),
                     'random_number': ('harvest',), 'random_seed': ('size', 'get'),
                     'move_alloc': ('from', 'to'),
                     'execute_command_line': ('exitstat', 'cmdstat', 'cmdmsg'),
                     'get_command_argument': ('value', 'length', 'status'),
                 }.get(callee, ())
                 intrinsic_formals = {
+                    'cpu_time': ('time',),
                     'random_number': ('harvest',), 'random_seed': ('size', 'put', 'get'),
                     'move_alloc': ('from', 'to', 'stat', 'errmsg'),
                     'execute_command_line': ('command', 'wait', 'exitstat', 'cmdstat', 'cmdmsg'),
@@ -5327,6 +5329,28 @@ class basic_f2p:
             cname = re.sub(r"\s*%\s*", ".", mm.group(1))
             cname_l = cname.lower()
             argtxt = (mm.group(2) or "").strip()
+            if (cname_l == 'cpu_time' and cname_l not in self._binding_targets
+                    and cname_l not in self._generic_names):
+                output = _bind_intrinsic_arguments(cname_l, argtxt, ('time',), 1)['time']
+                target = self.translate_expr(output, arrays_1d)
+                node = ast.parse(target, mode='eval').body
+                if not isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)) or ':' in output or '[' in output:
+                    raise ValueError('CPU_TIME requires a scalar REAL variable, component or array element')
+                base = re.match(r'[a-z_]\w*', output, re.I)
+                name = base.group().lower() if base else ''
+                spec = self._component_spec(output) if '%' in output else None
+                ftype = spec['ftype'] if spec else self._decl_types.get(name)
+                if ftype != 'real':
+                    raise ValueError('CPU_TIME requires a declared REAL output')
+                if ((isinstance(node, ast.Name) and name in arrays_1d)
+                        or (spec and spec.get('shape') and not output.rstrip().endswith(')'))
+                        or (spec and name in arrays_1d and re.match(r'\w+\s*%', output))):
+                    raise ValueError('CPU_TIME requires a scalar output')
+                if spec and 'pointer' in spec.get('attrs_l', '') and not spec.get('shape'):
+                    self.emit(f'{target}[...] = _f_cpu_time()')
+                else:
+                    self.transpile_assignment(output, '_f_cpu_time()', arrays_1d)
+                return True
             if cname_l in self._generic_names:
                 self.emit(self._translate_generic_call(cname, argtxt, arrays_1d))
                 return True
