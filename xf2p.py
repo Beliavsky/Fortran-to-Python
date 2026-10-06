@@ -1780,6 +1780,11 @@ class basic_f2p:
         written = set()
 
         def mark(target):
+            part = re.fullmatch(r'\s*([a-z_]\w*)\s*[%\.]\s*(?:re|im)\s*', target, re.I)
+            if part and symbols.get(part.group(1).lower(), {}).get('ftype') == 'complex':
+                if part.group(1).lower() in eligible:
+                    written.add(part.group(1).lower())
+                return
             match = re.match(r'^\s*([a-z_]\w*)\s*(?:\(|$)', target, re.I)
             if match and match.group(1).lower() in eligible:
                 written.add(match.group(1).lower())
@@ -2101,6 +2106,31 @@ class basic_f2p:
                 return None
             type_name = spec.get("type_name") or ""
         return spec
+
+    def _python_reference_type(self, node):
+        """Resolve type paths while ignoring Python-translated subscripts."""
+        def path(value):
+            if isinstance(value, ast.Name):
+                return value.id
+            if isinstance(value, ast.Subscript):
+                return path(value.value)
+            if isinstance(value, ast.Attribute):
+                base = path(value.value)
+                return base + '.' + value.attr if base else None
+        if isinstance(node, ast.Attribute) and node.attr in {'re', 'im', 'real', 'imag'}:
+            if self._python_reference_type(node.value) == 'complex':
+                return 'real'
+        name = path(node)
+        if name:
+            spec = self._component_spec(name) if '.' in name else None
+            return spec['ftype'] if spec else self._decl_types.get(name.lower())
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == '_xf2p_component_array' and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)):
+            root = path(node.args[0])
+            spec = self._component_spec(root + '.' + node.args[1].value) if root else None
+            return spec['ftype'] if spec else None
+        return None
 
     @staticmethod
     def _is_chained_subscript(reference: str) -> bool:
@@ -2791,6 +2821,10 @@ class basic_f2p:
                     return ('character', '1')
                 if isinstance(node.value, bool):
                     return ('logical', '4')
+            if isinstance(node, ast.Attribute) and node.attr in {'real', 'imag'}:
+                parent = infer(node.value)
+                if parent and parent[0] == 'complex':
+                    return ('real', parent[1])
             name = reference(node)
             if name:
                 info = self._component_spec(name) if '.' in name else next(
@@ -2828,6 +2862,12 @@ class basic_f2p:
                 return result
             if isinstance(node, ast.Call):
                 name = ast.unparse(node.func)
+                if (name == '_xf2p_component_array' and len(node.args) >= 2
+                        and isinstance(node.args[0], ast.Name) and isinstance(node.args[1], ast.Constant)
+                        and isinstance(node.args[1].value, str)):
+                    info = self._component_spec(node.args[0].id + '.' + node.args[1].value)
+                    kind = self._declared_value_kind(info) if info else None
+                    return (info['ftype'], kind) if kind else None
                 if name in {'np.asarray', 'np.array', '_xf2p_div', '_xf2p_min', '_xf2p_max', '_xf2p_concat'}:
                     result = infer(node.args[0]) if node.args else None
                     for arg in node.args[1:]:
@@ -3178,8 +3218,6 @@ class basic_f2p:
                                        match.group(1) + ' is not None') + ')', s, flags=re.I)
         s = re.sub(r"\bnull\s*\(\s*\)", "None", s, flags=re.I)
         s = s.replace("np.np.", "np.")
-        s = re.sub(r"(?i)\.re\b", ".real", s)
-        s = re.sub(r"(?i)\.im\b", ".imag", s)
 
         s = re.sub(r"\bsize\s*\(\s*([a-z_]\w*)\s*\)", r"_f_size(\1)", s, flags=re.I)
         s = re.sub(r"\bsize\s*\(\s*([^)]+)\s*\)", r"_f_size(\1)", s, flags=re.I)
@@ -3662,8 +3700,23 @@ class basic_f2p:
                         continue
                 root = name.split(".", 1)[0].lower()
                 if "." in name and root in arrays_1d and root not in {"np", "math", "random", "sps"}:
+                    if (name.rsplit('.', 1)[1].lower() in {'re', 'im'}
+                            and self._decl_types.get(root) == 'complex'):
+                        out.append(name)
+                        i = j
+                        chain_name = full_name
+                        continue
                     root_name, path_name = name.split(".", 1)
                     spec = self._component_spec(name)
+                    if path_name.rsplit('.', 1)[-1].lower() in {'re', 'im'} and '.' in path_name:
+                        base_path, member = path_name.rsplit('.', 1)
+                        base_spec = self._component_spec(root_name + '.' + base_path)
+                        if base_spec and base_spec['ftype'] == 'complex':
+                            member = 'real' if member.lower() == 're' else 'imag'
+                            out.append(f'_xf2p_component_array({root_name}, {base_path!r}, dtype=np.complex128).{member}')
+                            i = j
+                            chain_name = full_name
+                            continue
                     if spec and spec.get('shape'):
                         raise ValueError('array components of an array parent require explicit subscripts')
                     dtype = _type_dtype.get(spec['ftype']) if spec else None
@@ -3694,6 +3747,8 @@ class basic_f2p:
                 return _expr_kind(node.operand)
             if isinstance(node, ast.Name):
                 return self._decl_types.get(node.id.lower())
+            if isinstance(node, (ast.Attribute, ast.Subscript)):
+                return self._python_reference_type(node)
             if isinstance(node, ast.List):
                 if not node.elts:
                     return "real"
@@ -3745,6 +3800,11 @@ class basic_f2p:
             return None
 
         class _ExprFixer(ast.NodeTransformer):
+            def visit_Attribute(fixer, node):
+                fixer.generic_visit(node)
+                if node.attr.lower() in {'re', 'im'} and self._python_reference_type(node.value) == 'complex':
+                    node.attr = 'real' if node.attr.lower() == 're' else 'imag'
+                return node
             @staticmethod
             def logical_call(name, operands):
                 return ast.Call(
@@ -3830,6 +3890,30 @@ class basic_f2p:
         return f"_f_str_assign({rhs_py}, {self.translate_expr(str(length), arrays_1d)})"
 
     def transpile_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> None:
+        part = re.fullmatch(r'(.+)[%.](re|im)', lhs.strip(), re.I)
+        if part:
+            base = self.translate_expr(part.group(1), arrays_1d)
+            node = ast.parse(base, mode='eval').body
+            if self._python_reference_type(node) == 'complex':
+                member = 'real' if part.group(2).lower() == 're' else 'imag'
+                mask = self._where_current_mask_expr()
+                mask_arg = f', mask={mask}' if mask is not None else ''
+                if isinstance(node, ast.Subscript):
+                    def index_text(index):
+                        if isinstance(index, ast.Slice):
+                            return 'slice(' + ', '.join(ast.unparse(item) if item is not None else 'None'
+                                                       for item in (index.lower, index.upper, index.step)) + ')'
+                        if isinstance(index, ast.Tuple):
+                            return '(' + ', '.join(index_text(item) for item in index.elts) + ',)'
+                        return ast.unparse(index)
+                    self.emit(f'_f_assign_complex_part({ast.unparse(node.value)}, {index_text(node.slice)}, {rhs_py}, {member!r}{mask_arg})')
+                elif isinstance(node, ast.Attribute):
+                    self.emit(f'_f_assign_complex_part_attribute({ast.unparse(node.value)}, {node.attr!r}, {rhs_py}, {member!r}{mask_arg})')
+                elif isinstance(node, ast.Name):
+                    self.emit(f'{base} = _f_set_complex_part({base}, {rhs_py}, {member!r}{mask_arg})')
+                else:
+                    raise ValueError('complex part assignment requires a definable variable or array selection')
+                return
         if self._where_masked_assignment(lhs, rhs_py, arrays_1d):
             return
         # An array expression/section has one-based bounds. A whole-array

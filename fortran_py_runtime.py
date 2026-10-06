@@ -303,6 +303,7 @@ __all__ = [
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
     "_f_execute_command_line", "_f_cpu_time",
+    "_f_set_complex_part", "_f_assign_complex_part", "_f_assign_complex_part_attribute",
     "_reshape_with_pad",
     "_f_size",
     "_f_shape",
@@ -672,6 +673,33 @@ def _f_execute_command_line(command, wait=True, *, has_cmdstat=False):
             raise RuntimeError(f'EXECUTE_COMMAND_LINE could not launch shell: {error}') from error
         return None, 1, str(error)
     return result.returncode, 0, None
+
+
+def _f_set_complex_part(value, rhs, part, mask=None):
+    """Update ndarray storage or rebuild an immutable scalar complex value."""
+    if part not in ('real', 'imag'):
+        raise ValueError('unknown complex part')
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind != 'c':
+            raise TypeError('complex part assignment requires COMPLEX storage')
+        view = getattr(value, part)
+        view[...] = rhs if mask is None else np.where(mask, rhs, view)
+        return value
+    if not isinstance(value, (complex, np.complexfloating)):
+        raise TypeError('complex part assignment requires a COMPLEX value')
+    if mask is not None and not bool(mask):
+        return value
+    return complex(rhs, value.imag) if part == 'real' else complex(value.real, rhs)
+
+
+def _f_assign_complex_part(array, index, rhs, part, mask=None):
+    # Selecting a scalar or using vector subscripts can produce a copy. Write
+    # the updated complex value back, not just its temporary real/imag view.
+    array[index] = _f_set_complex_part(array[index], rhs, part, mask)
+
+
+def _f_assign_complex_part_attribute(obj, attribute, rhs, part, mask=None):
+    setattr(obj, attribute, _f_set_complex_part(getattr(obj, attribute), rhs, part, mask))
 
 
 def _f_cpu_time():

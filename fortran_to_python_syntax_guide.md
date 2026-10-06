@@ -577,6 +577,18 @@ Selection does not add kind-dependent storage or arithmetic emulation; existing
 floating-point kind fidelity limitations still apply. Other intrinsics, such
 as `SELECTED_CHAR_KIND`, remain unimplemented.
 
+Complex part designators `%re` and `%im` read the corresponding real or imaginary
+part. Assignments update complex array storage in place, including elements,
+sections and masked `WHERE` assignments. Immutable scalar complex values are
+rebuilt while preserving the untouched part. Associated pointer storage remains
+shared, and scalar dummy argument modifications are propagated. Parts of complex
+components and components of individually selected derived-type elements are
+supported; ordinary derived-type fields named `re` or `im` are not renamed.
+The part's real kind follows its complex parent for inquiries and dispatch.
+Assignment through a whole derived-type-array projection, such as
+`records%z%re = ...`, and indexed complex-part assignments in `FORALL` are
+explicitly rejected; use individually selected records or ordinary `DO` loops.
+
 `CALL CPU_TIME(time)` becomes an assignment from Python's process CPU clock,
 not a wall-clock timer. Scalar REAL variables, array elements, components,
 associated scalar pointers, and `time=` keyword arguments are supported.

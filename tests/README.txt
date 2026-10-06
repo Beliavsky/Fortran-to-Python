@@ -663,3 +663,9 @@ cpu_time.f90 and test_cpu_time.py check process CPU timing into scalar variables
 array elements, components and pointers; keyword arguments; dummy/host variable
 updates; user procedure names and invalid outputs. Tests check nonnegative,
 nondecreasing timings, not equality of Python and Fortran CPU seconds.
+
+complex_parts.f90 and test_complex_parts.py check real/imaginary part updates
+for scalars, arrays, elements, strided/matrix sections and WHERE masks;
+complex components, pointer aliases, scalar dummy updates and kind inquiries.
+Fields named re/im and quoted text are preserved. Whole derived-array projection
+assignments and indexed complex-part FORALL assignments are diagnosed explicitly.
