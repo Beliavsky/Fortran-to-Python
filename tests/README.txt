@@ -687,6 +687,13 @@ include matrices, empty arrays, nested/selected records, WHERE masks, allocated
 components and pointer aliases. system_clock.f90 also initializes an array
 component by scalar expansion before assigning its elements as clock outputs.
 
+date_and_time.f90 and test_date_and_time.py check a coherent local-time snapshot,
+positive/negative/fractional-hour UTC offsets, milliseconds, optional positional
+and keyword outputs, character truncation/padding, components and array elements,
+VALUES arrays and sections, pointer storage, host/dummy updates, unavailable
+clock/zone values, integer range checks, invalid outputs and procedure shadowing.
+Compiled-reference tests compare properties; fixed-clock unit tests check values.
+
 projected_complex_parts.f90 and test_projected_complex_parts.py check explicit
 write-back through whole derived-array projections, scalar expansion, conformable
 vector/matrix RHS values, nested scalar components and WHERE/ELSEWHERE masks.

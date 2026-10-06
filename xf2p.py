@@ -1819,6 +1819,7 @@ class basic_f2p:
                 intrinsic_outputs = {
                     'cpu_time': ('time',) if signature is None and callee not in self._generic_names else (),
                     'system_clock': ('count', 'count_rate', 'count_max') if signature is None and callee not in self._generic_names else (),
+                    'date_and_time': ('date', 'time', 'zone', 'values') if signature is None and callee not in self._generic_names else (),
                     'random_number': ('harvest',), 'random_seed': ('size', 'get'),
                     'move_alloc': ('from', 'to'),
                     'execute_command_line': ('exitstat', 'cmdstat', 'cmdmsg'),
@@ -1827,6 +1828,7 @@ class basic_f2p:
                 intrinsic_formals = {
                     'cpu_time': ('time',),
                     'system_clock': ('count', 'count_rate', 'count_max'),
+                    'date_and_time': ('date', 'time', 'zone', 'values'),
                     'random_number': ('harvest',), 'random_seed': ('size', 'put', 'get'),
                     'move_alloc': ('from', 'to', 'stat', 'errmsg'),
                     'execute_command_line': ('command', 'wait', 'exitstat', 'cmdstat', 'cmdmsg'),
@@ -5447,6 +5449,58 @@ class basic_f2p:
             cname = re.sub(r"\s*%\s*", ".", mm.group(1))
             cname_l = cname.lower()
             argtxt = (mm.group(2) or "").strip()
+            if (cname_l == 'date_and_time' and cname_l not in self._binding_targets
+                    and cname_l not in self._generic_names):
+                formals = ('date', 'time', 'zone', 'values')
+                outputs = _bind_intrinsic_arguments(cname_l, argtxt, formals, 0)
+                prepared = []
+                integer_kind = '4'
+                for formal, output in outputs.items():
+                    target = self.translate_expr(output, arrays_1d)
+                    node = ast.parse(target, mode='eval').body
+                    if not isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)):
+                        raise ValueError('DATE_AND_TIME requires definable output variables')
+                    base = re.match(r'[a-z_]\w*', output, re.I)
+                    name = base.group().lower() if base else ''
+                    spec = self._component_spec(output) if '%' in output else None
+                    ftype = spec['ftype'] if spec else self._decl_types.get(name)
+                    if formal == 'values':
+                        if ftype != 'integer' or not ((spec and spec.get('shape')) or (not spec and name in arrays_1d)):
+                            raise ValueError('DATE_AND_TIME VALUES requires a rank-1 INTEGER array of size at least 8')
+                        integer_kind = self._integer_model_kind(output, arrays_1d)
+                        if integer_kind is None:
+                            raise ValueError('DATE_AND_TIME cannot determine VALUES integer kind')
+                    else:
+                        if ftype != 'character' or ':' in output or '[' in output:
+                            raise ValueError('DATE_AND_TIME DATE/TIME/ZONE require scalar CHARACTER outputs; substrings are not supported')
+                        if ((isinstance(node, ast.Name) and name in arrays_1d)
+                                or (spec and spec.get('shape') and not output.rstrip().endswith(')'))):
+                            raise ValueError('DATE_AND_TIME requires scalar CHARACTER outputs')
+                    length = spec.get('char_len') if spec else self._decl_char_len.get(name)
+                    length_py = (self.translate_expr(str(length), arrays_1d)
+                                 if length not in (None, ':', '*') else f'_f_len({target})')
+                    prepared.append((formal, output, target, node, length_py))
+                self._allocation_counter += 1
+                result = _choose_fresh_identifier(self._allocation_source,
+                                                  f'_xf2p_date_time_{self._allocation_counter}')
+                self.emit(f'{result} = _f_date_and_time({integer_kind})')
+                for formal, output, target, node, length in prepared:
+                    value = f'{result}[{formals.index(formal)}]'
+                    if formal == 'values':
+                        if isinstance(node, ast.Subscript):
+                            def index_text(index):
+                                if isinstance(index, ast.Slice):
+                                    return 'slice(' + ', '.join(ast.unparse(item) if item is not None else 'None'
+                                                               for item in (index.lower, index.upper, index.step)) + ')'
+                                if isinstance(index, ast.Tuple):
+                                    return '(' + ', '.join(index_text(item) for item in index.elts) + ',)'
+                                return ast.unparse(index)
+                            self.emit(f'_f_date_and_time_values_at({ast.unparse(node.value)}, {index_text(node.slice)}, {value})')
+                        else:
+                            self.emit(f'_f_date_and_time_values({target}, {value})')
+                    else:
+                        self.transpile_assignment(output, f'_f_str_assign({value}, {length})', arrays_1d)
+                return True
             if (cname_l == 'system_clock' and cname_l not in self._binding_targets
                     and cname_l not in self._generic_names):
                 formals = ('count', 'count_rate', 'count_max')

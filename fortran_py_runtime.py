@@ -14,6 +14,7 @@ import tempfile
 import subprocess
 import weakref
 import time
+import datetime as _datetime
 import numpy as np
 
 _np_reshape_orig = np.reshape
@@ -303,6 +304,7 @@ __all__ = [
     "_f_contiguous_arguments", "_f_adjustr", "_f_scan", "_f_verify", "_f_repeat",
     "_f_command_argument_count", "_f_get_command_argument", "_f_bits",
     "_f_execute_command_line", "_f_cpu_time", "_f_system_clock",
+    "_f_date_and_time", "_f_date_and_time_values", "_f_date_and_time_values_at",
     "_f_set_complex_part", "_f_assign_complex_part", "_f_assign_complex_part_attribute",
     "_f_assign_component_complex_part",
     "_reshape_with_pad",
@@ -701,6 +703,43 @@ def _f_assign_complex_part(array, index, rhs, part, mask=None):
 
 def _f_assign_complex_part_attribute(obj, attribute, rhs, part, mask=None):
     setattr(obj, attribute, _f_set_complex_part(getattr(obj, attribute), rhs, part, mask))
+
+
+def _f_local_datetime():
+    return _datetime.datetime.now().astimezone()
+
+
+def _f_date_and_time(integer_kind=4):
+    """Sample local calendar time once, returning DATE, TIME, ZONE and VALUES."""
+    bits = _f_bit_size(integer_kind)
+    if bits < 16:
+        raise ValueError('DATE_AND_TIME VALUES requires an integer range of at least four decimal digits')
+    unavailable = -((1 << (bits - 1)) - 1)
+    try:
+        now = _f_local_datetime()
+    except (OSError, OverflowError, NotImplementedError):
+        return ' ' * 8, ' ' * 10, ' ' * 5, [unavailable] * 8
+    delta = now.utcoffset()
+    offset = int(delta.total_seconds() / 60) if delta is not None else unavailable
+    zone = (f"{'+' if offset >= 0 else '-'}{abs(offset) // 60:02d}{abs(offset) % 60:02d}"
+            if delta is not None else ' ' * 5)
+    milliseconds = now.microsecond // 1000
+    date = f'{now.year:04d}{now.month:02d}{now.day:02d}'
+    clock = f'{now.hour:02d}{now.minute:02d}{now.second:02d}.{milliseconds:03d}'
+    return date, clock, zone, [now.year, now.month, now.day, offset,
+                             now.hour, now.minute, now.second, milliseconds]
+
+
+def _f_date_and_time_values(array, values):
+    if not isinstance(array, np.ndarray) or array.ndim != 1 or array.size < 8 or array.dtype.kind not in 'iuO':
+        raise ValueError('DATE_AND_TIME VALUES requires a rank-1 INTEGER array of size at least 8')
+    array[:8] = values
+
+
+def _f_date_and_time_values_at(array, index, values):
+    selected = array[index]
+    _f_date_and_time_values(selected, values)
+    array[index] = selected
 
 
 def _f_system_clock(integer_kinds=()):

@@ -627,6 +627,23 @@ These are translation clock choices, not an emulation of a particular Fortran
 compiler's resolution, epoch or wrap period. Compare timing properties rather
 than exact timestamps across independently executed programs.
 
+`CALL DATE_AND_TIME([date,time,zone,values])` obtains one snapshot of local
+calendar time. Positional and keyword outputs may be omitted. Scalar CHARACTER
+outputs receive `YYYYMMDD`, `hhmmss.sss` and the signed UTC offset `+hhmm` or
+`-hhmm`, truncated or blank-padded to their declared lengths. Scalar components
+and character array elements are supported; substring outputs are explicitly
+rejected. Scalar dummy and host-variable updates propagate.
+
+`VALUES` must designate a rank-one INTEGER array or section of at least eight
+elements, with a decimal exponent range of at least four. Its first eight
+elements receive year, month, day, UTC offset in minutes, hour, minute, second,
+and millisecond. Writes preserve array and pointer storage, including vector
+subscripts. Larger output arrays retain their remaining elements. If the clock
+is unavailable, character outputs are blank and integer fields are negative
+`HUGE` values of the requested kind; an unknown timezone affects only the zone
+string and UTC-offset field. Exact dates/times need not match across independent
+Fortran/Python executions; compare stable properties instead.
+
 `DPROD(x,y)` is translated to an elemental helper that converts both real
 operands to double precision before multiplying. Scalar operands may expand
 over an array; two array operands must have the same shape, rather than relying
