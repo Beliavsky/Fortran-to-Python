@@ -575,3 +575,8 @@ associate_components.f90 and test_associate_components.py check write-through
 aliases to numeric component arrays, strided sections and scalar elements,
 matrix sections, declared component bounds, integer conversion, expression
 snapshots, enclosing-scope selector evaluation and nested/shadowed bindings.
+
+character_lengths.f90 and test_character_lengths.py check equivalent legacy
+CHARACTER*n / CHARACTER*(expr) and modern CHARACTER(LEN=expr) declarations:
+initialization, padding/truncation, arrays, nested constant expressions, and
+assumed-length dummy arguments.

@@ -1451,6 +1451,14 @@ class basic_f2p:
                 parts = [p.strip() for p in split_args(inner) if p.strip()]
                 if parts and all(("kind" not in p.lower()) and ("=" not in p) for p in parts):
                     return parts[0]
+        # Legacy CHARACTER*(expr) has the same LEN semantics as
+        # CHARACTER(LEN=expr); use balanced parentheses for nested expressions.
+        m = re.search(r"\bcharacter\s*\*\s*\(", s, re.I)
+        if m:
+            p0 = s.find("(", m.start())
+            p1 = find_matching_paren(s, p0)
+            if p1 != -1:
+                return s[p0 + 1 : p1].strip()
         m = re.search(r"\bcharacter\s*\*\s*([a-z_]\w*|\d+)", s, re.I)
         if m:
             return m.group(1).strip()

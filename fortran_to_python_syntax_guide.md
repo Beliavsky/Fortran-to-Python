@@ -470,6 +470,11 @@ label = "abc".ljust(5)[:5]  # "abc  "
 
 Generated assignments use `_f_str_assign` to handle fixed lengths, including
 arrays. `LEN` counts declared padding; `LEN_TRIM` excludes trailing spaces.
+The legacy declarations `CHARACTER*3` and `CHARACTER*(3)` use the same
+padding/truncation rules as `CHARACTER(LEN=3)`. Parenthesized lengths can
+contain constant expressions, and `CHARACTER*(*)` dummy arguments retain
+the actual argument's length, like `CHARACTER(LEN=*)`. Prefer the modern
+`CHARACTER(LEN=...)` spelling in new Fortran code.
 `TRIM` removes trailing spaces, not arbitrary whitespace: `.strip()` would
 also remove leading blanks and is not equivalent.
 
