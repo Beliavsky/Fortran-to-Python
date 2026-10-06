@@ -694,6 +694,14 @@ VALUES arrays and sections, pointer storage, host/dummy updates, unavailable
 clock/zone values, integer range checks, invalid outputs and procedure shadowing.
 Compiled-reference tests compare properties; fixed-clock unit tests check values.
 
+integer_not_ishft.f90 and test_integer_not_ishft.py check integer bitwise NOT
+separately from logical .NOT., left and zero-filled right ISHFT, signed results,
+word-width shift boundaries, kinds 1/2/4/8/16, elemental scalar expansion, empty
+arrays, conformance checks, keywords, nested calls/component kind metadata,
+invalid inputs and user procedure/array shadowing. The compiled fixture checks
+native agreement for 8/16/32/64-bit operations; 128-bit helper values are checked
+against exact Python integers.
+
 projected_complex_parts.f90 and test_projected_complex_parts.py check explicit
 write-back through whole derived-array projections, scalar expansion, conformable
 vector/matrix RHS values, nested scalar components and WHERE/ELSEWHERE masks.

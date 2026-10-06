@@ -786,7 +786,7 @@ def _f_get_command_argument(number, value_length=None):
 def _f_bits(operation, i, j=None, *, pos=None, length=None, shift=None, bits=32):
     """Elemental bit operations with an explicit two's-complement word width."""
     bits = int(bits)
-    if bits not in (8, 16, 32, 64):
+    if bits not in (8, 16, 32, 64, 128):
         raise ValueError('unsupported integer bit width')
     operands = [np.asarray(i, dtype=object)]
     second = j if j is not None else pos if pos is not None else shift
@@ -794,16 +794,28 @@ def _f_bits(operation, i, j=None, *, pos=None, length=None, shift=None, bits=32)
         operands.append(np.asarray(second, dtype=object))
     if length is not None:
         operands.append(np.asarray(length, dtype=object))
+    if operation in {'not', 'ishft'}:
+        shapes = [operand.shape for operand in operands if operand.ndim]
+        if shapes and any(shape != shapes[0] for shape in shapes):
+            raise ValueError('bit intrinsic array arguments must be conformable')
     operands = np.broadcast_arrays(*operands)
     mask = (1 << bits) - 1
     def apply(*values):
+        if operation in {'not', 'ishft'} and any(
+                not isinstance(v, (int, np.integer)) or isinstance(v, (bool, np.bool_)) for v in values):
+            raise TypeError('bit intrinsic arguments must be INTEGER')
         value = int(values[0]) & mask
         other = int(values[1]) if len(values) > 1 else 0
         if operation in {'btest', 'ibset', 'ibclr'} and not 0 <= other < bits:
             raise ValueError('bit position out of range')
         if operation == 'btest':
             return bool(value & (1 << other))
-        if operation == 'ibset': result = value | (1 << other)
+        if operation == 'not': result = ~value
+        elif operation == 'ishft':
+            if not -bits <= other <= bits:
+                raise ValueError('ISHFT count out of range')
+            result = value << other if other >= 0 else value >> -other
+        elif operation == 'ibset': result = value | (1 << other)
         elif operation == 'ibclr': result = value & ~(1 << other)
         elif operation == 'ibits':
             size = int(values[2])
@@ -820,7 +832,7 @@ def _f_bits(operation, i, j=None, *, pos=None, length=None, shift=None, bits=32)
         else: raise ValueError('unsupported bit operation')
         result &= mask
         return result - (1 << bits) if result >= (1 << (bits - 1)) else result
-    dtype = bool if operation == 'btest' else np.dtype(f'int{bits}')
+    dtype = bool if operation == 'btest' else object if bits == 128 else np.dtype(f'int{bits}')
     result = np.vectorize(apply, otypes=[dtype])(*operands)
     return result[()] if result.ndim == 0 else result
 

@@ -651,6 +651,17 @@ on NumPy's more general broadcasting. Keyword arguments `x=` and `y=` are
 supported, and result-kind inference records double precision (kind 8).
 This does not change the translator's general single-precision storage fidelity.
 
+Integer `NOT(i)` is a bitwise complement, distinct from logical `.not. mask`.
+`ISHFT(i,shift)` shifts left for positive counts and right for negative counts,
+introducing zero bits in either direction and discarding bits outside the word.
+Both preserve the source integer kind, using widths of 8, 16, 32, 64 or 128 bits.
+Scalar arguments expand over an array; array arguments must have matching shapes
+rather than relying on general NumPy broadcasting. Keywords `i=` and `shift=`
+are supported. Shifts of exactly plus/minus the word width return zero; larger
+absolute counts are rejected. Kind inquiries and generic dispatch retain the
+result kind. The 128-bit helper uses Python integers/object arrays, not native
+NumPy int128 storage. Other shift/bit-count intrinsics may remain unsupported.
+
 `BIT_SIZE(i)` uses the argument's declared Fortran integer kind, not the width
 of its translated Python/NumPy storage. Kinds 1, 2, 4, 8, and 16 report 8,
 16, 32, 64, and 128 bits. Supported literals, integer expressions, array

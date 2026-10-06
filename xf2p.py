@@ -1154,8 +1154,9 @@ _INTRINSIC_ARGUMENTS = {
     'ibclr': (('i', 'pos'), 2), 'ibits': (('i', 'pos', 'len'), 3),
     'iand': (('i', 'j'), 2), 'ior': (('i', 'j'), 2), 'ieor': (('i', 'j'), 2),
     'shiftl': (('i', 'shift'), 2), 'shiftr': (('i', 'shift'), 2),
+    'not': (('i',), 1), 'ishft': (('i', 'shift'), 2),
 }
-_BIT_INTRINSICS = {'btest', 'ibset', 'ibclr', 'ibits', 'iand', 'ior', 'ieor', 'shiftl', 'shiftr'}
+_BIT_INTRINSICS = {'btest', 'ibset', 'ibclr', 'ibits', 'iand', 'ior', 'ieor', 'shiftl', 'shiftr', 'not', 'ishft'}
 
 
 def _bind_intrinsic_arguments(name, text, parameters, required):
@@ -2499,12 +2500,17 @@ class basic_f2p:
         raw = _bind_intrinsic_arguments(name, inner, parameters, required)
         bound = {k: self.translate_expr(v, arrays_1d) for k, v in raw.items()}
         bits = '32'
+        if name in {'not', 'ishft'}:
+            model = self._generic_expression_model(raw['i'], arrays_1d)
+            if model is None or model[0] != 'integer':
+                raise ValueError(f'{name.upper()} requires a known INTEGER type/kind')
+            bits = f'_f_bit_size({model[1]})'
         literal = re.fullmatch(r'([+-]?\d+)_([a-z_]\w*|\d+)', raw['i'], re.I)
-        if literal:
+        if literal and name not in {'not', 'ishft'}:
             bound['i'] = literal.group(1)
             bits = f'8 * ({self.translate_expr(literal.group(2), arrays_1d)})'
         name_match = re.match(r'^([a-z_]\w*)(?:\s*\(.*\))?$', raw['i'], re.I)
-        if name_match:
+        if name_match and name not in {'not', 'ishft'}:
             for symbols, _binding in reversed(self._host_scopes):
                 info = symbols.get(name_match.group(1))
                 if info is not None:
@@ -2696,6 +2702,9 @@ class basic_f2p:
             return ('real', '8')
         if name == 'dprod':
             return ('real', '8')
+        if name in {'not', 'ishft'}:
+            raw = _bind_intrinsic_arguments(name, inner, *_INTRINSIC_ARGUMENTS[name])
+            return self._generic_expression_model(raw['i'], arrays)
         if name in {'aint', 'anint'}:
             model = first_model()
             kind = keywords.get('kind') or (positional[1] if len(positional) > 1 else None)
@@ -2879,6 +2888,15 @@ class basic_f2p:
                     return result
                 if name in {'np.sqrt', 'np.exp', 'np.log', 'np.sin', 'np.cos', 'np.abs', 'np.sum', '_f_reshape', '_f_maxval', '_f_minval'}:
                     return infer(node.args[0]) if node.args else None
+                if name == '_f_bits':
+                    operation = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
+                    if operation == 'btest':
+                        return ('logical', '4')
+                    width = next((kw.value for kw in node.keywords if kw.arg == 'bits'), None)
+                    if width is not None:
+                        if isinstance(width, ast.Call) and ast.unparse(width.func) == '_f_bit_size':
+                            return ('integer', ast.unparse(width.args[0]))
+                        return ('integer', f'({ast.unparse(width)}) // 8')
                 if name == '_xf2p_real':
                     return ('real', '4')
                 if name == '_xf2p_cmplx':
@@ -3022,7 +3040,7 @@ class basic_f2p:
         # Bit widths and integer models must be recovered before kind suffixes
         # are removed. Scan nested calls too, without matching string contents.
         bit_pattern = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|"
-            r"\b(btest|ibset|ibclr|ibits|iand|ior|ieor|shiftl|shiftr|huge|digits|range|radix)\s*\(", re.I)
+            r"(?<![\w.])(btest|ibset|ibclr|ibits|iand|ior|ieor|shiftl|shiftr|not|ishft|huge|digits|range|radix)\s*\(", re.I)
         out, cursor = [], 0
         while match := bit_pattern.search(s, cursor):
             out.append(s[cursor:match.start()])
@@ -3032,6 +3050,10 @@ class basic_f2p:
                 if closing < 0:
                     raise ValueError('unbalanced intrinsic call')
                 name = match.group(1).lower()
+                if name in {'not', 'ishft'} and (name in self._binding_targets or name in arrays_1d):
+                    out.append(match.group())
+                    cursor = match.end()
+                    continue
                 translator = self._translate_model_inquiry if name in {"huge", "digits", "range", "radix"} else self._translate_bit_call
                 out.append(translator(name, s[opening + 1:closing], arrays_1d))
                 cursor = closing + 1
@@ -3289,6 +3311,10 @@ class basic_f2p:
 
         def _translate_special_call(name: str, inner: str) -> str | None:
             lname = name.lower()
+            # Integer NOT was lowered before operator rewriting. At this stage
+            # Python `not (...)` is logical negation, not another intrinsic call.
+            if lname == 'not' or (lname == 'ishft' and (lname in self._binding_targets or lname in arrays_1d)):
+                return None
             if lname == 'dprod' and (lname in self._binding_targets
                     or any(lname in scope for scope, _ in self._host_scopes)):
                 return None
@@ -3659,7 +3685,10 @@ class basic_f2p:
                 if k < n and txt[k] == "(":
                     pclose = find_matching_paren(txt, k)
                     if pclose != -1:
-                        inner = txt[k + 1 : pclose]
+                        # This scan follows operator rewriting. Restore logical
+                        # NOT before recursively treating its arguments as
+                        # Fortran source; integer NOT is already a helper call.
+                        inner = _replace_identifier_outside_strings(txt[k + 1 : pclose], 'not', '.not.')
                         inner_py = self.translate_expr(inner, arrays_1d)
                         root = full_name.split(".", 1)[0].lower()
                         dotted_array_ref = ("." in full_name) and (root not in {"np", "math", "random", "sps"}) and self._bound_signature(full_name) is None
@@ -3787,6 +3816,9 @@ class basic_f2p:
                     return "complex"
                 if fname == "_xf2p_concat":
                     return "character"
+                if fname == '_f_bits':
+                    return ('logical' if node.args and isinstance(node.args[0], ast.Constant)
+                            and node.args[0].value == 'btest' else 'integer')
                 if fname == "np.asarray":
                     for kw in node.keywords:
                         if kw.arg == "dtype":
